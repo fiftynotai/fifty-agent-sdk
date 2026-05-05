@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-sdk"
+version = "0.0.1"
+description = "Production-grade reusable agent loop SDK — custom ReACT, JSON-mode tool calls, MCP client, pluggable LLM/state/tools."
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+authors = [{name = "MOCA Team"}]
+
+dependencies = [
+    "pydantic>=2.5.0",
+    "httpx>=0.26.0",
+    "structlog>=24.1.0",
+]
+
+[project.optional-dependencies]
+sql = [
+    "sqlalchemy[asyncio]>=2.0.0",
+]
+redis = [
+    "redis>=5.0.0",
+]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-asyncio>=0.23.0",
+    "pytest-cov>=4.1.0",
+    "ruff>=0.1.0",
+    "mypy>=1.8.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["agent_sdk*"]
