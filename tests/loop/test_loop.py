@@ -738,6 +738,45 @@ async def test_run_with_empty_messages_still_works() -> None:
 
 
 # ---------------------------------------------------------------------------
+# _serialize_tool_output repr fallback
+# ---------------------------------------------------------------------------
+
+
+def test_serialize_tool_output_falls_back_to_repr_when_dumps_raises() -> None:
+    """Both ``TypeError`` and ``ValueError`` from ``json.dumps(..., default=str)``
+    must funnel through to the ``repr()`` fallback branch.
+
+    json.dumps calls ``default=str`` on non-serializable objects; if ``str(obj)``
+    itself raises, the exception propagates out of ``json.dumps``. We construct
+    objects whose ``__str__`` raises (one TypeError, one ValueError) to cover
+    both arms of the ``except`` clause.
+    """
+    from agent_sdk.loop import _serialize_tool_output
+
+    class StrRaisesValueError:
+        def __repr__(self) -> str:
+            return "REPR_VALUE_ERR"
+
+        def __str__(self) -> str:
+            raise ValueError("str blew up")
+
+    class StrRaisesTypeError:
+        def __repr__(self) -> str:
+            return "REPR_TYPE_ERR"
+
+        def __str__(self) -> str:
+            raise TypeError("str blew up with type error")
+
+    value_err_obj = StrRaisesValueError()
+    type_err_obj = StrRaisesTypeError()
+
+    assert _serialize_tool_output(value_err_obj) == repr(value_err_obj)
+    assert _serialize_tool_output(value_err_obj) == "REPR_VALUE_ERR"
+    assert _serialize_tool_output(type_err_obj) == repr(type_err_obj)
+    assert _serialize_tool_output(type_err_obj) == "REPR_TYPE_ERR"
+
+
+# ---------------------------------------------------------------------------
 # Top-level exports
 # ---------------------------------------------------------------------------
 

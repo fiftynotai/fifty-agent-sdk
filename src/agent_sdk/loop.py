@@ -218,6 +218,8 @@ class AgentLoop:
         self,
         *,
         llm: LLMClient,
+        # TODO(BR-008+): Widen `registry` to a RegistryProtocol once non-in-process
+        # providers (MCP, RPC) land — current type pins us to the concrete class.
         registry: Registry,
         parser: Parser,
         prompts: PromptSections,
@@ -385,8 +387,8 @@ class AgentLoop:
                 args=dict(parsed.tool_call.args),
             )
 
-            # Append the assistant message BEFORE the tool dispatch so the
-            # tool reply is appended on top of the model's reasoning turn.
+            # Append the assistant turn to history before emitting ToolStarted, so the
+            # subsequent tool reply sits on top of the model's reasoning turn.
             working.append(ChatMessage(role="assistant", content=completion))
 
             # ----- 4. Invoke tool ------------------------------------------
