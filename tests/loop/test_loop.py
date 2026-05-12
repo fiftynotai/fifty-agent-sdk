@@ -1,0 +1,794 @@
+"""Integration tests for ``agent_sdk.loop.AgentLoop``.
+
+Each test wires the loop with :class:`tests.loop.conftest.FakeLLMClient` and
+:class:`tests.loop.conftest.FakeTool` doubles, drives a single ``run()``,
+collects the event stream, and asserts on shape, sequence, and side
+effects.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+from collections.abc import AsyncIterator
+from typing import Any
+
+import pytest
+
+from agent_sdk import (
+    ActionEvent,
+    AgentEvent,
+    AgentLoop,
+    ChatMessage,
+    ErrorEvent,
+    FinalEvent,
+    JsonModeParser,
+    ObservationEvent,
+    PromptSections,
+    Registry,
+    SafetyConfig,
+    ThoughtEvent,
+    TokenEvent,
+    ToolFailedEvent,
+    ToolResult,
+    ToolStartedEvent,
+)
+from agent_sdk.errors import LLMError
+from agent_sdk.streaming import ToolProgressEvent
+from tests.loop.conftest import (
+    FakeLLMClient,
+    FakeTool,
+    make_response,
+    make_stream_chunks,
+)
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _final_json(answer: str) -> str:
+    return json.dumps(
+        {
+            "thought": "done",
+            "action": "final",
+            "tool_name": None,
+            "tool_args": None,
+            "answer": answer,
+        }
+    )
+
+
+def _tool_json(thought: str, name: str, args: dict[str, Any] | None) -> str:
+    return json.dumps(
+        {
+            "thought": thought,
+            "action": "tool",
+            "tool_name": name,
+            "tool_args": args,
+            "answer": None,
+        }
+    )
+
+
+def _make_loop(
+    *,
+    llm: FakeLLMClient,
+    registry: Registry | None = None,
+    safety: SafetyConfig | None = None,
+    stream: bool = False,
+    persona: str = "You are a helpful agent.",
+) -> AgentLoop:
+    return AgentLoop(
+        llm=llm,
+        registry=registry if registry is not None else Registry(),
+        parser=JsonModeParser(),
+        prompts=PromptSections(persona=persona),
+        safety=safety if safety is not None else SafetyConfig(),
+        model="test-model",
+        stream=stream,
+    )
+
+
+async def _collect(
+    iterator: AsyncIterator[AgentEvent],
+) -> list[AgentEvent]:
+    return [event async for event in iterator]
+
+
+# ---------------------------------------------------------------------------
+# Happy single-step
+# ---------------------------------------------------------------------------
+
+
+async def test_happy_single_step_emits_thought_then_final() -> None:
+    llm = FakeLLMClient(replies=[make_response(_final_json("42"))])
+    loop = _make_loop(llm=llm)
+
+    events = await _collect(loop.run([ChatMessage(role="user", content="q")]))
+
+    types = [type(e) for e in events]
+    assert types == [ThoughtEvent, FinalEvent]
+    assert [e.sequence for e in events] == [0, 1]
+    final_event = events[1]
+    assert isinstance(final_event, FinalEvent)
+    assert final_event.text == "42"
+    assert len(llm.calls) == 1
+
+
+async def test_happy_single_step_thought_text_propagated() -> None:
+    completion = json.dumps(
+        {
+            "thought": "deep reasoning",
+            "action": "final",
+            "tool_name": None,
+            "tool_args": None,
+            "answer": "ans",
+        }
+    )
+    llm = FakeLLMClient(replies=[make_response(completion)])
+    loop = _make_loop(llm=llm)
+
+    events = await _collect(loop.run([ChatMessage(role="user", content="q")]))
+
+    thought_event = events[0]
+    assert isinstance(thought_event, ThoughtEvent)
+    assert thought_event.text == "deep reasoning"
+
+
+# ---------------------------------------------------------------------------
+# Happy multi-step
+# ---------------------------------------------------------------------------
+
+
+async def test_happy_multi_step_with_tool_then_final() -> None:
+    tool = FakeTool("search", result=ToolResult(output={"results": ["a", "b"]}))
+    registry = Registry()
+    registry.register(tool)
+    llm = FakeLLMClient(
+        replies=[
+            make_response(_tool_json("look it up", "search", {"q": "x"})),
+            make_response(_final_json("answer is a,b")),
+        ]
+    )
+    loop = _make_loop(llm=llm, registry=registry)
+
+    events = await _collect(loop.run([ChatMessage(role="user", content="q")]))
+
+    types = [type(e) for e in events]
+    assert types == [
+        ThoughtEvent,
+        ActionEvent,
+        ToolStartedEvent,
+        ObservationEvent,
+        ThoughtEvent,
+        FinalEvent,
+    ]
+    assert [e.sequence for e in events] == [0, 1, 2, 3, 4, 5]
+
+    started_event = events[2]
+    observation_event = events[3]
+    assert isinstance(started_event, ToolStartedEvent)
+    assert isinstance(observation_event, ObservationEvent)
+    assert started_event.call_id == observation_event.call_id
+    # uuid4().hex is a 32-char lowercase hex string
+    assert len(started_event.call_id) == 32
+    assert all(c in "0123456789abcdef" for c in started_event.call_id)
+
+    # second LLM call sees the tool reply with role="tool"
+    assert len(llm.calls) == 2
+    second_request = llm.calls[1]
+    tool_msgs = [m for m in second_request.messages if m.role == "tool"]
+    assert len(tool_msgs) == 1
+    assert tool_msgs[0].name == "search"
+    assert tool_msgs[0].tool_call_id == started_event.call_id
+
+
+async def test_happy_multi_step_action_event_carries_args() -> None:
+    tool = FakeTool("search", result=ToolResult(output="ok"))
+    registry = Registry()
+    registry.register(tool)
+    llm = FakeLLMClient(
+        replies=[
+            make_response(_tool_json("t", "search", {"k": "v"})),
+            make_response(_final_json("done")),
+        ]
+    )
+    loop = _make_loop(llm=llm, registry=registry)
+
+    events = await _collect(loop.run([ChatMessage(role="user", content="q")]))
+    action_event = events[1]
+    assert isinstance(action_event, ActionEvent)
+    assert action_event.tool_name == "search"
+    assert action_event.args == {"k": "v"}
+    assert tool.last_args == {"k": "v"}
+
+
+# ---------------------------------------------------------------------------
+# Tool failure: ToolResult(is_error=True)
+# ---------------------------------------------------------------------------
+
+
+async def test_tool_returns_is_error_emits_tool_failed_and_continues() -> None:
+    tool = FakeTool(
+        "search",
+        result=ToolResult(output=None, is_error=True, error="boom"),
+    )
+    registry = Registry()
+    registry.register(tool)
+    llm = FakeLLMClient(
+        replies=[
+            make_response(_tool_json("t", "search", {})),
+            make_response(_final_json("recovered")),
+        ]
+    )
+    loop = _make_loop(llm=llm, registry=registry)
+
+    events = await _collect(loop.run([ChatMessage(role="user", content="q")]))
+
+    types = [type(e) for e in events]
+    assert types == [
+        ThoughtEvent,
+        ActionEvent,
+        ToolStartedEvent,
+        ToolFailedEvent,
+        ThoughtEvent,
+        FinalEvent,
+    ]
+    failed_event = events[3]
+    assert isinstance(failed_event, ToolFailedEvent)
+    assert failed_event.error == "boom"
+
+    # The second LLM call should see a tool message starting with "Tool error:"
+    second_request = llm.calls[1]
+    tool_msgs = [m for m in second_request.messages if m.role == "tool"]
+    assert len(tool_msgs) == 1
+    assert tool_msgs[0].content.startswith("Tool error:")
+
+
+async def test_tool_returns_is_error_without_error_message() -> None:
+    """ToolResult(is_error=True, error=None) gets a default error description."""
+    tool = FakeTool("t", result=ToolResult(output=None, is_error=True, error=None))
+    registry = Registry()
+    registry.register(tool)
+    llm = FakeLLMClient(
+        replies=[
+            make_response(_tool_json("th", "t", {})),
+            make_response(_final_json("done")),
+        ]
+    )
+    loop = _make_loop(llm=llm, registry=registry)
+
+    events = await _collect(loop.run([ChatMessage(role="user", content="q")]))
+    failed_event = next(e for e in events if isinstance(e, ToolFailedEvent))
+    assert failed_event.error == "tool reported error with no message"
+
+
+# ---------------------------------------------------------------------------
+# Tool not found
+# ---------------------------------------------------------------------------
+
+
+async def test_tool_not_found_emits_tool_failed_and_continues() -> None:
+    registry = Registry()  # no tools registered
+    llm = FakeLLMClient(
+        replies=[
+            make_response(_tool_json("t", "ghost", {})),
+            make_response(_final_json("gave up")),
+        ]
+    )
+    loop = _make_loop(llm=llm, registry=registry)
+
+    events = await _collect(loop.run([ChatMessage(role="user", content="q")]))
+
+    failed_event = next(e for e in events if isinstance(e, ToolFailedEvent))
+    assert failed_event.error.startswith("ToolNotFound:")
+
+    second_request = llm.calls[1]
+    tool_msgs = [m for m in second_request.messages if m.role == "tool"]
+    assert len(tool_msgs) == 1
+    assert "ToolNotFound" in tool_msgs[0].content
+
+
+# ---------------------------------------------------------------------------
+# Tool timeout
+# ---------------------------------------------------------------------------
+
+
+async def test_tool_timeout_emits_tool_failed_and_continues() -> None:
+    tool = FakeTool("slow", sleep_seconds=0.5)
+    registry = Registry()
+    registry.register(tool)
+    safety = SafetyConfig(max_iterations=4, tool_timeout_seconds=0.05)
+    llm = FakeLLMClient(
+        replies=[
+            make_response(_tool_json("t", "slow", {})),
+            make_response(_final_json("recovered")),
+        ]
+    )
+    loop = _make_loop(llm=llm, registry=registry, safety=safety)
+
+    events = await _collect(loop.run([ChatMessage(role="user", content="q")]))
+
+    failed_event = next(e for e in events if isinstance(e, ToolFailedEvent))
+    assert failed_event.error.startswith("ToolTimeout:")
+    final_event = events[-1]
+    assert isinstance(final_event, FinalEvent)
+    assert final_event.text == "recovered"
+
+
+# ---------------------------------------------------------------------------
+# Iteration cap
+# ---------------------------------------------------------------------------
+
+
+async def test_iteration_cap_emits_error_and_fallback_final() -> None:
+    tool = FakeTool("t", result=ToolResult(output="ok"))
+    registry = Registry()
+    registry.register(tool)
+    safety = SafetyConfig(max_iterations=2)
+    # LLM emits tool calls forever; loop will hit the cap after 2 iterations.
+    tool_call = make_response(_tool_json("loop", "t", {}))
+    llm = FakeLLMClient(replies=[tool_call, tool_call, tool_call])
+    loop = _make_loop(llm=llm, registry=registry, safety=safety)
+
+    events = await _collect(loop.run([ChatMessage(role="user", content="q")]))
+
+    error_event = events[-2]
+    final_event = events[-1]
+    assert isinstance(error_event, ErrorEvent)
+    assert error_event.error_type == "MaxIterationsExceeded"
+    assert isinstance(final_event, FinalEvent)
+    assert final_event.text == safety.fallback_message
+    assert len(llm.calls) == 2
+
+
+async def test_max_iterations_exceeded_context_includes_counters() -> None:
+    tool = FakeTool("t", result=ToolResult(output="ok"))
+    registry = Registry()
+    registry.register(tool)
+    safety = SafetyConfig(max_iterations=2)
+    tool_call = make_response(_tool_json("t", "t", {}))
+    llm = FakeLLMClient(replies=[tool_call, tool_call])
+    loop = _make_loop(llm=llm, registry=registry, safety=safety)
+
+    events = await _collect(loop.run([ChatMessage(role="user", content="q")]))
+
+    error_event = next(e for e in events if isinstance(e, ErrorEvent))
+    assert error_event.context == {"max_iterations": 2, "iteration_count": 2}
+
+
+async def test_iteration_cap_does_not_raise() -> None:
+    """Iteration-cap termination must NOT propagate an exception out of the generator."""
+    tool = FakeTool("t", result=ToolResult(output="ok"))
+    registry = Registry()
+    registry.register(tool)
+    safety = SafetyConfig(max_iterations=1)
+    tool_call = make_response(_tool_json("t", "t", {}))
+    llm = FakeLLMClient(replies=[tool_call])
+    loop = _make_loop(llm=llm, registry=registry, safety=safety)
+
+    # If this raised, pytest would fail the test outright.
+    events = await _collect(loop.run([ChatMessage(role="user", content="q")]))
+    assert isinstance(events[-1], FinalEvent)
+
+
+# ---------------------------------------------------------------------------
+# Parser error
+# ---------------------------------------------------------------------------
+
+
+async def test_parser_error_emits_error_event_and_fallback_final() -> None:
+    llm = FakeLLMClient(replies=[make_response("not valid json at all")])
+    loop = _make_loop(llm=llm)
+
+    events = await _collect(loop.run([ChatMessage(role="user", content="q")]))
+
+    error_event = events[-2]
+    final_event = events[-1]
+    assert isinstance(error_event, ErrorEvent)
+    assert error_event.error_type == "ParserError"
+    assert error_event.context["parser"] == "JsonModeParser"
+    assert "error_phase" in error_event.context
+    assert isinstance(final_event, FinalEvent)
+
+
+async def test_parser_error_does_not_propagate() -> None:
+    llm = FakeLLMClient(replies=[make_response("garbage")])
+    loop = _make_loop(llm=llm)
+    # Must not raise:
+    events = await _collect(loop.run([ChatMessage(role="user", content="q")]))
+    assert isinstance(events[-1], FinalEvent)
+
+
+# ---------------------------------------------------------------------------
+# LLM error
+# ---------------------------------------------------------------------------
+
+
+async def test_llm_error_emits_error_event_and_fallback_final() -> None:
+    llm = FakeLLMClient(
+        replies=[LLMError("provider down", context={"model": "test-model"})]
+    )
+    loop = _make_loop(llm=llm)
+
+    events = await _collect(loop.run([ChatMessage(role="user", content="q")]))
+
+    error_event = events[-2]
+    final_event = events[-1]
+    assert isinstance(error_event, ErrorEvent)
+    assert error_event.error_type == "LLMError"
+    assert error_event.message == "provider down"
+    assert error_event.context == {"model": "test-model"}
+    assert isinstance(final_event, FinalEvent)
+
+
+# ---------------------------------------------------------------------------
+# Stream mode
+# ---------------------------------------------------------------------------
+
+
+async def test_stream_mode_emits_token_events_on_final_answer() -> None:
+    final_completion = _final_json("42")
+    # Split into 3 non-empty chunks.
+    chunk_size = max(1, len(final_completion) // 3)
+    parts = [
+        final_completion[i : i + chunk_size]
+        for i in range(0, len(final_completion), chunk_size)
+    ]
+    llm = FakeLLMClient(replies=[make_stream_chunks(parts)])
+    loop = _make_loop(llm=llm, stream=True)
+
+    events = await _collect(loop.run([ChatMessage(role="user", content="q")]))
+
+    token_events = [e for e in events if isinstance(e, TokenEvent)]
+    assert len(token_events) == len(parts)
+    # Token text concatenation should equal the original completion text.
+    assert "".join(t.text for t in token_events) == final_completion
+    # Final event payload is the parsed answer field, not the raw JSON.
+    final_event = events[-1]
+    assert isinstance(final_event, FinalEvent)
+    assert final_event.text == "42"
+
+    # Order: Thought before Tokens before Final.
+    thought_idx = next(
+        i for i, e in enumerate(events) if isinstance(e, ThoughtEvent)
+    )
+    token_indices = [
+        i for i, e in enumerate(events) if isinstance(e, TokenEvent)
+    ]
+    final_idx = next(
+        i for i, e in enumerate(events) if isinstance(e, FinalEvent)
+    )
+    assert thought_idx < token_indices[0]
+    assert token_indices[-1] < final_idx
+
+
+async def test_stream_mode_does_not_emit_token_events_on_tool_call() -> None:
+    tool = FakeTool("t", result=ToolResult(output="ok"))
+    registry = Registry()
+    registry.register(tool)
+    tool_completion = _tool_json("th", "t", {})
+    final_completion = _final_json("done")
+    llm = FakeLLMClient(
+        replies=[
+            make_stream_chunks([tool_completion]),
+            make_stream_chunks([final_completion]),
+        ]
+    )
+    loop = _make_loop(llm=llm, registry=registry, stream=True)
+
+    events = await _collect(loop.run([ChatMessage(role="user", content="q")]))
+
+    # Iteration 1: tool call — no TokenEvents in that iteration.
+    # Iteration 2: final answer — TokenEvents allowed.
+    tool_started_idx = next(
+        i for i, e in enumerate(events) if isinstance(e, ToolStartedEvent)
+    )
+    iter1_events = events[: tool_started_idx + 1]
+    assert not any(isinstance(e, TokenEvent) for e in iter1_events)
+
+
+async def test_stream_mode_skips_empty_deltas() -> None:
+    """Empty content chunks must NOT produce zero-length TokenEvents."""
+    final_completion = _final_json("ok")
+    chunks_with_empty = [
+        final_completion[: len(final_completion) // 2],
+        "",
+        final_completion[len(final_completion) // 2 :],
+    ]
+    llm = FakeLLMClient(replies=[make_stream_chunks(chunks_with_empty)])
+    loop = _make_loop(llm=llm, stream=True)
+
+    events = await _collect(loop.run([ChatMessage(role="user", content="q")]))
+
+    token_events = [e for e in events if isinstance(e, TokenEvent)]
+    assert all(e.text for e in token_events)
+    # We expect 2 (the empty one was filtered).
+    assert len(token_events) == 2
+
+
+# ---------------------------------------------------------------------------
+# Cancellation
+# ---------------------------------------------------------------------------
+
+
+async def test_cancellation_propagates() -> None:
+    """Cancelling the consuming task must surface as CancelledError."""
+    tool = FakeTool("slow", sleep_seconds=1.0)
+    registry = Registry()
+    registry.register(tool)
+    llm = FakeLLMClient(
+        replies=[
+            make_response(_tool_json("t", "slow", {})),
+            make_response(_final_json("done")),
+        ]
+    )
+    safety = SafetyConfig(max_iterations=3, tool_timeout_seconds=None)
+    loop = _make_loop(llm=llm, registry=registry, safety=safety)
+
+    async def consume() -> list[AgentEvent]:
+        return await _collect(
+            loop.run([ChatMessage(role="user", content="q")])
+        )
+
+    task = asyncio.create_task(consume())
+    await asyncio.sleep(0.05)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+async def test_cancellation_does_not_call_more_tools() -> None:
+    """After cancellation, the tool is called at most once and the loop unwinds."""
+    tool = FakeTool("slow", sleep_seconds=0.5)
+    registry = Registry()
+    registry.register(tool)
+    llm = FakeLLMClient(
+        replies=[
+            make_response(_tool_json("t", "slow", {})),
+            make_response(_final_json("done")),
+        ]
+    )
+    safety = SafetyConfig(max_iterations=3, tool_timeout_seconds=None)
+    loop = _make_loop(llm=llm, registry=registry, safety=safety)
+
+    async def consume() -> list[AgentEvent]:
+        return await _collect(
+            loop.run([ChatMessage(role="user", content="q")])
+        )
+
+    task = asyncio.create_task(consume())
+    await asyncio.sleep(0.1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert tool.call_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Sequencing invariants
+# ---------------------------------------------------------------------------
+
+
+async def test_event_sequences_are_monotonic_and_dense() -> None:
+    tool = FakeTool("t", result=ToolResult(output="ok"))
+    registry = Registry()
+    registry.register(tool)
+    llm = FakeLLMClient(
+        replies=[
+            make_response(_tool_json("t", "t", {})),
+            make_response(_final_json("done")),
+        ]
+    )
+    loop = _make_loop(llm=llm, registry=registry)
+
+    events = await _collect(loop.run([ChatMessage(role="user", content="q")]))
+    assert [e.sequence for e in events] == list(range(len(events)))
+
+
+@pytest.mark.parametrize(
+    "scenario",
+    ["happy", "parser_error", "iteration_cap", "llm_error"],
+)
+async def test_run_always_terminates_with_final_event(scenario: str) -> None:
+    if scenario == "happy":
+        llm = FakeLLMClient(replies=[make_response(_final_json("ok"))])
+        loop = _make_loop(llm=llm)
+    elif scenario == "parser_error":
+        llm = FakeLLMClient(replies=[make_response("garbage")])
+        loop = _make_loop(llm=llm)
+    elif scenario == "iteration_cap":
+        tool = FakeTool("t", result=ToolResult(output="ok"))
+        registry = Registry()
+        registry.register(tool)
+        tool_call = make_response(_tool_json("t", "t", {}))
+        llm = FakeLLMClient(replies=[tool_call, tool_call])
+        loop = _make_loop(
+            llm=llm, registry=registry, safety=SafetyConfig(max_iterations=2)
+        )
+    else:  # llm_error
+        llm = FakeLLMClient(replies=[LLMError("fail")])
+        loop = _make_loop(llm=llm)
+
+    events = await _collect(loop.run([ChatMessage(role="user", content="q")]))
+    assert isinstance(events[-1], FinalEvent)
+
+
+# ---------------------------------------------------------------------------
+# System prompt construction
+# ---------------------------------------------------------------------------
+
+
+async def test_system_prompt_contains_tool_descriptions() -> None:
+    registry = Registry()
+    registry.register(FakeTool("alpha"))
+    registry.register(FakeTool("beta"))
+    llm = FakeLLMClient(replies=[make_response(_final_json("ok"))])
+    loop = _make_loop(llm=llm, registry=registry)
+
+    await _collect(loop.run([ChatMessage(role="user", content="q")]))
+
+    first_request = llm.calls[0]
+    system_msg = first_request.messages[0]
+    assert system_msg.role == "system"
+    assert "alpha" in system_msg.content
+    assert "beta" in system_msg.content
+    assert "# Tools" in system_msg.content
+
+
+async def test_empty_registry_omits_tool_section() -> None:
+    llm = FakeLLMClient(replies=[make_response(_final_json("ok"))])
+    loop = _make_loop(llm=llm, registry=Registry())
+
+    await _collect(loop.run([ChatMessage(role="user", content="q")]))
+
+    system_msg = llm.calls[0].messages[0]
+    assert "# Tools" not in system_msg.content
+
+
+async def test_registry_snapshot_does_not_change_per_iteration() -> None:
+    """Tools registered AFTER AgentLoop construction must NOT appear in the prompt."""
+    registry = Registry()
+    registry.register(FakeTool("alpha", result=ToolResult(output="ok")))
+    llm = FakeLLMClient(
+        replies=[
+            make_response(_tool_json("t", "alpha", {})),
+            make_response(_final_json("done")),
+        ]
+    )
+    loop = _make_loop(llm=llm, registry=registry)
+    # Register a new tool AFTER constructing the loop:
+    registry.register(FakeTool("beta"))
+
+    await _collect(loop.run([ChatMessage(role="user", content="q")]))
+
+    # Both LLM calls must share the same system prompt (no beta).
+    assert len(llm.calls) == 2
+    sys_msg_1 = llm.calls[0].messages[0].content
+    sys_msg_2 = llm.calls[1].messages[0].content
+    assert "alpha" in sys_msg_1
+    assert "beta" not in sys_msg_1
+    assert sys_msg_1 == sys_msg_2
+
+
+async def test_output_format_argument_appears_in_system_prompt() -> None:
+    llm = FakeLLMClient(replies=[make_response(_final_json("ok"))])
+    loop = AgentLoop(
+        llm=llm,
+        registry=Registry(),
+        parser=JsonModeParser(),
+        prompts=PromptSections(persona="P"),
+        safety=SafetyConfig(),
+        model="test-model",
+        output_format="USE JSON",
+    )
+
+    await _collect(loop.run([ChatMessage(role="user", content="q")]))
+    system_msg = llm.calls[0].messages[0].content
+    assert "USE JSON" in system_msg
+
+
+# ---------------------------------------------------------------------------
+# Statelessness
+# ---------------------------------------------------------------------------
+
+
+async def test_run_does_not_mutate_input_messages() -> None:
+    tool = FakeTool("t", result=ToolResult(output="ok"))
+    registry = Registry()
+    registry.register(tool)
+    llm = FakeLLMClient(
+        replies=[
+            make_response(_tool_json("t", "t", {})),
+            make_response(_final_json("done")),
+        ]
+    )
+    loop = _make_loop(llm=llm, registry=registry)
+    user_messages: list[ChatMessage] = [
+        ChatMessage(role="user", content="hello")
+    ]
+    snapshot_id = id(user_messages)
+    snapshot_contents = list(user_messages)
+
+    await _collect(loop.run(user_messages))
+
+    # Input list identity is unchanged AND its contents are unmodified.
+    assert id(user_messages) == snapshot_id
+    assert user_messages == snapshot_contents
+
+
+# ---------------------------------------------------------------------------
+# Empty messages input
+# ---------------------------------------------------------------------------
+
+
+async def test_run_with_empty_messages_still_works() -> None:
+    llm = FakeLLMClient(replies=[make_response(_final_json("hello"))])
+    loop = _make_loop(llm=llm)
+
+    events = await _collect(loop.run([]))
+
+    final_event = events[-1]
+    assert isinstance(final_event, FinalEvent)
+    assert final_event.text == "hello"
+    # First request has just the system message.
+    assert len(llm.calls[0].messages) == 1
+    assert llm.calls[0].messages[0].role == "system"
+
+
+# ---------------------------------------------------------------------------
+# Top-level exports
+# ---------------------------------------------------------------------------
+
+
+def test_top_level_exports_loop_surface() -> None:
+    from agent_sdk import (
+        ActionEvent as _ActionEvent,
+    )
+    from agent_sdk import (
+        AgentEvent as _AgentEvent,
+    )
+    from agent_sdk import (
+        AgentLoop as _AgentLoop,
+    )
+    from agent_sdk import (
+        ErrorEvent as _ErrorEvent,
+    )
+    from agent_sdk import (
+        FinalEvent as _FinalEvent,
+    )
+    from agent_sdk import (
+        ObservationEvent as _ObservationEvent,
+    )
+    from agent_sdk import (
+        SafetyConfig as _SafetyConfig,
+    )
+    from agent_sdk import (
+        ThoughtEvent as _ThoughtEvent,
+    )
+    from agent_sdk import (
+        TokenEvent as _TokenEvent,
+    )
+    from agent_sdk import (
+        ToolFailedEvent as _ToolFailedEvent,
+    )
+    from agent_sdk import (
+        ToolProgressEvent as _ToolProgressEvent,
+    )
+    from agent_sdk import (
+        ToolStartedEvent as _ToolStartedEvent,
+    )
+
+    assert _AgentLoop is AgentLoop
+    assert _AgentEvent is AgentEvent
+    assert _SafetyConfig is SafetyConfig
+    assert _ThoughtEvent is ThoughtEvent
+    assert _ActionEvent is ActionEvent
+    assert _ToolStartedEvent is ToolStartedEvent
+    assert _ObservationEvent is ObservationEvent
+    assert _ToolFailedEvent is ToolFailedEvent
+    assert _ToolProgressEvent is ToolProgressEvent
+    assert _TokenEvent is TokenEvent
+    assert _FinalEvent is FinalEvent
+    assert _ErrorEvent is ErrorEvent
