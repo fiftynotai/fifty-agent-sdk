@@ -20,11 +20,18 @@ from pydantic import BaseModel, ConfigDict, Field
 Role = Literal["system", "user", "assistant", "tool"]
 """Discriminator for the speaker of a :class:`ChatMessage`."""
 
-FinishReason = Literal["stop", "length", "tool_calls", "content_filter", "error"]
-"""Standard terminal reason for a chat completion.
+FinishReason = Literal[
+    "stop", "length", "tool_calls", "content_filter", "error", "in_progress"
+]
+"""Standard terminal reason for a chat completion — plus the streaming sentinel.
 
 Mirrors the OpenAI chat-completion ``finish_reason`` field. Adapters MUST map
 provider-specific values into one of these literals.
+
+The ``"in_progress"`` value is a streaming-only sentinel emitted on
+intermediate chunks where the upstream provider has not yet reported a
+terminal reason. Consumers can branch on it without misreading an
+intermediate delta as a terminal ``"stop"``.
 """
 
 
@@ -114,9 +121,11 @@ class ChatResponse(BaseModel):
 
     For non-streaming responses, ``message.content`` holds the full completion.
     For streaming responses, each yielded :class:`ChatResponse` chunk carries
-    only the delta in ``message.content`` (consumers accumulate). Only the
-    final chunk has a non-``error``/``stop`` style ``finish_reason``; usage
-    figures may be zero on intermediate chunks if the provider omits them.
+    only the delta in ``message.content`` (consumers accumulate). Intermediate
+    chunks have ``finish_reason='in_progress'``; only the final chunk carries a
+    real terminal reason (``stop`` / ``length`` / ``tool_calls`` /
+    ``content_filter`` / ``error``). Usage figures may be zero on intermediate
+    chunks if the provider omits them.
 
     Attributes:
         message: The assistant's message for this response (or chunk delta).

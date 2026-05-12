@@ -140,11 +140,13 @@ class OpenAICompatibleClient:
         """Stream a completion as incremental chunks.
 
         Each yielded :class:`ChatResponse` carries the delta in
-        ``message.content`` (not the running accumulation). The final chunk
-        has a populated ``finish_reason``. Intermediate chunks emit
-        ``finish_reason="stop"`` as a placeholder when the provider has not
-        yet reported one — consumers should treat any chunk with
-        non-``None`` ``finish_reason`` from the upstream as terminal.
+        ``message.content`` (not the running accumulation). Intermediate
+        chunks emit ``finish_reason="in_progress"``; the terminal chunk
+        carries a real terminal reason (``"stop"`` / ``"length"`` /
+        ``"tool_calls"`` / ``"content_filter"`` / ``"error"``) mapped from
+        the upstream provider's value. Consumers can therefore branch on
+        ``finish_reason`` without misreading an intermediate delta as
+        terminal.
 
         Args:
             request: The chat completion request.
@@ -281,9 +283,12 @@ class OpenAICompatibleClient:
         """Map a streaming SDK chunk into a delta-carrying :class:`ChatResponse`.
 
         ``message.content`` is the chunk's delta. ``finish_reason`` is
-        populated only on the final chunk; intermediate chunks emit
-        ``"stop"`` as a placeholder (consumers should look for the chunk
-        whose upstream ``finish_reason`` is non-``None`` to detect end).
+        ``"in_progress"`` on intermediate chunks (and on header-only chunks
+        with no ``choices``) and only resolves to a terminal value
+        (``"stop"``/``"length"``/``"tool_calls"``/``"content_filter"``/``"error"``)
+        on the chunk whose upstream ``finish_reason`` is non-``None``. This
+        lets consumers branch on ``finish_reason`` without misreading an
+        intermediate delta as terminal.
         """
         try:
             choices = raw.choices
@@ -293,7 +298,7 @@ class OpenAICompatibleClient:
                 return ChatResponse(
                     message=ChatMessage(role="assistant", content=""),
                     usage=usage,
-                    finish_reason="stop",
+                    finish_reason="in_progress",
                 )
             choice = choices[0]
             delta = choice.delta
@@ -303,11 +308,11 @@ class OpenAICompatibleClient:
             upstream_finish = choice.finish_reason
             finish_reason: FinishReason
             if upstream_finish is None:
-                finish_reason = "stop"
+                finish_reason = "in_progress"
             else:
                 finish_reason = cls._normalize_finish_reason(upstream_finish)
             usage = cls._map_usage(getattr(raw, "usage", None))
-        except (AttributeError, TypeError) as e:
+        except (AttributeError, IndexError, TypeError) as e:
             raise LLMError(
                 f"Malformed provider stream chunk: {e}",
                 context={"model": model, "type": "MalformedChunk"},

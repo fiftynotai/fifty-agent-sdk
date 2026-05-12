@@ -167,7 +167,7 @@ def test_chat_request_forbids_extra_fields() -> None:
 
 @pytest.mark.parametrize(
     "finish_reason",
-    ["stop", "length", "tool_calls", "content_filter", "error"],
+    ["stop", "length", "tool_calls", "content_filter", "error", "in_progress"],
 )
 def test_chat_response_accepts_every_finish_reason(finish_reason: str) -> None:
     resp = ChatResponse(

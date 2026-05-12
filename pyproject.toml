@@ -15,7 +15,7 @@ dependencies = [
     "pydantic>=2.5.0",
     "httpx>=0.26.0",
     "structlog>=24.1.0",
-    "openai>=1.30.0",
+    "openai>=1.30.0,<3.0.0",
 ]
 
 [project.optional-dependencies]

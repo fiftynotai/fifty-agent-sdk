@@ -20,13 +20,17 @@ from typing import Any
 class AgentSdkError(Exception):
     """Base class for every exception raised by the agent SDK.
 
-    Catching :class:`AgentSdkError` catches every SDK-originated failure. Each
-    instance exposes:
+    Catching :class:`AgentSdkError` catches every SDK-originated failure.
 
     Attributes:
         message: The human-readable error message also stored in ``args[0]``.
         context: A dictionary of structured debugging information. Always a
             real ``dict`` (never ``None``); defaults to ``{}`` when not given.
+
+    Caution:
+        Callers MUST NOT place credentials (API keys, tokens, passwords) into
+        ``context``: the dict is included verbatim in ``repr(error)`` and in
+        any log line that captures the exception.
     """
 
     def __init__(self, message: str, *, context: dict[str, Any] | None = None) -> None:

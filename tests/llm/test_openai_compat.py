@@ -365,11 +365,73 @@ async def test_stream_happy_path(httpx_mock: HTTPXMock) -> None:
     contents = [c.message.content for c in chunks]
     accum = "".join(contents)
     assert accum == "Hello world"
-    # Final chunk has finish_reason="stop"; intermediate chunks should not.
-    # Our adapter uses "stop" as a placeholder, so the discriminator is the
-    # final chunk having no content and the explicit upstream finish.
+    # Intermediate chunks emit "in_progress"; only the terminal chunk
+    # carries the real terminal reason from upstream.
+    for intermediate in chunks[:-1]:
+        assert intermediate.finish_reason == "in_progress"
     assert chunks[-1].finish_reason == "stop"
     assert chunks[-1].message.content == ""
+
+
+async def test_stream_intermediate_chunks_use_in_progress(httpx_mock: HTTPXMock) -> None:
+    """A naive consumer that breaks on `finish_reason == "stop"` must not exit early."""
+    body = b"".join(
+        [
+            _sse(_chunk(delta_content="a")),
+            _sse(_chunk(delta_content="b")),
+            _sse(_chunk(delta_content="c")),
+            _sse(_chunk(finish_reason="stop")),
+            b"data: [DONE]\n\n",
+        ]
+    )
+    httpx_mock.add_response(
+        method="POST",
+        url=ENDPOINT,
+        content=body,
+        headers={"content-type": "text/event-stream"},
+    )
+    client = _make_client()
+    seen = []
+    async for chunk in client.stream(_basic_request()):
+        seen.append(chunk.finish_reason)
+    # Every chunk before the last reports "in_progress"; only the last
+    # carries the real "stop".
+    assert seen[:-1] == ["in_progress"] * (len(seen) - 1)
+    assert seen[-1] == "stop"
+
+
+@pytest.mark.parametrize(
+    "upstream_terminal,expected_terminal",
+    [
+        ("stop", "stop"),
+        ("length", "length"),
+        ("tool_calls", "tool_calls"),
+        ("content_filter", "content_filter"),
+    ],
+)
+async def test_stream_terminal_chunk_preserves_upstream_reason(
+    httpx_mock: HTTPXMock,
+    upstream_terminal: str,
+    expected_terminal: str,
+) -> None:
+    body = b"".join(
+        [
+            _sse(_chunk(delta_content="hi")),
+            _sse(_chunk(finish_reason=upstream_terminal)),
+            b"data: [DONE]\n\n",
+        ]
+    )
+    httpx_mock.add_response(
+        method="POST",
+        url=ENDPOINT,
+        content=body,
+        headers={"content-type": "text/event-stream"},
+    )
+    client = _make_client()
+    chunks = []
+    async for chunk in client.stream(_basic_request()):
+        chunks.append(chunk)
+    assert chunks[-1].finish_reason == expected_terminal
 
 
 async def test_stream_request_body_marks_stream_true(httpx_mock: HTTPXMock) -> None:

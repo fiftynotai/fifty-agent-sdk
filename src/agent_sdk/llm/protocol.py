@@ -77,8 +77,9 @@ class LLMClient(Protocol):
 
         Raises:
             agent_sdk.errors.LLMError: If the stream fails to open or fails
-                mid-iteration. Errors mid-iteration surface on the next
-                ``__anext__`` call.
+                mid-iteration. Errors — both during the underlying connection
+                open and mid-iteration — surface from ``__anext__`` because
+                implementations are typically async generators.
         """
         ...
 
