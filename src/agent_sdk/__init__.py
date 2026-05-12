@@ -34,6 +34,14 @@ from agent_sdk.prompts import (
     prose_mode_template,
     render_system_prompt,
 )
+from agent_sdk.tools import (
+    InProcProvider,
+    Registry,
+    Tool,
+    ToolResult,
+    ToolSchema,
+    tool,
+)
 
 __version__ = "0.0.1"
 
@@ -45,19 +53,25 @@ __all__ = [
     "ChatRequest",
     "ChatResponse",
     "FinishReason",
+    "InProcProvider",
     "LLMClient",
     "LLMError",
     "MaxIterationsExceeded",
     "OpenAICompatibleClient",
     "ParserError",
     "PromptSections",
+    "Registry",
     "Role",
     "StateStoreError",
+    "Tool",
     "ToolCall",
     "ToolNotFound",
+    "ToolResult",
+    "ToolSchema",
     "ToolTimeout",
     "Usage",
     "json_mode_template",
     "prose_mode_template",
     "render_system_prompt",
+    "tool",
 ]
