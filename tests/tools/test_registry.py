@@ -6,6 +6,7 @@ import asyncio
 from typing import Any
 
 import pytest
+import structlog
 
 from agent_sdk.errors import LLMError, ToolNotFound, ToolTimeout
 from agent_sdk.tools.protocol import ToolResult, ToolSchema
@@ -99,6 +100,32 @@ def test_register_overwrites_on_duplicate_name() -> None:
     r.register(second)
     assert r.list() == [second]
     assert r.get("same") is second
+
+
+def test_register_emits_warning_on_duplicate_name() -> None:
+    """An overwrite is allowed (tested above) but must emit an operational signal."""
+    r = Registry()
+    first = _NamedTool("same", output="first")
+    second = _NamedTool("same", output="second")
+    r.register(first)
+    with structlog.testing.capture_logs() as logs:
+        r.register(second)
+    overwrites = [
+        entry
+        for entry in logs
+        if entry.get("event") == "tool overwritten" and entry.get("name") == "same"
+    ]
+    assert len(overwrites) == 1, f"expected exactly one overwrite warning, got {logs}"
+    assert overwrites[0]["log_level"] == "warning"
+
+
+def test_register_does_not_warn_on_first_registration() -> None:
+    """A first-time registration must not emit the overwrite warning."""
+    r = Registry()
+    with structlog.testing.capture_logs() as logs:
+        r.register(_NamedTool("fresh"))
+    overwrites = [entry for entry in logs if entry.get("event") == "tool overwritten"]
+    assert overwrites == []
 
 
 def test_list_preserves_insertion_order() -> None:

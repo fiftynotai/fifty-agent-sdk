@@ -17,8 +17,12 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
+import structlog
+
 from agent_sdk.errors import AgentSdkError, ToolNotFound, ToolTimeout
 from agent_sdk.tools.protocol import Tool, ToolResult
+
+_log = structlog.get_logger(__name__)
 
 
 class Registry:
@@ -39,7 +43,9 @@ class Registry:
 
         Subsequent registrations with the same ``tool.name`` overwrite the
         previous entry (last write wins). This is deliberate: tests, fixtures,
-        and providers commonly re-register tools when reconfiguring.
+        and providers commonly re-register tools when reconfiguring. A
+        ``structlog`` warning is emitted on overwrite so unintended
+        collisions in production are still visible.
 
         Args:
             tool: An object satisfying the :class:`Tool` protocol.
@@ -54,6 +60,8 @@ class Registry:
             raise TypeError(
                 f"register() requires a Tool; got {type(tool).__name__}"
             )
+        if tool.name in self._tools:
+            _log.warning("tool overwritten", name=tool.name)
         self._tools[tool.name] = tool
 
     def list(self) -> list[Tool]:

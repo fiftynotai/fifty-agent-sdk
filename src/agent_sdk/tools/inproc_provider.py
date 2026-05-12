@@ -69,7 +69,11 @@ class _DecoratedTool:
                 is_error=True,
                 error=f"ValidationError: {e}",
             )
-        output = await self._fn(**validated.model_dump())
+        # Use attribute access rather than ``model_dump()`` so nested
+        # ``BaseModel`` parameters reach the function as their original
+        # instances rather than being recursively serialized back into dicts.
+        kwargs = {k: getattr(validated, k) for k in self._input_model.model_fields}
+        output = await self._fn(**kwargs)
         return ToolResult(output=output, is_error=False, error=None)
 
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any, Literal
 
 import pytest
+from pydantic import BaseModel
 
 from agent_sdk.tools.inproc_provider import InProcProvider, tool
 from agent_sdk.tools.protocol import Tool
@@ -300,3 +301,52 @@ async def test_decorated_callable_runtime_error_wraps_via_registry() -> None:
     result = await r.invoke("fails", {"x": 7}, timeout=1.0)
     assert result.is_error is True
     assert result.error == "RuntimeError: sad: 7"
+
+
+# ---------------------------------------------------------------------------
+# @tool — nested BaseModel boundary
+# ---------------------------------------------------------------------------
+
+
+class _Address(BaseModel):
+    """Defined at module scope so ``typing.get_type_hints`` can resolve it
+    inside ``_build_model_from_signature`` (PEP 563 / ``from __future__
+    import annotations`` evaluates annotations in the global namespace)."""
+
+    street: str
+    city: str
+
+
+async def test_decorated_callable_preserves_nested_basemodel_instance() -> None:
+    """A function annotated with a Pydantic model parameter must receive an
+    instance of that model, not the underlying dict produced by ``model_dump``.
+
+    Regression test for the ``model_dump`` -> ``getattr`` fix in ``_DecoratedTool.invoke``.
+    """
+
+    @tool()
+    async def describe(address: _Address) -> dict[str, Any]:
+        # The function body asserts the parameter type itself so the bug
+        # surfaces inside the tool, not just in the returned payload.
+        assert isinstance(address, _Address), (
+            f"expected _Address, got {type(address).__name__}"
+        )
+        return {
+            "type": type(address).__name__,
+            "street": address.street,
+            "city": address.city,
+        }
+
+    r = Registry()
+    r.register(describe)
+    result = await r.invoke(
+        "describe",
+        {"address": {"street": "1 Infinite Loop", "city": "Cupertino"}},
+        timeout=1.0,
+    )
+    assert result.is_error is False, result.error
+    assert result.output == {
+        "type": "_Address",
+        "street": "1 Infinite Loop",
+        "city": "Cupertino",
+    }
