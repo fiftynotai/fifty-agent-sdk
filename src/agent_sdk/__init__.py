@@ -4,7 +4,18 @@ Foundation layer: typed errors, Pydantic v2 message types, the
 :class:`LLMClient` protocol, an OpenAI-compatible adapter, and a system
 prompt template builder. Higher layers (parser, tool registry, ReACT loop,
 state stores) build on these contracts in subsequent briefs.
+
+Optional ``sql`` extra surface
+    :class:`SqlStateStore` and :data:`sql_metadata` are re-exported
+    lazily — they require ``pip install 'agent-sdk[sql]'``. Importing
+    :mod:`agent_sdk` itself does not pull SQLAlchemy. First access to
+    either symbol triggers the import and raises a clear
+    :class:`ImportError` if the extra is missing.
 """
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Any
 
 from agent_sdk.errors import (
     AgentSdkError,
@@ -69,6 +80,9 @@ from agent_sdk.tools import (
     tool,
 )
 
+if TYPE_CHECKING:
+    from agent_sdk.state.sql import SqlStateStore, sql_metadata
+
 __version__ = "0.0.1"
 
 __all__ = [
@@ -104,6 +118,7 @@ __all__ = [
     "Registry",
     "Role",
     "SafetyConfig",
+    "SqlStateStore",
     "StateStore",
     "StateStoreError",
     "ThoughtAction",
@@ -122,5 +137,21 @@ __all__ = [
     "json_mode_template",
     "prose_mode_template",
     "render_system_prompt",
+    "sql_metadata",
     "tool",
 ]
+
+
+def __getattr__(name: str) -> Any:
+    """Lazily import SQL surface symbols on first access.
+
+    ``SqlStateStore`` and ``sql_metadata`` require the optional ``sql``
+    extra. Routing access through this hook keeps ``import agent_sdk``
+    free of SQLAlchemy and surfaces a clear :class:`ImportError` only
+    when the symbols are actually used without the extra installed.
+    """
+    if name in {"SqlStateStore", "sql_metadata"}:
+        from agent_sdk.state import sql
+
+        return getattr(sql, name)
+    raise AttributeError(f"module 'agent_sdk' has no attribute {name!r}")
