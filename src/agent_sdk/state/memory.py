@@ -144,6 +144,10 @@ class MemoryStateStore:
         Args:
             session_id: Opaque session identifier.
         """
+        # TODO(BR-009/BR-010): Durable state backends MUST NOT inherit this race.
+        # In-memory tolerates a concurrent append re-creating a deleted session
+        # (acceptable for ephemeral state); SQL/Redis impls should serialize
+        # delete with writes via transaction or row-level lock.
         async with self._registry_lock:
             self._messages.pop(session_id, None)
             self._locks.pop(session_id, None)

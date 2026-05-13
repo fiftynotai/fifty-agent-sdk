@@ -515,6 +515,78 @@ async def test_state_store_error_on_user_append_propagates_before_any_event() ->
     assert len(llm.calls) == 0  # LLM never reached
 
 
+class _FailingNthAppendStore:
+    """Test double whose ``append`` raises ``StateStoreError`` on the Nth call.
+
+    All other ``append`` calls (and ``get_messages``) delegate to a real
+    :class:`MemoryStateStore`, so the user message remains durable on the
+    happy-path appends while the chosen call fails.
+    """
+
+    def __init__(self, *, fail_on_call: int) -> None:
+        self._inner = MemoryStateStore()
+        self._fail_on_call = fail_on_call
+        self.append_calls = 0
+
+    async def get_messages(self, session_id: str) -> list[ChatMessage]:
+        return await self._inner.get_messages(session_id)
+
+    async def append(
+        self, session_id: str, message: ChatMessage
+    ) -> None:
+        self.append_calls += 1
+        if self.append_calls == self._fail_on_call:
+            raise StateStoreError(
+                "backend unavailable on assistant persist",
+                context={
+                    "session_id": session_id,
+                    "call_number": self.append_calls,
+                },
+            )
+        await self._inner.append(session_id, message)
+
+    async def delete(self, session_id: str) -> None:
+        await self._inner.delete(session_id)
+
+
+async def test_state_store_error_on_assistant_append_propagates_after_final_event() -> None:
+    """Phase-5 failure: FinalEvent IS yielded, then persistence boundary raises.
+
+    The loop produces a clean :class:`FinalEvent`; the Runner attempts to
+    append the assistant message and the store raises
+    :class:`StateStoreError`. The error must propagate to the caller,
+    the user message must remain durable, and no assistant message may
+    land in the store.
+    """
+    # First append = user message (succeeds), second append = assistant
+    # message (raises). No system_prompt → no system append in between.
+    failing = _FailingNthAppendStore(fail_on_call=2)
+    typed_failing: StateStore = failing
+    llm = FakeLLMClient(replies=[make_response(final_json("answer"))])
+    runner, _ = make_runner(llm=llm, state=typed_failing)
+
+    seen_events: list[AgentEvent] = []
+    with pytest.raises(StateStoreError):
+        async for event in runner.run("s1", "Hi"):
+            seen_events.append(event)
+
+    # FinalEvent was yielded BEFORE the persistence boundary failed.
+    assert any(isinstance(e, FinalEvent) for e in seen_events)
+    assert isinstance(seen_events[-1], FinalEvent)
+    final_event = seen_events[-1]
+    assert isinstance(final_event, FinalEvent)
+    assert final_event.text == "answer"
+
+    # Exactly two append attempts: user (ok) + assistant (raised).
+    assert failing.append_calls == 2
+
+    # State has only the user message — the assistant persist failed at
+    # the durability boundary, so no fake assistant turn was committed.
+    history = await failing.get_messages("s1")
+    assert [m.role for m in history] == ["user"]
+    assert history[0].content == "Hi"
+
+
 # ---------------------------------------------------------------------------
 # Top-level exports
 # ---------------------------------------------------------------------------

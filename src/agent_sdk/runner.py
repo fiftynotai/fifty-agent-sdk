@@ -51,16 +51,33 @@ Logging
     Module-level :mod:`structlog` logger. ``INFO`` on run start and run
     end; ``ERROR`` only when persistence itself fails. Never logs prompt
     or message content — only lengths and counts.
+
+    The ``runner.run_completed`` log carries ``terminated_by`` with one of:
+
+    * ``"final_answer"`` — happy path: a clean :class:`FinalEvent` was
+      yielded and the assistant message was persisted.
+    * ``"error"`` — loop-internal failure (LLMError, ParserError,
+      MaxIterationsExceeded). The loop's fallback FinalEvent is yielded
+      but the assistant message is NOT persisted.
+    * ``"state_store_error"`` — durability boundary failed. A
+      :class:`agent_sdk.errors.StateStoreError` propagated out of one of
+      the load/append calls. A companion ``phase`` field names which
+      site failed: ``"load"``, ``"persist_system"``, ``"persist_user"``,
+      or ``"persist_assistant"``.
+    * ``"cancelled"`` — caller cancelled the consumer task or broke out
+      of the ``async for`` via ``aclose()``.
 """
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from typing import Final
 from uuid import uuid4
 
 import structlog
 
+from agent_sdk.errors import StateStoreError
 from agent_sdk.llm.types import ChatMessage
 from agent_sdk.loop import AgentLoop
 from agent_sdk.state.protocol import StateStore
@@ -181,7 +198,21 @@ class AgentRunner:
         run_id = uuid4().hex
 
         # ── PHASE 1: LOAD ──────────────────────────────────────────────
-        history = await self._state.get_messages(session_id)
+        try:
+            history = await self._state.get_messages(session_id)
+        except StateStoreError as exc:
+            _log.error(
+                "runner.persist_failed",
+                phase="load",
+                session_id=session_id,
+                run_id=run_id,
+                error_type=type(exc).__name__,
+                error_message=str(exc),
+            )
+            # No run_completed log here: we never entered the try/finally
+            # block below, so there is nothing to summarise. The caller
+            # gets the StateStoreError unchanged.
+            raise
         is_first_turn = len(history) == 0
         _log.info(
             "runner.run_started",
@@ -193,32 +224,64 @@ class AgentRunner:
             has_prior_messages=not is_first_turn,
         )
 
-        # ── PHASE 2: PERSIST KICKOFF (FIRST TURN ONLY) ────────────────
-        if is_first_turn and self._system_prompt is not None:
-            sys_msg = ChatMessage(role="system", content=self._system_prompt)
-            await self._state.append(session_id, sys_msg)
-            # Mirror locally — `history` was a defensive copy.
-            history.append(sys_msg)
-
-        # ── PHASE 3: PERSIST USER MESSAGE ─────────────────────────────
-        user_msg = ChatMessage(role="user", content=user_message)
-        await self._state.append(session_id, user_msg)
-        history.append(user_msg)
-
-        # ── PHASE 4: DRIVE THE LOOP ───────────────────────────────────
-        # AgentLoop adds its OWN structured system message to the head of
-        # its working list — that is the per-iteration reasoning scaffold
-        # (tool descriptions, output format hints) and is separate from
-        # any role="system" message we persisted in phase 2 (the consumer's
-        # kickoff). Both coexist in the prompt; that is intentional.
-        loop_messages = list(history)  # defensive copy for the loop
-
+        # Initial value is "interrupted" — neutral and applies to any
+        # unexpected exit path (e.g. an exception escaping the loop that
+        # we did not catch explicitly). The dedicated
+        # ``except asyncio.CancelledError`` branch upgrades this to
+        # ``"cancelled"`` ONLY when we can attribute exit to an actual
+        # task/consumer cancellation.
+        terminated_by = "interrupted"
+        state_store_error_phase: str | None = None
         saw_error = False
         final_text: str | None = None
-        terminated_by = "cancelled"
         event_count = 0
 
         try:
+            # ── PHASE 2: PERSIST KICKOFF (FIRST TURN ONLY) ────────────
+            if is_first_turn and self._system_prompt is not None:
+                sys_msg = ChatMessage(role="system", content=self._system_prompt)
+                try:
+                    await self._state.append(session_id, sys_msg)
+                except StateStoreError as exc:
+                    state_store_error_phase = "persist_system"
+                    _log.error(
+                        "runner.persist_failed",
+                        phase="persist_system",
+                        session_id=session_id,
+                        run_id=run_id,
+                        error_type=type(exc).__name__,
+                        error_message=str(exc),
+                    )
+                    raise
+                # Mirror locally — `history` was a defensive copy.
+                history.append(sys_msg)
+
+            # ── PHASE 3: PERSIST USER MESSAGE ─────────────────────────
+            user_msg = ChatMessage(role="user", content=user_message)
+            try:
+                await self._state.append(session_id, user_msg)
+            except StateStoreError as exc:
+                state_store_error_phase = "persist_user"
+                _log.error(
+                    "runner.persist_failed",
+                    phase="persist_user",
+                    session_id=session_id,
+                    run_id=run_id,
+                    error_type=type(exc).__name__,
+                    error_message=str(exc),
+                )
+                raise
+            history.append(user_msg)
+
+            # ── PHASE 4: DRIVE THE LOOP ───────────────────────────────
+            # AgentLoop adds its OWN structured system message to the
+            # head of its working list — that is the per-iteration
+            # reasoning scaffold (tool descriptions, output format
+            # hints) and is separate from any role="system" message we
+            # persisted in phase 2 (the consumer's kickoff). Both
+            # coexist in the prompt; that is intentional.
+            loop_messages = list(history)  # defensive copy for the loop
+
             async for event in self._loop.run(loop_messages):
                 event_count += 1
                 if isinstance(event, ErrorEvent):
@@ -230,14 +293,34 @@ class AgentRunner:
             # ── PHASE 5: PERSIST ASSISTANT (SUCCESS PATH) ─────────────
             if not saw_error and final_text is not None:
                 asst_msg = ChatMessage(role="assistant", content=final_text)
-                await self._state.append(session_id, asst_msg)
+                try:
+                    await self._state.append(session_id, asst_msg)
+                except StateStoreError as exc:
+                    state_store_error_phase = "persist_assistant"
+                    _log.error(
+                        "runner.persist_failed",
+                        phase="persist_assistant",
+                        session_id=session_id,
+                        run_id=run_id,
+                        error_type=type(exc).__name__,
+                        error_message=str(exc),
+                    )
+                    raise
                 terminated_by = "final_answer"
             else:
                 # Error path: an ErrorEvent was emitted; the loop's
                 # fallback FinalEvent is yielded but NOT persisted, so
                 # the next run() does not see a fake assistant turn.
                 terminated_by = "error"
+        except asyncio.CancelledError:
+            # Caller cancelled the consumer task (or broke out via
+            # ``aclose()``). Attribute exit to cancellation and let the
+            # exception propagate untouched.
+            terminated_by = "cancelled"
+            raise
         finally:
+            if state_store_error_phase is not None:
+                terminated_by = "state_store_error"
             assistant_persisted = terminated_by == "final_answer"
             _log.info(
                 "runner.run_completed",
@@ -247,6 +330,7 @@ class AgentRunner:
                 assistant_message_persisted=assistant_persisted,
                 event_count=event_count,
                 final_event_type="final" if final_text is not None else None,
+                phase=state_store_error_phase,
             )
 
 
