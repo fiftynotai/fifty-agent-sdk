@@ -316,6 +316,29 @@ output before applying.
 """
 
 
+def _wrap_state_store_error(
+    exc: SQLAlchemyError,
+    *,
+    session_id: str,
+    operation: str,
+) -> StateStoreError:
+    """Build the SDK's standard wrap of a SQLAlchemy backend failure.
+
+    Returns the :class:`StateStoreError`; the caller writes
+    ``raise _wrap_state_store_error(...) from exc`` so the
+    ``__cause__`` chain (the BR-009 error-wrapping contract) is
+    preserved at every call site.
+    """
+    return StateStoreError(
+        f"SqlStateStore.{operation} failed for session_id={session_id}",
+        context={
+            "session_id": session_id,
+            "wrapped": type(exc).__name__,
+            "operation": operation,
+        },
+    )
+
+
 class SqlStateStore:
     """SQLAlchemy-backed implementation of :class:`StateStore`.
 
@@ -348,6 +371,40 @@ class SqlStateStore:
         * Construct with an :class:`AsyncEngine` → the caller owns the
           engine. :meth:`aclose` is a no-op on the engine; the caller
           must dispose it themselves.
+
+    Example:
+        Construct from a URL (the store owns and disposes the engine)
+        and wire it into an :class:`AgentRunner`::
+
+            from agent_sdk import (
+                AgentLoop, AgentRunner, JsonModeParser, PromptSections,
+                Registry, SafetyConfig, SqlStateStore,
+            )
+            from agent_sdk.llm import OpenAICompatibleClient
+
+            state = SqlStateStore("sqlite+aiosqlite:///./agent.db")
+            try:
+                runner = AgentRunner(
+                    loop=AgentLoop(
+                        llm=OpenAICompatibleClient(...),
+                        registry=Registry(),
+                        parser=JsonModeParser(),
+                        prompts=PromptSections(persona="You are helpful."),
+                        safety=SafetyConfig(),
+                        model="gpt-4o",
+                    ),
+                    state=state,
+                    system_prompt="You are a helpful customer-support agent.",
+                )
+                async for event in runner.run("session-abc", "Hello"):
+                    print(event)
+            finally:
+                await state.aclose()
+
+        Schema must be created out-of-band (the SDK does not own
+        migrations); register :data:`sql_metadata` with your Alembic
+        environment first. See the module docstring's
+        "Schema lifecycle" section.
 
     Failure mode:
         Every public method wraps :class:`sqlalchemy.exc.SQLAlchemyError`
@@ -492,13 +549,8 @@ class SqlStateStore:
                 )
                 return messages
         except SQLAlchemyError as exc:
-            raise StateStoreError(
-                f"SqlStateStore.get_messages failed for session_id={session_id}",
-                context={
-                    "session_id": session_id,
-                    "wrapped": type(exc).__name__,
-                    "operation": "get_messages",
-                },
+            raise _wrap_state_store_error(
+                exc, session_id=session_id, operation="get_messages"
             ) from exc
 
     async def append(self, session_id: str, message: ChatMessage) -> None:
@@ -551,13 +603,18 @@ class SqlStateStore:
                 parent.last_active_at = func.now()
 
                 # 3. Compute the next sequence under the held lock.
-                next_seq_raw = await session.scalar(
+                # COALESCE(MAX(sequence), 0) + 1 is always a non-null integer,
+                # so we can rely on scalar_one() here. If this SELECT is ever
+                # changed in a way that could yield no row (e.g., dropping
+                # COALESCE), the call below will raise NoResultFound -- that
+                # surfaces as a SQLAlchemyError and gets wrapped uniformly by
+                # the surrounding except block.
+                result = await session.execute(
                     select(func.coalesce(func.max(AgentMessage.sequence), 0) + 1).where(
                         AgentMessage.session_id == session_id
                     )
                 )
-                # `coalesce(MAX,0)+1` is non-null and integer; cast for mypy.
-                next_seq: int = int(next_seq_raw) if next_seq_raw is not None else 1
+                next_seq: int = int(result.scalar_one())
 
                 # 4. Insert the message.
                 session.add(
@@ -577,13 +634,8 @@ class SqlStateStore:
                 sequence=next_seq,
             )
         except SQLAlchemyError as exc:
-            raise StateStoreError(
-                f"SqlStateStore.append failed for session_id={session_id}",
-                context={
-                    "session_id": session_id,
-                    "wrapped": type(exc).__name__,
-                    "operation": "append",
-                },
+            raise _wrap_state_store_error(
+                exc, session_id=session_id, operation="append"
             ) from exc
 
     async def delete(self, session_id: str) -> None:
@@ -626,13 +678,8 @@ class SqlStateStore:
                 existed=True,
             )
         except SQLAlchemyError as exc:
-            raise StateStoreError(
-                f"SqlStateStore.delete failed for session_id={session_id}",
-                context={
-                    "session_id": session_id,
-                    "wrapped": type(exc).__name__,
-                    "operation": "delete",
-                },
+            raise _wrap_state_store_error(
+                exc, session_id=session_id, operation="delete"
             ) from exc
 
 

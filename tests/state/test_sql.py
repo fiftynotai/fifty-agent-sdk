@@ -463,6 +463,7 @@ async def test_store_wraps_integrity_error_on_duplicate_sequence(
             from sqlalchemy.exc import SQLAlchemyError as _SA
 
             from agent_sdk.state.sql import AgentSession as _AS
+            from agent_sdk.state.sql import _wrap_state_store_error
 
             try:
                 async with self._session_factory() as session, session.begin():
@@ -481,13 +482,8 @@ async def test_store_wraps_integrity_error_on_duplicate_sequence(
                         )
                     )
             except _SA as exc:
-                raise StateStoreError(
-                    f"SqlStateStore.append failed for session_id={session_id}",
-                    context={
-                        "session_id": session_id,
-                        "wrapped": type(exc).__name__,
-                        "operation": "append",
-                    },
+                raise _wrap_state_store_error(
+                    exc, session_id=session_id, operation="append"
                 ) from exc
 
     dup_store = _DuplicatingStore(engine)
