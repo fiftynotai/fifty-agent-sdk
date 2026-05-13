@@ -292,6 +292,20 @@ class MCPClient:
     network I/O; the first call to :meth:`discover` or :meth:`invoke`
     establishes the connection.
 
+    Invariant — auth headers MUST NEVER appear in MCPError.context.
+        Every :class:`MCPError` raised by this client builds its
+        ``context`` dict from the small allow-list ``{server_url, method,
+        tool_name, wrapped, status_code, error_code, error_data,
+        expected_id, received_id, has_result, has_error,
+        envelope_jsonrpc, content, operation}`` — no header dict is ever
+        captured. ``_resolve_auth`` still tracks declared header names
+        for any future code path that *does* need to surface headers
+        (e.g. a debug-mode dump): that path MUST funnel through
+        :func:`_redact_headers` first. The next person tempted to widen
+        the context shape: do not put headers in. Use
+        :func:`_redact_headers` and prove a test exercises the
+        redaction.
+
     Args:
         config: Connection configuration.
         auth: Either a static header mapping (applied to every request)
@@ -337,6 +351,7 @@ class MCPClient:
                 transport=httpx.AsyncHTTPTransport(retries=config.connect_retries),
             )
             self._owns_client = True
+        self._closed: bool = False
 
     # ------------------------------------------------------------------
     # Public API
@@ -352,8 +367,18 @@ class MCPClient:
         Raises:
             MCPError: For any transport failure, malformed JSON-RPC
                 envelope, server-returned error object, or unexpected
-                ``result`` shape (e.g. ``tools`` not a list).
+                ``result`` shape (e.g. ``tools`` not a list). Also
+                raised with ``message == "MCP client is closed"`` when
+                invoked after :meth:`aclose`.
         """
+        if self._closed:
+            raise MCPError(
+                "MCP client is closed",
+                context={
+                    "operation": "discover",
+                    "server_url": self._config.base_url,
+                },
+            ) from None
         result = await self._call("tools/list", params=None)
         return self._parse_tool_catalog(result)
 
@@ -387,10 +412,16 @@ class MCPClient:
         """Close the owned :class:`httpx.AsyncClient`, if any.
 
         Externally-provided clients are NOT closed — their lifecycle
-        belongs to the caller.
+        belongs to the caller. Idempotent: a second ``aclose()`` is a
+        no-op and does NOT raise. After ``aclose()`` returns, calls to
+        :meth:`discover` and :meth:`invoke` raise :class:`MCPError`
+        with ``message == "MCP client is closed"``.
         """
+        if self._closed:
+            return
         if self._owns_client:
             await self._client.aclose()
+        self._closed = True
 
     # ------------------------------------------------------------------
     # Internals
@@ -410,11 +441,18 @@ class MCPClient:
         callable auth supports token rotation) and never appear in the
         error context.
         """
+        if self._closed:
+            raise MCPError(
+                "MCP client is closed",
+                context={
+                    "operation": method,
+                    "server_url": self._config.base_url,
+                },
+            ) from None
         envelope = _make_request(method, params)
         request_id: str = envelope["id"]
 
-        resolved_auth, dynamic_auth_keys = await self._resolve_auth()
-        sensitive_keys = self._declared_auth_keys | dynamic_auth_keys
+        resolved_auth, _ = await self._resolve_auth()
         headers: dict[str, str] = {
             "Content-Type": "application/json",
             "Accept": "application/json",
@@ -486,12 +524,6 @@ class MCPClient:
             )
 
         # _parse_response raises MCPError on any envelope/protocol issue.
-        # Suppress the unused-variable in sensitive_keys path: the
-        # redaction helper is exposed for callers that capture headers
-        # into error context; here, we never put headers in context, so
-        # the only purpose of sensitive_keys is documentation + future
-        # extension points (kept tracked to honor the auth contract).
-        del sensitive_keys
         result = _parse_response(
             decoded,
             expected_id=request_id,
@@ -598,6 +630,20 @@ class MCPClient:
         Per MCP spec the success shape is::
 
             {"content": [...], "isError": false}
+
+        Security note — error-content capture:
+            When ``isError`` is True, ``result["content"]`` is captured
+            verbatim into ``MCPError.context["content"]``. The SDK has no
+            way to know what an MCP server places in that field — a
+            non-conformant or poorly-implemented server MAY echo request
+            arguments, credentials, or other sensitive material into the
+            error content, in which case that material surfaces in our
+            error logs. We intentionally preserve the value as-is rather
+            than redact it: the SDK does not own the schema, redaction
+            would mask real debug info, and the threat model here is a
+            misbehaving downstream (which we cannot fix from the client
+            side). Consumers running against untrusted MCP servers SHOULD
+            scrub ``MCPError.context["content"]`` before logging.
 
         If ``isError`` is True, raise :class:`MCPError`. If ``content`` is
         present, return it verbatim; otherwise return the raw ``result`` —

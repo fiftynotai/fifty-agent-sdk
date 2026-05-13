@@ -433,8 +433,29 @@ async def test_aclose_disposes_owned_client(
     mcp_server.set_tool_catalog([])
     await client.discover()  # works
     await client.aclose()
-    with pytest.raises(RuntimeError):
+    # Post-aclose, the defensive guard maps the "client closed" condition
+    # into the uniform MCPError contract instead of leaking httpx's
+    # RuntimeError. Asserting the message + operation context pins the
+    # contract end-to-end (TD-007 item 2).
+    with pytest.raises(MCPError) as exc:
         await client.discover()
+    assert "closed" in exc.value.message.lower()
+    assert exc.value.context["operation"] == "discover"
+
+
+async def test_aclose_is_idempotent(
+    mcp_server: MockMCPServer,
+) -> None:
+    """A second ``aclose()`` is a no-op and MUST NOT raise (TD-007 item 2)."""
+    cfg = _config()
+    client = MCPClient(cfg)
+    client._client._transport = httpx.MockTransport(mcp_server.handle)  # type: ignore[attr-defined]
+    mcp_server.set_tool_catalog([])
+    await client.discover()
+    await client.aclose()
+    # Second call must short-circuit cleanly — no exception, no double-close
+    # of the underlying httpx client.
+    await client.aclose()
 
 
 async def test_caller_provided_client_not_disposed(
@@ -458,7 +479,7 @@ async def test_caller_provided_client_not_disposed(
 # ---------------------------------------------------------------------------
 
 
-async def test_discover_rejects_tools_not_a_list(
+async def test_discover_rejects_malformed_envelope(
     mcp_server: MockMCPServer, mcp_http_client: httpx.AsyncClient
 ) -> None:
     bad = json.dumps(
@@ -466,12 +487,10 @@ async def test_discover_rejects_tools_not_a_list(
     ).encode()
     mcp_server.force_next_raw(bad)
     client = _make_client(mcp_http_client)
-    # id mismatch will fire first; force a matching id by also injecting
-    # the expected id — easier path: set tool catalog to a non-list via
-    # the dispatcher's natural shape, but the dispatcher only emits lists.
-    # So we accept the id-mismatch error here as proxy for malformed
-    # envelope handling and pivot to a different malformed shape: have the
-    # dispatcher route a real catalog and test the parser branch directly.
+    # The strict mock validates envelope shape before the parser sees it,
+    # so the id-mismatch path fires first. Assertion still proves that
+    # malformed envelopes surface as MCPError; parser-branch coverage for
+    # ``tools: <not-a-list>`` is left to a future brief.
     with pytest.raises(MCPError):
         await client.discover()
 
