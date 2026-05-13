@@ -10,14 +10,19 @@ Public surface:
 - :class:`Registry` — name-keyed dispatch with timeout enforcement.
 - :func:`tool` — decorator that lifts an ``async def`` into a :class:`Tool`.
 - :class:`InProcProvider` — bulk-register helper for decorated callables.
+- :class:`MCPProvider` — bridges an :class:`agent_sdk.mcp.client.MCPClient`
+  into the registry, registering one adapter per MCP-advertised tool.
 """
 
 from agent_sdk.tools.inproc_provider import InProcProvider, tool
+from agent_sdk.tools.mcp_provider import MCPProvider, RefreshSummary
 from agent_sdk.tools.protocol import Tool, ToolCall, ToolResult, ToolSchema
 from agent_sdk.tools.registry import Registry
 
 __all__ = [
     "InProcProvider",
+    "MCPProvider",
+    "RefreshSummary",
     "Registry",
     "Tool",
     "ToolCall",

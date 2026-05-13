@@ -54,6 +54,31 @@ class LLMError(AgentSdkError):
     """
 
 
+class MCPError(AgentSdkError):
+    """MCP transport, protocol, or tool-call failure.
+
+    Raised by :class:`agent_sdk.mcp.client.MCPClient` for:
+
+    - Transport failures (connection refused, timeout, non-2xx HTTP)
+    - Malformed JSON-RPC envelopes (missing ``jsonrpc``/``id``, bad ``result``)
+    - Server-returned JSON-RPC ``error`` payloads (``error.code``,
+      ``error.message``)
+    - Argument validation errors surfaced by the remote tool
+
+    ``context`` typically carries ``server_url``, ``method``, ``tool_name``,
+    ``error_code``, ``status_code``, or ``wrapped`` (the underlying httpx
+    exception class name). It NEVER includes auth headers — they are stripped
+    before recording (see :class:`agent_sdk.mcp.client.MCPClient`).
+
+    Because :class:`MCPError` is an :class:`AgentSdkError`, the tool
+    :class:`agent_sdk.tools.registry.Registry` re-raises it untouched rather
+    than wrapping it in a :class:`agent_sdk.tools.protocol.ToolResult` with
+    ``is_error=True``. This treats MCP failures as system errors the
+    surrounding runner can catch and surface, NOT as recoverable per-tool
+    failures the LLM should reason about.
+    """
+
+
 class ToolNotFound(AgentSdkError):
     """A requested tool name was not present in the registry."""
 
@@ -77,6 +102,7 @@ class StateStoreError(AgentSdkError):
 __all__ = [
     "AgentSdkError",
     "LLMError",
+    "MCPError",
     "MaxIterationsExceeded",
     "ParserError",
     "StateStoreError",

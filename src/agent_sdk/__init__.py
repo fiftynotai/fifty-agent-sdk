@@ -21,6 +21,7 @@ from agent_sdk.errors import (
     AgentSdkError,
     LLMError,
     MaxIterationsExceeded,
+    MCPError,
     ParserError,
     StateStoreError,
     ToolNotFound,
@@ -38,6 +39,7 @@ from agent_sdk.llm import (
     Usage,
 )
 from agent_sdk.loop import AgentLoop
+from agent_sdk.mcp import MCPClient, MCPClientConfig, MCPToolDef
 from agent_sdk.parser import (
     FinalAnswer,
     JsonModeParser,
@@ -73,6 +75,8 @@ from agent_sdk.streaming import (
 )
 from agent_sdk.tools import (
     InProcProvider,
+    MCPProvider,
+    RefreshSummary,
     Registry,
     Tool,
     ToolResult,
@@ -104,6 +108,11 @@ __all__ = [
     "JsonModeParser",
     "LLMClient",
     "LLMError",
+    "MCPClient",
+    "MCPClientConfig",
+    "MCPError",
+    "MCPProvider",
+    "MCPToolDef",
     "MaxIterationsExceeded",
     "MemoryStateStore",
     "NativeToolsParser",
@@ -115,6 +124,7 @@ __all__ = [
     "ParserError",
     "PromptSections",
     "ProseModeParser",
+    "RefreshSummary",
     "Registry",
     "Role",
     "SafetyConfig",
