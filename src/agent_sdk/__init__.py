@@ -5,12 +5,13 @@ Foundation layer: typed errors, Pydantic v2 message types, the
 prompt template builder. Higher layers (parser, tool registry, ReACT loop,
 state stores) build on these contracts in subsequent briefs.
 
-Optional ``sql`` extra surface
-    :class:`SqlStateStore` and :data:`sql_metadata` are re-exported
-    lazily — they require ``pip install 'agent-sdk[sql]'``. Importing
-    :mod:`agent_sdk` itself does not pull SQLAlchemy. First access to
-    either symbol triggers the import and raises a clear
-    :class:`ImportError` if the extra is missing.
+Optional extra surface
+    :class:`SqlStateStore` and :data:`sql_metadata` (the ``sql`` extra,
+    ``pip install 'agent-sdk[sql]'``) and :class:`RedisStateStore` (the
+    ``redis`` extra, ``pip install 'agent-sdk[redis]'``) are re-exported
+    lazily. Importing :mod:`agent_sdk` itself pulls neither SQLAlchemy nor
+    redis-py. First access to one of these symbols triggers its import and
+    raises a clear :class:`ImportError` if the relevant extra is missing.
 """
 
 from __future__ import annotations
@@ -85,6 +86,7 @@ from agent_sdk.tools import (
 )
 
 if TYPE_CHECKING:
+    from agent_sdk.state.redis import RedisStateStore
     from agent_sdk.state.sql import SqlStateStore, sql_metadata
 
 __version__ = "0.0.1"
@@ -124,6 +126,7 @@ __all__ = [
     "ParserError",
     "PromptSections",
     "ProseModeParser",
+    "RedisStateStore",
     "RefreshSummary",
     "Registry",
     "Role",
@@ -153,15 +156,20 @@ __all__ = [
 
 
 def __getattr__(name: str) -> Any:
-    """Lazily import SQL surface symbols on first access.
+    """Lazily import optional-extra surface symbols on first access.
 
-    ``SqlStateStore`` and ``sql_metadata`` require the optional ``sql``
-    extra. Routing access through this hook keeps ``import agent_sdk``
-    free of SQLAlchemy and surfaces a clear :class:`ImportError` only
-    when the symbols are actually used without the extra installed.
+    ``SqlStateStore`` / ``sql_metadata`` require the optional ``sql``
+    extra; ``RedisStateStore`` requires the ``redis`` extra. Routing
+    access through this hook keeps ``import agent_sdk`` free of
+    SQLAlchemy and redis-py, and surfaces a clear :class:`ImportError`
+    only when the symbols are actually used without the extra installed.
     """
     if name in {"SqlStateStore", "sql_metadata"}:
         from agent_sdk.state import sql
 
         return getattr(sql, name)
+    if name == "RedisStateStore":
+        from agent_sdk.state import redis
+
+        return redis.RedisStateStore
     raise AttributeError(f"module 'agent_sdk' has no attribute {name!r}")
