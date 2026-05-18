@@ -35,6 +35,7 @@ Streaming semantics
 from __future__ import annotations
 
 import json
+import time
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from typing import Any, Final, TypeVar
@@ -44,7 +45,9 @@ import structlog
 
 from agent_sdk.errors import LLMError, ParserError, ToolNotFound, ToolTimeout
 from agent_sdk.llm.protocol import LLMClient
-from agent_sdk.llm.types import ChatMessage, ChatRequest, ChatResponse
+from agent_sdk.llm.types import ChatMessage, ChatRequest, ChatResponse, Usage
+from agent_sdk.observability import Hooks
+from agent_sdk.observability.hooks import invoke_hook
 from agent_sdk.parser.base import FinalAnswer, Parser
 from agent_sdk.prompts import PromptSections, render_system_prompt
 from agent_sdk.safety import SafetyConfig
@@ -171,6 +174,30 @@ async def _accumulate_stream(
     return "".join(deltas), deltas
 
 
+def _synthesize_stream_response(completion: str) -> ChatResponse:
+    """Build a :class:`ChatResponse` standing in for a streamed completion.
+
+    A stream has no single :class:`ChatResponse` — :func:`_accumulate_stream`
+    drains the per-chunk responses and discards them. The ``on_llm_call``
+    observability hook is contracted to always receive a real
+    :class:`ChatResponse`, so in stream mode the loop synthesizes one from
+    the accumulated ``completion``: an ``assistant`` :class:`ChatMessage`
+    carrying the full text, zero-filled :class:`Usage` (a stream provides no
+    aggregate token counts here), and ``finish_reason="stop"``.
+
+    Args:
+        completion: The full accumulated completion string.
+
+    Returns:
+        A synthesized :class:`ChatResponse` for the ``on_llm_call`` hook.
+    """
+    return ChatResponse(
+        message=ChatMessage(role="assistant", content=completion),
+        usage=Usage(prompt_tokens=0, completion_tokens=0, total_tokens=0),
+        finish_reason="stop",
+    )
+
+
 class AgentLoop:
     """Production ReACT loop.
 
@@ -212,6 +239,15 @@ class AgentLoop:
             in ``prompts.output_format``. Useful for callers that want
             to pin the parser-aligned format without rebuilding
             ``prompts``.
+        hooks: Optional :class:`agent_sdk.observability.Hooks`. When set,
+            the loop fires the two Loop-tier hooks — ``on_iteration`` once
+            per ReACT iteration and ``on_llm_call`` once per successful LLM
+            call. The other five hooks are Runner-tier; wire the SAME
+            :class:`Hooks` instance into :class:`agent_sdk.runner.
+            AgentRunner` as well so all seven fire (the loop does NOT
+            receive ``hooks`` from a Runner — the two are wired
+            independently by the consumer). A raising hook never aborts the
+            loop. When ``None`` (default), hook dispatch is zero-overhead.
     """
 
     def __init__(
@@ -227,6 +263,7 @@ class AgentLoop:
         model: str,
         stream: bool = False,
         output_format: str = "",
+        hooks: Hooks | None = None,
     ) -> None:
         self._llm = llm
         self._registry = registry
@@ -234,6 +271,7 @@ class AgentLoop:
         self._safety = safety
         self._model = model
         self._stream = stream
+        self._hooks = hooks
         # Snapshot tool descriptions ONCE; subsequent registry mutations are
         # invisible to this loop instance. Documented behavior.
         self._system_prompt = self._build_system_prompt(prompts, output_format)
@@ -257,7 +295,7 @@ class AgentLoop:
         return ChatRequest(messages=list(messages), model=self._model)
 
     async def run(
-        self, messages: list[ChatMessage]
+        self, messages: list[ChatMessage], *, session_id: str | None = None
     ) -> AsyncIterator[AgentEvent]:
         """Drive a single ReACT run.
 
@@ -279,6 +317,13 @@ class AgentLoop:
             messages: Caller's conversation messages. Not mutated. The
                 loop builds a private working list prefixed with the
                 system message it constructed at ``__init__`` time.
+            session_id: Opaque session identifier forwarded verbatim to the
+                Loop-tier observability hooks (``on_iteration`` and
+                ``on_llm_call``). ``None`` — the default — when the loop is
+                driven directly without an :class:`agent_sdk.runner.
+                AgentRunner`; a Runner passes the conversation's
+                ``session_id`` down. The hook contract types this parameter
+                as ``str | None`` for exactly this reason.
 
         Yields:
             :class:`agent_sdk.streaming.AgentEvent` values in monotonic
@@ -303,11 +348,19 @@ class AgentLoop:
         while iteration < self._safety.max_iterations:
             iteration += 1
             _log.info("iteration_started", iteration=iteration, run_id=run_id)
+            await self._invoke_hook(
+                "on_iteration",
+                self._hooks.on_iteration if self._hooks is not None else None,
+                session_id,
+                iteration,
+            )
 
             # ----- 1. Build request and call LLM ----------------------------
             request = self._build_request(working)
             try:
-                completion, deltas = await self._call_llm(request)
+                llm_t0 = time.perf_counter()
+                completion, deltas, response = await self._call_llm(request)
+                llm_duration_ms = (time.perf_counter() - llm_t0) * 1000
             except LLMError as exc:
                 yield self._make_event(
                     ErrorEvent,
@@ -328,6 +381,28 @@ class AgentLoop:
                     terminated_by="llm_error",
                 )
                 return
+
+            # `on_llm_call` fires once per SUCCESSFUL LLM call only — an
+            # LLMError surfaces via the Runner-tier `on_error` hook (driven
+            # by the ErrorEvent above), so firing here with no response
+            # would be ill-defined. In stream mode `_call_llm` returns
+            # `response is None` (a stream has no single response object);
+            # synthesize a minimal ChatResponse from the accumulated
+            # completion so the hook always receives a real ChatResponse.
+            if self._hooks is not None and self._hooks.on_llm_call is not None:
+                llm_response = (
+                    response
+                    if response is not None
+                    else _synthesize_stream_response(completion)
+                )
+                await self._invoke_hook(
+                    "on_llm_call",
+                    self._hooks.on_llm_call,
+                    session_id,
+                    request,
+                    llm_response,
+                    llm_duration_ms,
+                )
 
             # ----- 2. Parse the completion ---------------------------------
             try:
@@ -520,26 +595,58 @@ class AgentLoop:
             terminated_by="safety_cap",
         )
 
-    async def _call_llm(self, request: ChatRequest) -> tuple[str, list[str]]:
+    async def _call_llm(
+        self, request: ChatRequest
+    ) -> tuple[str, list[str], ChatResponse | None]:
         """Call the LLM in either streaming or non-streaming mode.
 
-        Returns a tuple ``(completion, deltas)``. In non-stream mode
-        ``deltas`` is empty; in stream mode it carries the per-chunk
-        deltas accumulated by :func:`_accumulate_stream`.
+        Returns a tuple ``(completion, deltas, response)``:
+
+        * ``completion`` — the full completion string.
+        * ``deltas`` — the per-chunk deltas. Empty in non-stream mode; the
+          accumulated deltas in stream mode.
+        * ``response`` — the underlying :class:`ChatResponse` in non-stream
+          mode, or ``None`` in stream mode. A stream has no single response
+          object — the per-chunk responses are drained by
+          :func:`_accumulate_stream` and discarded. The ``None`` is surfaced
+          (rather than synthesized here) so the caller can decide whether a
+          synthesized response is needed; the ``on_llm_call`` fire site
+          synthesizes one only when the hook is actually wired.
 
         Args:
             request: The :class:`ChatRequest` to issue.
 
         Returns:
-            A two-tuple of the full completion string and the deltas list.
+            A three-tuple of the completion string, the deltas list, and the
+            :class:`ChatResponse` (``None`` in stream mode).
 
         Raises:
             agent_sdk.errors.LLMError: Forwarded from the underlying client.
         """
         if self._stream:
-            return await _accumulate_stream(self._llm, request)
+            completion, deltas = await _accumulate_stream(self._llm, request)
+            return completion, deltas, None
         response: ChatResponse = await self._llm.complete(request)
-        return response.message.content, []
+        return response.message.content, [], response
+
+    async def _invoke_hook(
+        self, hook_name: str, hook: Any, *args: Any
+    ) -> None:
+        """Dispatch a single Loop-tier observability hook.
+
+        A thin wrapper over :func:`agent_sdk.observability.hooks.invoke_hook`
+        that keeps the loop's two fire points terse. ``hook`` is ``None``
+        when no :class:`Hooks` is configured or the specific field is unset,
+        in which case the delegate short-circuits with zero overhead. A
+        raising hook is logged and swallowed by the delegate;
+        :class:`asyncio.CancelledError` is re-raised untouched.
+
+        Args:
+            hook_name: Stable name of the hook for the failure log line.
+            hook: The hook callable, or ``None`` for a no-op.
+            *args: Positional arguments forwarded verbatim to the hook.
+        """
+        await invoke_hook(hook, hook_name, *args)
 
     def _make_event(
         self,

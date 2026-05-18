@@ -44,6 +44,7 @@ from agent_sdk.llm import (
 )
 from agent_sdk.loop import AgentLoop
 from agent_sdk.mcp import MCPClient, MCPClientConfig, MCPToolDef
+from agent_sdk.observability import Hooks
 from agent_sdk.parser import (
     FinalAnswer,
     JsonModeParser,
@@ -113,6 +114,7 @@ __all__ = [
     "FinalAnswer",
     "FinalEvent",
     "FinishReason",
+    "Hooks",
     "InProcProvider",
     "JsonModeParser",
     "LLMClient",

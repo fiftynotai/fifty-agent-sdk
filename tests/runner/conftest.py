@@ -27,6 +27,7 @@ from agent_sdk import (
     SafetyConfig,
 )
 from agent_sdk.audit.protocol import AuditSink
+from agent_sdk.observability import Hooks
 from agent_sdk.state.protocol import StateStore
 from tests.loop.conftest import FakeLLMClient
 
@@ -68,6 +69,7 @@ def make_runner(
     system_prompt: str | None = None,
     persona: str = "You are a helpful agent.",
     audit: AuditSink | None = None,
+    hooks: Hooks | None = None,
 ) -> tuple[AgentRunner, StateStore]:
     """Build a ready-to-drive :class:`AgentRunner` and return it with its store.
 
@@ -77,6 +79,12 @@ def make_runner(
     Pass ``audit`` to wire an :class:`agent_sdk.audit.protocol.AuditSink`
     into the runner; left ``None`` (default) the runner emits no audit
     events.
+
+    Pass ``hooks`` to wire an :class:`agent_sdk.observability.Hooks` into the
+    stack. The SAME instance is threaded into BOTH the :class:`AgentLoop`
+    and the :class:`AgentRunner` — the consumer-shares-one-instance pattern
+    — so the two Loop-tier hooks and the five Runner-tier hooks all fire
+    from one wired stack. Left ``None`` (default) no hooks fire.
     """
     loop = AgentLoop(
         llm=llm,
@@ -85,10 +93,15 @@ def make_runner(
         prompts=PromptSections(persona=persona),
         safety=safety if safety is not None else SafetyConfig(),
         model="test-model",
+        hooks=hooks,
     )
     store = state if state is not None else MemoryStateStore()
     runner = AgentRunner(
-        loop=loop, state=store, system_prompt=system_prompt, audit=audit
+        loop=loop,
+        state=store,
+        system_prompt=system_prompt,
+        audit=audit,
+        hooks=hooks,
     )
     return runner, store
 

@@ -62,6 +62,25 @@ Audit emission
     zero-overhead: :meth:`_emit_audit` returns before constructing any
     :class:`AuditEvent`.
 
+Observability hooks
+    When an optional :class:`agent_sdk.observability.Hooks` is wired in,
+    the Runner fires five of the seven hooks: ``on_run_start`` once at run
+    start, ``on_tool_start`` / ``on_tool_end`` per tool invocation,
+    ``on_error`` on a loop or durability failure, and ``on_run_end`` once
+    from the ``finally`` block on EVERY exit path. The remaining two hooks
+    (``on_iteration``, ``on_llm_call``) are Loop-tier — the consumer must
+    wire the SAME :class:`Hooks` instance into :class:`agent_sdk.loop.
+    AgentLoop` as well. The Runner does NOT forward ``hooks`` into the loop;
+    the two collaborators are wired independently, exactly like ``audit``.
+
+    Hook dispatch is best-effort and isolated, mirroring audit emission: a
+    raising hook is caught, logged at ``WARNING`` under the
+    ``agent_sdk.observability`` logger (event ``hook.invoke_failed``), and
+    swallowed — including ``on_run_end`` raising inside ``finally``, where
+    the swallow guarantee is what makes awaiting a hook there safe.
+    :class:`asyncio.CancelledError` is re-raised untouched. When ``hooks``
+    is ``None`` (the default) dispatch is zero-overhead.
+
 Logging
     Module-level :mod:`structlog` logger. ``INFO`` on run start and run
     end; ``ERROR`` only when persistence itself fails. Never logs prompt
@@ -86,6 +105,7 @@ Logging
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from typing import Any, Final
@@ -97,6 +117,8 @@ from agent_sdk.audit import AuditEvent, AuditSink
 from agent_sdk.errors import StateStoreError
 from agent_sdk.llm.types import ChatMessage
 from agent_sdk.loop import AgentLoop
+from agent_sdk.observability import Hooks
+from agent_sdk.observability.hooks import invoke_hook
 from agent_sdk.state.protocol import StateStore
 from agent_sdk.streaming import (
     ActionEvent,
@@ -176,6 +198,21 @@ class AgentRunner:
             raising sink never aborts a run — see the module docstring's
             "Audit emission" section. When ``None`` (default), emission is
             zero-overhead.
+        hooks: Optional :class:`agent_sdk.observability.Hooks`. When set,
+            the Runner fires the five Runner-tier hooks (``on_run_start``,
+            ``on_run_end``, ``on_tool_start``, ``on_tool_end``,
+            ``on_error``). The two Loop-tier hooks (``on_iteration``,
+            ``on_llm_call``) fire only from :class:`agent_sdk.loop.
+            AgentLoop` — wire the SAME :class:`Hooks` instance into the
+            loop as well::
+
+                hooks = Hooks(on_run_start=..., on_iteration=...)
+                loop = AgentLoop(..., hooks=hooks)
+                runner = AgentRunner(loop=loop, state=..., hooks=hooks)
+
+            A raising hook never aborts a run — see the module docstring's
+            "Observability hooks" section. When ``None`` (default),
+            dispatch is zero-overhead.
 
     Invariants:
         * Every ``run()`` either persists exactly one user message and
@@ -190,6 +227,10 @@ class AgentRunner:
           :class:`AuditSink` is caught and logged, never propagated. With
           ``audit=None`` the run behaves identically to a Runner built
           without auditing — no events, no overhead.
+        * Observability hook dispatch is best-effort and isolated: a
+          raising hook is caught and logged, never propagated. With
+          ``hooks=None`` the run behaves identically to a Runner built
+          without hooks — no dispatch, no overhead.
         * A Runner-level ``run_id`` is generated per ``run()`` call for
           log correlation and is SEPARATE from the inner :class:`AgentLoop`
           run id. Neither id is exposed on :class:`AgentEvent` values.
@@ -202,11 +243,13 @@ class AgentRunner:
         state: StateStore,
         system_prompt: str | None = None,
         audit: AuditSink | None = None,
+        hooks: Hooks | None = None,
     ) -> None:
         self._loop = loop
         self._state = state
         self._system_prompt = system_prompt
         self._audit = audit
+        self._hooks = hooks
 
     async def _emit_audit(
         self,
@@ -254,6 +297,28 @@ class AgentRunner:
                 error_type=type(exc).__name__,
                 error_message=str(exc),
             )
+
+    async def _invoke_hook(self, hook_name: str, *args: Any) -> None:
+        """Dispatch a single Runner-tier observability hook.
+
+        Reads the named field off the configured :class:`Hooks` and
+        delegates to :func:`agent_sdk.observability.hooks.invoke_hook`.
+        Short-circuits with zero overhead when no :class:`Hooks` is wired.
+        A raising hook is logged at ``WARNING`` (event
+        ``hook.invoke_failed``) and swallowed by the delegate;
+        :class:`asyncio.CancelledError` is re-raised untouched — which is
+        what makes awaiting ``on_run_end`` inside ``finally`` safe.
+
+        Args:
+            hook_name: Name of the :class:`Hooks` field to fire — one of
+                ``"on_run_start"``, ``"on_run_end"``, ``"on_tool_start"``,
+                ``"on_tool_end"``, ``"on_error"``.
+            *args: Positional arguments forwarded verbatim to the hook.
+        """
+        if self._hooks is None:
+            return
+        hook = getattr(self._hooks, hook_name)
+        await invoke_hook(hook, hook_name, *args)
 
     @staticmethod
     def _tool_invocation_payload(
@@ -349,6 +414,13 @@ class AgentRunner:
                 or from the consumer's cancellation.
         """
         run_id = uuid4().hex
+        # Monotonic start stamp for the `on_run_end` duration. `perf_counter`
+        # (not wall-clock `datetime`) is correct for measuring an elapsed
+        # interval. Captured before PHASE 1 so a load failure is still timed
+        # — but note a load failure raises before the try/finally below, so
+        # `on_run_end` does not fire for it (consistent with the audit layer
+        # not emitting a `run_completed` log on a load failure).
+        run_start = time.perf_counter()
 
         # ── PHASE 1: LOAD ──────────────────────────────────────────────
         try:
@@ -386,6 +458,7 @@ class AgentRunner:
                 "user_message_len": len(user_message),
             },
         )
+        await self._invoke_hook("on_run_start", session_id, user_message)
 
         # Initial value is "interrupted" — neutral and applies to any
         # unexpected exit path (e.g. an exception escaping the loop that
@@ -398,6 +471,15 @@ class AgentRunner:
         saw_error = False
         final_text: str | None = None
         event_count = 0
+        # `run_error` carries the exception that terminated the run, for the
+        # `on_run_end` hook. It is set ONLY by an exception that escaped the
+        # run — a `StateStoreError` from a persist site or a surfaced
+        # `CancelledError`. Typed `BaseException | None` because
+        # `asyncio.CancelledError` is a `BaseException`, not an `Exception`.
+        # A loop-internal failure surfaces an `ErrorEvent` (not a Python
+        # exception) and is reported via `on_error`; for that path
+        # `run_error` stays `None`. See the BR-012 plan's Q5.
+        run_error: BaseException | None = None
 
         try:
             # ── PHASE 2: PERSIST KICKOFF (FIRST TURN ONLY) ────────────
@@ -407,6 +489,7 @@ class AgentRunner:
                     await self._state.append(session_id, sys_msg)
                 except StateStoreError as exc:
                     state_store_error_phase = "persist_system"
+                    run_error = exc
                     _log.error(
                         "runner.persist_failed",
                         phase="persist_system",
@@ -429,6 +512,12 @@ class AgentRunner:
                             "phase": "persist_system",
                         },
                     )
+                    await self._invoke_hook(
+                        "on_error",
+                        session_id,
+                        exc,
+                        {"phase": "persist_system"},
+                    )
                     raise
                 # Mirror locally — `history` was a defensive copy.
                 history.append(sys_msg)
@@ -439,6 +528,7 @@ class AgentRunner:
                 await self._state.append(session_id, user_msg)
             except StateStoreError as exc:
                 state_store_error_phase = "persist_user"
+                run_error = exc
                 _log.error(
                     "runner.persist_failed",
                     phase="persist_user",
@@ -456,6 +546,12 @@ class AgentRunner:
                         "error_message": str(exc),
                         "phase": "persist_user",
                     },
+                )
+                await self._invoke_hook(
+                    "on_error",
+                    session_id,
+                    exc,
+                    {"phase": "persist_user"},
                 )
                 raise
             history.append(user_msg)
@@ -479,8 +575,17 @@ class AgentRunner:
             pending_action: ActionEvent | None = None
             pending_call: ToolStartedEvent | None = None
             last_error: ErrorEvent | None = None
+            # Monotonic stamp set when a `ToolStartedEvent` is seen and
+            # diffed on the terminal tool event for the `on_tool_end`
+            # `duration_ms`. A single slot is sufficient — the ReACT loop
+            # runs one tool at a time — and it lives alongside the existing
+            # `pending_action`/`pending_call` single-slot correlation, not
+            # as a second correlation pass.
+            tool_started_at: float | None = None
 
-            async for event in self._loop.run(loop_messages):
+            async for event in self._loop.run(
+                loop_messages, session_id=session_id
+            ):
                 event_count += 1
                 if isinstance(event, ErrorEvent):
                     saw_error = True
@@ -491,7 +596,20 @@ class AgentRunner:
                     pending_action = event
                 elif isinstance(event, ToolStartedEvent):
                     pending_call = event
+                    tool_started_at = time.perf_counter()
                 yield event
+                # `on_tool_start` fires once the `ToolStartedEvent` is seen;
+                # `args` come from the correlated `pending_action`. Fired
+                # AFTER yielding so consumer delivery is never blocked.
+                if isinstance(event, ToolStartedEvent):
+                    await self._invoke_hook(
+                        "on_tool_start",
+                        session_id,
+                        event.tool_name,
+                        pending_action.args
+                        if pending_action is not None
+                        else {},
+                    )
                 # Emit `tool_invocation` AFTER yielding so consumer event
                 # delivery is never blocked on audit latency.
                 if isinstance(event, ObservationEvent | ToolFailedEvent):
@@ -502,8 +620,30 @@ class AgentRunner:
                             event, pending_action, pending_call
                         ),
                     )
+                    # `on_tool_end` fires beside the audit emission, BEFORE
+                    # the pending slots are cleared. `result` is the tool's
+                    # output on success or the failure string on a
+                    # recoverable failure.
+                    tool_duration_ms = (
+                        (time.perf_counter() - tool_started_at) * 1000
+                        if tool_started_at is not None
+                        else 0.0
+                    )
+                    tool_result = (
+                        event.result.output
+                        if isinstance(event, ObservationEvent)
+                        else event.error
+                    )
+                    await self._invoke_hook(
+                        "on_tool_end",
+                        session_id,
+                        event.tool_name,
+                        tool_result,
+                        tool_duration_ms,
+                    )
                     pending_action = None
                     pending_call = None
+                    tool_started_at = None
 
             # ── PHASE 5: PERSIST ASSISTANT (SUCCESS PATH) ─────────────
             if not saw_error and final_text is not None:
@@ -512,6 +652,7 @@ class AgentRunner:
                     await self._state.append(session_id, asst_msg)
                 except StateStoreError as exc:
                     state_store_error_phase = "persist_assistant"
+                    run_error = exc
                     _log.error(
                         "runner.persist_failed",
                         phase="persist_assistant",
@@ -529,6 +670,12 @@ class AgentRunner:
                             "error_message": str(exc),
                             "phase": "persist_assistant",
                         },
+                    )
+                    await self._invoke_hook(
+                        "on_error",
+                        session_id,
+                        exc,
+                        {"phase": "persist_assistant"},
                     )
                     raise
                 terminated_by = "final_answer"
@@ -563,11 +710,29 @@ class AgentRunner:
                         ),
                     },
                 )
-        except asyncio.CancelledError:
+                # `on_error` fires for the loop-internal failure. The loop
+                # reports failure via an `ErrorEvent`, not a Python
+                # exception, so a lightweight `RuntimeError` is synthesized
+                # from `last_error` for the hook's `error: Exception`
+                # parameter. `run_error` is NOT set here — the run did not
+                # terminate by an escaped exception, so `on_run_end`
+                # receives `error=None` (see the BR-012 plan's Q5).
+                if last_error is not None:
+                    await self._invoke_hook(
+                        "on_error",
+                        session_id,
+                        RuntimeError(last_error.message),
+                        {
+                            "error_type": last_error.error_type,
+                            **dict(last_error.context),
+                        },
+                    )
+        except asyncio.CancelledError as exc:
             # Caller cancelled the consumer task (or broke out via
             # ``aclose()``). Attribute exit to cancellation and let the
             # exception propagate untouched.
             terminated_by = "cancelled"
+            run_error = exc
             raise
         finally:
             if state_store_error_phase is not None:
@@ -582,6 +747,18 @@ class AgentRunner:
                 event_count=event_count,
                 final_event_type="final" if final_text is not None else None,
                 phase=state_store_error_phase,
+            )
+            # `on_run_end` fires on EVERY exit path. `run_error` is
+            # non-`None` only for an exception that escaped the run (a
+            # `StateStoreError` or the surfaced `CancelledError`); a
+            # loop-internal `terminated_by == "error"` keeps it `None`
+            # (`on_error` already fired for that). Awaiting a hook in
+            # `finally` is safe: `_invoke_hook`/`invoke_hook` swallow every
+            # `Exception` and re-raise only `CancelledError`, so a raising
+            # `on_run_end` cannot mask an in-flight `StateStoreError`.
+            run_duration_ms = (time.perf_counter() - run_start) * 1000
+            await self._invoke_hook(
+                "on_run_end", session_id, run_duration_ms, run_error
             )
 
 
