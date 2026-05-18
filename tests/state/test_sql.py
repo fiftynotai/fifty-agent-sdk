@@ -83,6 +83,54 @@ async def store(engine: AsyncEngine) -> AsyncIterator[SqlStateStore]:
         await s.aclose()  # no-op on caller-owned engine; documents the contract
 
 
+@pytest_asyncio.fixture
+async def concurrent_engine(tmp_path: Any) -> AsyncIterator[AsyncEngine]:
+    """Yield a fresh *file-backed* aiosqlite engine for concurrency tests.
+
+    Unlike the shared :func:`engine` fixture, this one is deliberately
+    built **without** ``StaticPool``. A file-backed SQLite database is
+    *not* connection-scoped, so the default connection pool hands out
+    real, independent per-connection isolation — exactly what genuine
+    concurrent transactions across *different* sessions need.
+
+    ``StaticPool`` (correct for every other test, which reads rows back
+    over the same in-memory DB the store wrote to) pins a single shared
+    DBAPI connection; SQLite permits only one transaction per connection,
+    so concurrent transactions interleave on that connection and a commit
+    can fail with ``SQL statements in progress``. That is a test-harness
+    artifact, not a store bug — see BR-013. This fixture sidesteps it by
+    giving the concurrency test a real connection pool, mirroring the
+    Postgres environment where per-connection isolation is genuine.
+
+    ``check_same_thread=False`` is still required: aiosqlite runs the
+    DBAPI on a worker thread and SQLAlchemy's async pool dispatches across
+    threads. ``tmp_path`` (pytest builtin) gives a per-test unique
+    directory that pytest auto-cleans.
+    """
+    eng = create_async_engine(
+        f"sqlite+aiosqlite:///{tmp_path / 'state.db'}",
+        connect_args={"check_same_thread": False},
+    )
+    async with eng.begin() as conn:
+        await conn.run_sync(sql_metadata.create_all)
+    try:
+        yield eng
+    finally:
+        await eng.dispose()
+
+
+@pytest_asyncio.fixture
+async def concurrent_store(
+    concurrent_engine: AsyncEngine,
+) -> AsyncIterator[SqlStateStore]:
+    """A :class:`SqlStateStore` over the file-backed concurrency engine."""
+    s = SqlStateStore(concurrent_engine)
+    try:
+        yield s
+    finally:
+        await s.aclose()  # no-op on caller-owned engine; documents the contract
+
+
 # ---------------------------------------------------------------------------
 # Round-trip / read-path basics
 # ---------------------------------------------------------------------------
@@ -328,12 +376,16 @@ async def test_concurrent_appends_same_session_preserve_monotonic_sequence(
 
 
 async def test_concurrent_appends_different_sessions_do_not_block(
-    store: SqlStateStore,
+    concurrent_store: SqlStateStore,
 ) -> None:
-    """20 appends across 5 sessions complete in well under a generous budget."""
+    """20 appends across 5 sessions complete in well under a generous budget.
+
+    Uses the file-backed :func:`concurrent_store` (real connection pool)
+    rather than the shared ``StaticPool`` store — see BR-013.
+    """
 
     async def appender(session_id: str, index: int) -> None:
-        await store.append(
+        await concurrent_store.append(
             session_id, ChatMessage(role="user", content=f"{session_id}-{index}")
         )
 
@@ -342,7 +394,7 @@ async def test_concurrent_appends_different_sessions_do_not_block(
 
     # Per-session counts: 4 messages each across 5 sessions
     for i in range(5):
-        got = await store.get_messages(f"s{i}")
+        got = await concurrent_store.get_messages(f"s{i}")
         assert len(got) == 4
 
 
