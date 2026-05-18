@@ -6,18 +6,21 @@ prompt template builder. Higher layers (parser, tool registry, ReACT loop,
 state stores) build on these contracts in subsequent briefs.
 
 Optional extra surface
-    :class:`SqlStateStore` and :data:`sql_metadata` (the ``sql`` extra,
-    ``pip install 'agent-sdk[sql]'``) and :class:`RedisStateStore` (the
-    ``redis`` extra, ``pip install 'agent-sdk[redis]'``) are re-exported
-    lazily. Importing :mod:`agent_sdk` itself pulls neither SQLAlchemy nor
-    redis-py. First access to one of these symbols triggers its import and
-    raises a clear :class:`ImportError` if the relevant extra is missing.
+    :class:`SqlStateStore` and :data:`sql_metadata`, plus
+    :class:`SqlAuditSink` and :data:`audit_metadata` (all the ``sql``
+    extra, ``pip install 'agent-sdk[sql]'``), and :class:`RedisStateStore`
+    (the ``redis`` extra, ``pip install 'agent-sdk[redis]'``) are
+    re-exported lazily. Importing :mod:`agent_sdk` itself pulls neither
+    SQLAlchemy nor redis-py. First access to one of these symbols triggers
+    its import and raises a clear :class:`ImportError` if the relevant
+    extra is missing.
 """
 
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+from agent_sdk.audit import AuditEvent, AuditSink, ConsoleAuditSink
 from agent_sdk.errors import (
     AgentSdkError,
     LLMError,
@@ -86,6 +89,7 @@ from agent_sdk.tools import (
 )
 
 if TYPE_CHECKING:
+    from agent_sdk.audit.sql import SqlAuditSink, audit_metadata
     from agent_sdk.state.redis import RedisStateStore
     from agent_sdk.state.sql import SqlStateStore, sql_metadata
 
@@ -99,9 +103,12 @@ __all__ = [
     "AgentLoop",
     "AgentRunner",
     "AgentSdkError",
+    "AuditEvent",
+    "AuditSink",
     "ChatMessage",
     "ChatRequest",
     "ChatResponse",
+    "ConsoleAuditSink",
     "ErrorEvent",
     "FinalAnswer",
     "FinalEvent",
@@ -131,6 +138,7 @@ __all__ = [
     "Registry",
     "Role",
     "SafetyConfig",
+    "SqlAuditSink",
     "SqlStateStore",
     "StateStore",
     "StateStoreError",
@@ -147,6 +155,7 @@ __all__ = [
     "ToolStartedEvent",
     "ToolTimeout",
     "Usage",
+    "audit_metadata",
     "json_mode_template",
     "prose_mode_template",
     "render_system_prompt",
@@ -158,16 +167,21 @@ __all__ = [
 def __getattr__(name: str) -> Any:
     """Lazily import optional-extra surface symbols on first access.
 
-    ``SqlStateStore`` / ``sql_metadata`` require the optional ``sql``
-    extra; ``RedisStateStore`` requires the ``redis`` extra. Routing
-    access through this hook keeps ``import agent_sdk`` free of
-    SQLAlchemy and redis-py, and surfaces a clear :class:`ImportError`
-    only when the symbols are actually used without the extra installed.
+    ``SqlStateStore`` / ``sql_metadata`` and ``SqlAuditSink`` /
+    ``audit_metadata`` require the optional ``sql`` extra;
+    ``RedisStateStore`` requires the ``redis`` extra. Routing access
+    through this hook keeps ``import agent_sdk`` free of SQLAlchemy and
+    redis-py, and surfaces a clear :class:`ImportError` only when the
+    symbols are actually used without the extra installed.
     """
     if name in {"SqlStateStore", "sql_metadata"}:
         from agent_sdk.state import sql
 
         return getattr(sql, name)
+    if name in {"SqlAuditSink", "audit_metadata"}:
+        from agent_sdk.audit import sql as audit_sql
+
+        return getattr(audit_sql, name)
     if name == "RedisStateStore":
         from agent_sdk.state import redis
 

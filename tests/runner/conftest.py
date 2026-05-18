@@ -26,6 +26,7 @@ from agent_sdk import (
     Registry,
     SafetyConfig,
 )
+from agent_sdk.audit.protocol import AuditSink
 from agent_sdk.state.protocol import StateStore
 from tests.loop.conftest import FakeLLMClient
 
@@ -66,11 +67,16 @@ def make_runner(
     safety: SafetyConfig | None = None,
     system_prompt: str | None = None,
     persona: str = "You are a helpful agent.",
+    audit: AuditSink | None = None,
 ) -> tuple[AgentRunner, StateStore]:
     """Build a ready-to-drive :class:`AgentRunner` and return it with its store.
 
     The store is returned alongside the runner so tests can assert on
     persisted history without reaching into private state.
+
+    Pass ``audit`` to wire an :class:`agent_sdk.audit.protocol.AuditSink`
+    into the runner; left ``None`` (default) the runner emits no audit
+    events.
     """
     loop = AgentLoop(
         llm=llm,
@@ -82,7 +88,7 @@ def make_runner(
     )
     store = state if state is not None else MemoryStateStore()
     runner = AgentRunner(
-        loop=loop, state=store, system_prompt=system_prompt
+        loop=loop, state=store, system_prompt=system_prompt, audit=audit
     )
     return runner, store
 

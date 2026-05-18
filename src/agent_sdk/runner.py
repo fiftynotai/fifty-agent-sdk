@@ -44,8 +44,23 @@ Transactional persistence invariants
     * Tool roundtrips (``role="tool"`` messages) are NOT persisted to the
       state store. They live in the loop's private working list and are
       deterministically re-derivable from the assistant's final answer
-      on the next turn. Tool-level audit provenance is BR-011's
-      responsibility.
+      on the next turn. Tool-level provenance is instead captured through
+      the optional :class:`agent_sdk.audit.protocol.AuditSink` (see below).
+
+Audit emission
+    When an optional :class:`agent_sdk.audit.protocol.AuditSink` is wired
+    in, the Runner emits an :class:`agent_sdk.audit.protocol.AuditEvent` at
+    four points of every ``run()``: session start, each tool invocation
+    (args plus a bounded result summary), the final answer, and any error.
+
+    Audit emission is best-effort and isolated from the run: a raising
+    sink is caught by :meth:`_emit_audit`, logged at ``WARNING`` under the
+    ``agent_sdk.audit`` logger (event ``audit.emit_failed``), and
+    swallowed — a sink outage NEVER aborts a live run.
+    :class:`asyncio.CancelledError` is the one exception that is re-raised
+    untouched. When ``audit`` is ``None`` (the default) emission is
+    zero-overhead: :meth:`_emit_audit` returns before constructing any
+    :class:`AuditEvent`.
 
 Logging
     Module-level :mod:`structlog` logger. ``INFO`` on run start and run
@@ -72,16 +87,47 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
-from typing import Final
+from datetime import UTC, datetime
+from typing import Any, Final
 from uuid import uuid4
 
 import structlog
 
+from agent_sdk.audit import AuditEvent, AuditSink
 from agent_sdk.errors import StateStoreError
 from agent_sdk.llm.types import ChatMessage
 from agent_sdk.loop import AgentLoop
 from agent_sdk.state.protocol import StateStore
-from agent_sdk.streaming import AgentEvent, ErrorEvent, FinalEvent
+from agent_sdk.streaming import (
+    ActionEvent,
+    AgentEvent,
+    ErrorEvent,
+    FinalEvent,
+    ObservationEvent,
+    ToolFailedEvent,
+    ToolStartedEvent,
+)
+
+_RESULT_SUMMARY_CAP: Final = 500
+"""Character cap for the ``result_summary`` field of a ``tool_invocation``
+audit event. A ``repr`` longer than this is truncated with a marker so a
+large or binary tool result cannot bloat the audit row or the console log."""
+
+_TRUNCATION_MARKER: Final = "…[truncated]"
+"""Suffix appended to a ``result_summary`` that was clipped at the cap."""
+
+
+def _bounded_repr(value: object) -> str:
+    """Return ``repr(value)`` clipped to :data:`_RESULT_SUMMARY_CAP` chars.
+
+    A clipped string carries the :data:`_TRUNCATION_MARKER` suffix so a
+    consumer can tell the summary is partial. Used to bound the
+    ``result_summary`` of a ``tool_invocation`` audit event.
+    """
+    text = repr(value)
+    if len(text) <= _RESULT_SUMMARY_CAP:
+        return text
+    return text[:_RESULT_SUMMARY_CAP] + _TRUNCATION_MARKER
 
 _log: Final = structlog.get_logger(__name__)
 """Module-level structured logger. INFO at run boundaries; no content payloads."""
@@ -123,6 +169,13 @@ class AgentRunner:
             message is persisted; the loop's structured prompt does the
             entire job. See the module docstring for the precise boundary
             between this and ``AgentLoop.prompts``.
+        audit: Optional :class:`agent_sdk.audit.protocol.AuditSink`. When
+            set, the Runner emits an
+            :class:`agent_sdk.audit.protocol.AuditEvent` on session start,
+            each tool invocation, the final answer, and any error. A
+            raising sink never aborts a run — see the module docstring's
+            "Audit emission" section. When ``None`` (default), emission is
+            zero-overhead.
 
     Invariants:
         * Every ``run()`` either persists exactly one user message and
@@ -131,8 +184,12 @@ class AgentRunner:
         * The optional ``system_prompt`` is persisted at most ONCE per
           session — only on the first ``run()`` call for that session.
         * Tool roundtrips are NOT persisted to state; the loop's working
-          list carries them. Audit-level tool provenance is BR-011's
-          responsibility.
+          list carries them. Tool-level provenance is captured through the
+          optional ``audit`` sink instead.
+        * Audit emission is best-effort and isolated: a raising
+          :class:`AuditSink` is caught and logged, never propagated. With
+          ``audit=None`` the run behaves identically to a Runner built
+          without auditing — no events, no overhead.
         * A Runner-level ``run_id`` is generated per ``run()`` call for
           log correlation and is SEPARATE from the inner :class:`AgentLoop`
           run id. Neither id is exposed on :class:`AgentEvent` values.
@@ -144,10 +201,106 @@ class AgentRunner:
         loop: AgentLoop,
         state: StateStore,
         system_prompt: str | None = None,
+        audit: AuditSink | None = None,
     ) -> None:
         self._loop = loop
         self._state = state
         self._system_prompt = system_prompt
+        self._audit = audit
+
+    async def _emit_audit(
+        self,
+        session_id: str,
+        event_type: str,
+        payload: dict[str, Any],
+    ) -> None:
+        """Emit a single :class:`AuditEvent` through the configured sink.
+
+        Best-effort and isolated: short-circuits with zero overhead when no
+        sink is configured; otherwise builds an :class:`AuditEvent`
+        (``timestamp`` stamped now in UTC, ``user_id=None`` — the Runner has
+        no user-id channel, consumers wanting it set it via a wrapping
+        sink) and awaits :meth:`AuditSink.record`. A raising sink is caught,
+        logged at ``WARNING`` (event ``audit.emit_failed``), and swallowed —
+        an audit failure never aborts the run.
+        :class:`asyncio.CancelledError` is re-raised untouched so consumer
+        cancellation still propagates.
+
+        Args:
+            session_id: Opaque session identifier for the event.
+            event_type: One of ``"session_start"``, ``"tool_invocation"``,
+                ``"final_answer"``, ``"error"``.
+            payload: Structured, event-specific detail (lengths/counts and
+                tool metadata only — never message or prompt content).
+        """
+        if self._audit is None:
+            return
+        event = AuditEvent(
+            session_id=session_id,
+            user_id=None,
+            timestamp=datetime.now(UTC),
+            event_type=event_type,
+            payload=payload,
+        )
+        try:
+            await self._audit.record(event)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            _log.warning(
+                "audit.emit_failed",
+                session_id=session_id,
+                event_type=event_type,
+                error_type=type(exc).__name__,
+                error_message=str(exc),
+            )
+
+    @staticmethod
+    def _tool_invocation_payload(
+        event: ObservationEvent | ToolFailedEvent,
+        pending_action: ActionEvent | None,
+        pending_call: ToolStartedEvent | None,
+    ) -> dict[str, Any]:
+        """Build the ``payload`` for a ``tool_invocation`` audit event.
+
+        Correlates the terminal tool event with the
+        :class:`ActionEvent` that carried the ``args`` and the
+        :class:`ToolStartedEvent` that carried the ``call_id``. The loop is
+        strictly sequential, so the single pending slots are the correct
+        pair; they are still treated as optional for robustness.
+
+        ``result_summary`` is a bounded ``repr`` of the tool's output (on
+        success) or the failure string (on a recoverable failure), capped
+        so a large or binary result cannot bloat the audit row.
+
+        Args:
+            event: The :class:`ObservationEvent` or :class:`ToolFailedEvent`
+                that ended the tool call.
+            pending_action: The most recent :class:`ActionEvent`, if seen.
+            pending_call: The most recent :class:`ToolStartedEvent`, if seen.
+
+        Returns:
+            The structured ``payload`` dict for the audit event.
+        """
+        if isinstance(event, ObservationEvent):
+            outcome = "ok"
+            result_summary = _bounded_repr(event.result.output)
+        else:
+            outcome = "failed"
+            result_summary = _bounded_repr(event.error)
+        return {
+            "tool_name": event.tool_name,
+            "call_id": (
+                pending_call.call_id
+                if pending_call is not None
+                else event.call_id
+            ),
+            "args": (
+                pending_action.args if pending_action is not None else {}
+            ),
+            "outcome": outcome,
+            "result_summary": result_summary,
+        }
 
     async def run(
         self, session_id: str, user_message: str
@@ -223,6 +376,16 @@ class AgentRunner:
             has_system_prompt=self._system_prompt is not None,
             has_prior_messages=not is_first_turn,
         )
+        await self._emit_audit(
+            session_id,
+            "session_start",
+            {
+                "run_id": run_id,
+                "is_first_turn": is_first_turn,
+                "has_system_prompt": self._system_prompt is not None,
+                "user_message_len": len(user_message),
+            },
+        )
 
         # Initial value is "interrupted" — neutral and applies to any
         # unexpected exit path (e.g. an exception escaping the loop that
@@ -252,6 +415,20 @@ class AgentRunner:
                         error_type=type(exc).__name__,
                         error_message=str(exc),
                     )
+                    # Audit the durability failure BEFORE re-raising. We
+                    # cannot do this in `finally` — that block must not
+                    # `await` the sink, since a raising sink would mask
+                    # the in-flight StateStoreError.
+                    await self._emit_audit(
+                        session_id,
+                        "error",
+                        {
+                            "run_id": run_id,
+                            "error_type": type(exc).__name__,
+                            "error_message": str(exc),
+                            "phase": "persist_system",
+                        },
+                    )
                     raise
                 # Mirror locally — `history` was a defensive copy.
                 history.append(sys_msg)
@@ -270,6 +447,16 @@ class AgentRunner:
                     error_type=type(exc).__name__,
                     error_message=str(exc),
                 )
+                await self._emit_audit(
+                    session_id,
+                    "error",
+                    {
+                        "run_id": run_id,
+                        "error_type": type(exc).__name__,
+                        "error_message": str(exc),
+                        "phase": "persist_user",
+                    },
+                )
                 raise
             history.append(user_msg)
 
@@ -282,13 +469,41 @@ class AgentRunner:
             # coexist in the prompt; that is intentional.
             loop_messages = list(history)  # defensive copy for the loop
 
+            # Single-slot correlation for `tool_invocation` audit events.
+            # The ReACT loop is strictly sequential — one tool in flight at
+            # a time — so a single pending `ActionEvent` (carries `args`)
+            # and pending `ToolStartedEvent` (carries `call_id`) is
+            # sufficient; the paired Observation/ToolFailed clears them.
+            # `last_error` holds the most recent ErrorEvent for the error
+            # branch below.
+            pending_action: ActionEvent | None = None
+            pending_call: ToolStartedEvent | None = None
+            last_error: ErrorEvent | None = None
+
             async for event in self._loop.run(loop_messages):
                 event_count += 1
                 if isinstance(event, ErrorEvent):
                     saw_error = True
+                    last_error = event
                 elif isinstance(event, FinalEvent):
                     final_text = event.text
+                elif isinstance(event, ActionEvent):
+                    pending_action = event
+                elif isinstance(event, ToolStartedEvent):
+                    pending_call = event
                 yield event
+                # Emit `tool_invocation` AFTER yielding so consumer event
+                # delivery is never blocked on audit latency.
+                if isinstance(event, ObservationEvent | ToolFailedEvent):
+                    await self._emit_audit(
+                        session_id,
+                        "tool_invocation",
+                        self._tool_invocation_payload(
+                            event, pending_action, pending_call
+                        ),
+                    )
+                    pending_action = None
+                    pending_call = None
 
             # ── PHASE 5: PERSIST ASSISTANT (SUCCESS PATH) ─────────────
             if not saw_error and final_text is not None:
@@ -305,13 +520,49 @@ class AgentRunner:
                         error_type=type(exc).__name__,
                         error_message=str(exc),
                     )
+                    await self._emit_audit(
+                        session_id,
+                        "error",
+                        {
+                            "run_id": run_id,
+                            "error_type": type(exc).__name__,
+                            "error_message": str(exc),
+                            "phase": "persist_assistant",
+                        },
+                    )
                     raise
                 terminated_by = "final_answer"
+                await self._emit_audit(
+                    session_id,
+                    "final_answer",
+                    {
+                        "run_id": run_id,
+                        "final_text_len": len(final_text),
+                        "event_count": event_count,
+                    },
+                )
             else:
                 # Error path: an ErrorEvent was emitted; the loop's
                 # fallback FinalEvent is yielded but NOT persisted, so
                 # the next run() does not see a fake assistant turn.
                 terminated_by = "error"
+                await self._emit_audit(
+                    session_id,
+                    "error",
+                    {
+                        "run_id": run_id,
+                        "error_type": (
+                            last_error.error_type
+                            if last_error is not None
+                            else "Unknown"
+                        ),
+                        "error_message": (
+                            last_error.message
+                            if last_error is not None
+                            else ""
+                        ),
+                    },
+                )
         except asyncio.CancelledError:
             # Caller cancelled the consumer task (or broke out via
             # ``aclose()``). Attribute exit to cancellation and let the

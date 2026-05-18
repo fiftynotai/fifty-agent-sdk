@@ -1,0 +1,128 @@
+"""Tests for the audit SQL surface's graceful-ImportError behaviour.
+
+The ``sql`` extra (SQLAlchemy) is optional. When it is NOT installed,
+attempting to use :class:`SqlAuditSink` or :data:`audit_metadata` must
+raise an :class:`ImportError` whose message references both the
+``sqlalchemy`` package and the ``agent-sdk[sql]`` extras line. The
+dependency-free audit surface (:class:`AuditEvent`, :class:`AuditSink`,
+:class:`ConsoleAuditSink`) and the rest of the SDK remain importable.
+
+These tests simulate "missing extra" by patching ``sys.modules`` so the
+top-level ``sqlalchemy`` import inside :mod:`agent_sdk.audit.sql` fails,
+then reloading the module via :mod:`importlib`. The patch is reverted in
+fixture teardown so subsequent tests in the same run are unaffected.
+"""
+
+from __future__ import annotations
+
+import importlib
+import sys
+from collections.abc import Iterator
+
+import pytest
+
+
+@pytest.fixture
+def sqlalchemy_unavailable(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Pretend SQLAlchemy is not installed for the duration of this test.
+
+    Removes any already-imported ``sqlalchemy*`` and ``agent_sdk.audit.sql``
+    modules from :data:`sys.modules`, and installs a ``None`` entry for
+    ``sqlalchemy`` so the next ``import sqlalchemy`` raises
+    :class:`ImportError`. Tearing down restores the prior state so the rest
+    of the test session sees a working SQL surface.
+    """
+    removed: list[str] = [
+        name
+        for name in list(sys.modules)
+        if name == "sqlalchemy"
+        or name.startswith("sqlalchemy.")
+        or name == "agent_sdk.audit.sql"
+    ]
+    for name in removed:
+        monkeypatch.delitem(sys.modules, name, raising=False)
+
+    # `None` in sys.modules makes `import sqlalchemy` raise ImportError.
+    monkeypatch.setitem(sys.modules, "sqlalchemy", None)
+
+    yield
+    # monkeypatch reverts sys.modules on teardown — the real sqlalchemy is
+    # back. We also pop our half-built agent_sdk.audit.sql so the next
+    # caller re-imports it cleanly.
+    sys.modules.pop("agent_sdk.audit.sql", None)
+
+
+def test_import_without_sqlalchemy_raises_clear_error(
+    sqlalchemy_unavailable: None,
+) -> None:
+    """Direct ``import agent_sdk.audit.sql`` without SQLAlchemy gives a clear error."""
+    with pytest.raises(ImportError) as exc_info:
+        importlib.import_module("agent_sdk.audit.sql")
+    msg = str(exc_info.value)
+    assert "sqlalchemy" in msg.lower()
+    assert "agent-sdk[sql]" in msg
+
+
+def test_lazy_attribute_access_on_audit_package_triggers_extras_hint(
+    sqlalchemy_unavailable: None,
+) -> None:
+    """``agent_sdk.audit.SqlAuditSink`` (lazy) raises the same ImportError."""
+    # `agent_sdk.audit` itself does not import sqlalchemy, so a fresh import
+    # of it must succeed even while sqlalchemy is blocked.
+    sys.modules.pop("agent_sdk.audit", None)
+    audit_pkg = importlib.import_module("agent_sdk.audit")
+
+    with pytest.raises(ImportError) as exc_info:
+        _ = audit_pkg.SqlAuditSink  # triggers __getattr__
+    msg = str(exc_info.value)
+    assert "sqlalchemy" in msg.lower()
+    assert "agent-sdk[sql]" in msg
+
+
+def test_top_level_lazy_attribute_access_triggers_extras_hint(
+    sqlalchemy_unavailable: None,
+) -> None:
+    """``agent_sdk.SqlAuditSink`` (top-level lazy) raises the same ImportError."""
+    sys.modules.pop("agent_sdk", None)
+    pkg = importlib.import_module("agent_sdk")
+
+    with pytest.raises(ImportError) as exc_info:
+        _ = pkg.SqlAuditSink  # triggers top-level __getattr__
+    msg = str(exc_info.value)
+    assert "sqlalchemy" in msg.lower()
+    assert "agent-sdk[sql]" in msg
+
+
+def test_lazy_attribute_access_for_audit_metadata_triggers_extras_hint(
+    sqlalchemy_unavailable: None,
+) -> None:
+    """``agent_sdk.audit_metadata`` lazy access also surfaces the extras hint."""
+    sys.modules.pop("agent_sdk", None)
+    pkg = importlib.import_module("agent_sdk")
+
+    with pytest.raises(ImportError) as exc_info:
+        _ = pkg.audit_metadata
+    msg = str(exc_info.value)
+    assert "sqlalchemy" in msg.lower()
+    assert "agent-sdk[sql]" in msg
+
+
+def test_audit_package_import_still_works_without_extras(
+    sqlalchemy_unavailable: None,
+) -> None:
+    """``import agent_sdk.audit`` succeeds and exposes the dependency-free surface."""
+    sys.modules.pop("agent_sdk.audit", None)
+    audit_pkg = importlib.import_module("agent_sdk.audit")
+    assert audit_pkg.AuditEvent is not None
+    assert audit_pkg.AuditSink is not None
+    assert audit_pkg.ConsoleAuditSink is not None
+
+
+def test_unknown_attribute_still_raises_attribute_error(
+    sqlalchemy_unavailable: None,
+) -> None:
+    """``__getattr__`` does NOT swallow access to non-SQL attribute names."""
+    sys.modules.pop("agent_sdk.audit", None)
+    audit_pkg = importlib.import_module("agent_sdk.audit")
+    with pytest.raises(AttributeError):
+        _ = audit_pkg.DefinitelyNotASymbol
