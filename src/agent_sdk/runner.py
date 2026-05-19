@@ -138,6 +138,9 @@ large or binary tool result cannot bloat the audit row or the console log."""
 _TRUNCATION_MARKER: Final = "…[truncated]"
 """Suffix appended to a ``result_summary`` that was clipped at the cap."""
 
+_log: Final = structlog.get_logger(__name__)
+"""Module-level structured logger. INFO at run boundaries; no content payloads."""
+
 
 def _bounded_repr(value: object) -> str:
     """Return ``repr(value)`` clipped to :data:`_RESULT_SUMMARY_CAP` chars.
@@ -150,9 +153,6 @@ def _bounded_repr(value: object) -> str:
     if len(text) <= _RESULT_SUMMARY_CAP:
         return text
     return text[:_RESULT_SUMMARY_CAP] + _TRUNCATION_MARKER
-
-_log: Final = structlog.get_logger(__name__)
-"""Module-level structured logger. INFO at run boundaries; no content payloads."""
 
 
 class AgentRunner:
@@ -693,6 +693,13 @@ class AgentRunner:
                 # fallback FinalEvent is yielded but NOT persisted, so
                 # the next run() does not see a fake assistant turn.
                 terminated_by = "error"
+                # Defensive `last_error is not None` fallbacks below: this
+                # branch runs only when `saw_error` is True, which is set
+                # alongside `last_error` whenever an ErrorEvent is seen — so
+                # `last_error` is in practice always non-None here. The
+                # "Unknown"/"" fallbacks guard a future refactor that could
+                # decouple `saw_error` from `last_error`; do not delete them
+                # as dead code.
                 await self._emit_audit(
                     session_id,
                     "error",

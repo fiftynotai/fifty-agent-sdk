@@ -102,6 +102,28 @@ async def test_redis_delete_removes_key(store: RedisStateStore) -> None:
     assert await store.get_messages("s2") == []
 
 
+async def test_redis_no_ttl_when_ttl_seconds_is_none() -> None:
+    """With ``ttl_seconds=None`` a real Redis key exists with no expiry (TTL == -1).
+
+    The shared :func:`store` fixture pins ``ttl_seconds=3600``; this test
+    builds its own no-expiry store so the ``ttl_seconds=None`` path is
+    exercised against a real server. Mirrors the fakeredis-covered
+    ``test_no_ttl_when_ttl_seconds_is_none`` in ``test_redis.py``.
+    """
+    assert REDIS_TEST_URL is not None  # narrowed by the module-level skip
+    s = RedisStateStore(
+        REDIS_TEST_URL, key_prefix=_TEST_KEY_PREFIX, ttl_seconds=None
+    )
+    try:
+        await s.append("s1", ChatMessage(role="user", content="a"))
+        # Redis returns -1 for a key that exists but has no associated expiry.
+        ttl = await s._client.ttl(f"{_TEST_KEY_PREFIX}s1")
+        assert ttl == -1
+    finally:
+        await s.delete("s1")
+        await s.aclose()
+
+
 async def test_redis_short_ttl_key_expires() -> None:
     """A short-TTL session disappears once the TTL window elapses.
 

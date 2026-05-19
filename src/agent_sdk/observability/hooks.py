@@ -60,6 +60,7 @@ OpenTelemetry dependency)::
         with tracer.start_as_current_span("llm.call") as span:
             span.set_attribute("llm.model", request.model)
             span.set_attribute("llm.duration_ms", duration_ms)
+            # note: usage is zero-filled in stream mode
             span.set_attribute(
                 "llm.completion_tokens", response.usage.completion_tokens
             )
@@ -169,6 +170,9 @@ class Hooks:
     ) = None
     on_tool_start: Callable[[str, str, dict[str, Any]], Any] | None = None
     on_tool_end: Callable[[str, str, Any, float], Any] | None = None
+    # `error` is `Exception`, not `BaseException` (cf. `on_run_end`): a
+    # cancellation (`asyncio.CancelledError`, a BaseException) routes through
+    # `on_run_end`, never `on_error`, so the narrower type is correct here.
     on_error: Callable[[str, Exception, dict[str, Any]], Any] | None = None
 
 

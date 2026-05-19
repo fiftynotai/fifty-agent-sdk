@@ -24,12 +24,17 @@ Engine fixture
     :class:`sqlalchemy.pool.StaticPool` so every session opened by the
     store sees the same underlying connection (and therefore the same
     schema and rows). A fresh engine is built per test for isolation.
+
+    The :func:`concurrent_engine` fixture is the file-backed counterpart —
+    no ``StaticPool``, so the concurrency tests get genuine per-connection
+    isolation (see BR-013).
 """
 
 from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -84,7 +89,7 @@ async def store(engine: AsyncEngine) -> AsyncIterator[SqlStateStore]:
 
 
 @pytest_asyncio.fixture
-async def concurrent_engine(tmp_path: Any) -> AsyncIterator[AsyncEngine]:
+async def concurrent_engine(tmp_path: Path) -> AsyncIterator[AsyncEngine]:
     """Yield a fresh *file-backed* aiosqlite engine for concurrency tests.
 
     Unlike the shared :func:`engine` fixture, this one is deliberately

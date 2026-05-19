@@ -72,7 +72,6 @@ import structlog
 
 try:
     from sqlalchemy import (
-        JSON,
         BigInteger,
         DateTime,
         Index,
@@ -89,6 +88,7 @@ try:
         create_async_engine,
     )
     from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+    from sqlalchemy.types import JSON
 except ImportError as exc:  # pragma: no cover - exercised via importlib in tests
     raise ImportError(
         "agent_sdk.audit.sql requires SQLAlchemy. "
@@ -150,10 +150,11 @@ class AgentAuditLog(Base):
     session_id: Mapped[str] = mapped_column(
         String(255),
         nullable=False,
-        index=True,
     )
-    """Opaque session id the action belongs to (indexed — audit queries
-    filter by session)."""
+    """Opaque session id the action belongs to. Session-scoped audit queries
+    are served by the composite ``ix_agent_audit_log_session_timestamp`` index
+    (``session_id`` is its leading column), so no separate single-column index
+    is declared."""
 
     user_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     """Optional end-user identifier; ``NULL`` when not supplied."""
