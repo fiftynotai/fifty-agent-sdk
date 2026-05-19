@@ -10,7 +10,7 @@ touches a real server.
 from __future__ import annotations
 
 import json
-from collections.abc import Awaitable
+import re
 from typing import Any
 
 import httpx
@@ -553,5 +553,136 @@ async def test_unique_ids_per_call(
     assert len(ids) == 2 and ids[0] != ids[1]
 
 
-# Type hint to keep mypy happy when callable typing tightens later.
-_ = Awaitable  # noqa: F841 — re-exported for typing context (no-op).
+# ---------------------------------------------------------------------------
+# Docstring-drift regression — MCPError.context allow-list
+# ---------------------------------------------------------------------------
+
+
+async def test_mcperror_context_keys_match_class_docstring_allowlist(
+    mcp_server: MockMCPServer, mcp_http_client: httpx.AsyncClient
+) -> None:
+    """Pin the ``MCPClient`` docstring's ``MCPError.context`` allow-list.
+
+    The class docstring's "Invariant" paragraph documents the exact set of
+    keys an :class:`MCPError.context` may carry. This test derives BOTH
+    sides programmatically — the documented set by parsing
+    ``MCPClient.__doc__``, the runtime set by triggering one representative
+    :class:`MCPError` per distinct context-key group — and asserts set
+    equality in both directions, so a doc edit OR a code edit that drifts
+    the two apart fails here instead of rotting silently.
+    """
+    # --- (a) documented set: parse the brace-delimited allow-list ----------
+    doc = MCPClient.__doc__
+    assert doc is not None, "MCPClient must carry a class docstring"
+    brace_match = re.search(
+        r"allow-list\s*``\{(?P<keys>[^}]*)\}``", doc, re.DOTALL
+    )
+    assert brace_match is not None, (
+        "could not locate the brace-delimited allow-list after the "
+        "'allow-list' keyword in MCPClient.__doc__"
+    )
+    documented: set[str] = {
+        token.strip()
+        for token in brace_match.group("keys").split(",")
+        if token.strip()
+    }
+
+    # --- (b) runtime set: trigger one MCPError per context-key group ------
+    runtime: set[str] = set()
+
+    def _capture(exc: MCPError) -> None:
+        runtime.update(exc.context.keys())
+
+    # Group 1: envelope wrong jsonrpc version -> envelope_jsonrpc.
+    mcp_server.force_next_raw(
+        json.dumps(
+            {"jsonrpc": "1.0", "id": "irrelevant", "result": {"tools": []}}
+        ).encode()
+    )
+    client = _make_client(mcp_http_client)
+    with pytest.raises(MCPError) as exc:
+        await client.discover()
+    _capture(exc.value)
+
+    # Group 2: envelope id mismatch -> expected_id, received_id.
+    mcp_server.force_next_raw(
+        json.dumps(
+            {"jsonrpc": "2.0", "id": "wrong-id", "result": {"tools": []}}
+        ).encode()
+    )
+    with pytest.raises(MCPError) as exc:
+        await client.discover()
+    _capture(exc.value)
+
+    # Group 3: envelope with both result and error -> has_result, has_error.
+    # This branch sits AFTER the id-match check in `_parse_response`, so the
+    # response id must equal the request id. The client picks a random hex
+    # id per call, so we echo the inbound id back via a MockTransport that
+    # inspects the request body.
+    def _echo_both(request: httpx.Request) -> httpx.Response:
+        sent_id = json.loads(request.content)["id"]
+        return httpx.Response(
+            200,
+            json={
+                "jsonrpc": "2.0",
+                "id": sent_id,
+                "result": {"tools": []},
+                "error": {"code": -32603, "message": "internal"},
+            },
+        )
+
+    both_client = MCPClient(
+        _config(),
+        client=httpx.AsyncClient(transport=httpx.MockTransport(_echo_both)),
+    )
+    with pytest.raises(MCPError) as exc:
+        await both_client.discover()
+    _capture(exc.value)
+
+    # Group 4: JSON-RPC error object -> error_code, error_data.
+    with pytest.raises(MCPError) as exc:
+        await client.invoke("missing", {})  # no handler -> -32602
+    _capture(exc.value)
+
+    # Group 5: result carries isError=True -> tool_name, content.
+    mcp_server.register_tool(
+        "fail", lambda _args: {"isError": True, "content": "tool said no"}
+    )
+    with pytest.raises(MCPError) as exc:
+        await client.invoke("fail", {})
+    _capture(exc.value)
+
+    # Group 6: transport-layer 5xx -> status_code, wrapped.
+    def _server_down(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, text="upstream down")
+
+    down_client = MCPClient(
+        _config(), client=httpx.AsyncClient(
+            transport=httpx.MockTransport(_server_down)
+        )
+    )
+    with pytest.raises(MCPError) as exc:
+        await down_client.invoke("search", {"q": "x"})
+    _capture(exc.value)
+
+    # Group 7: post-aclose call -> operation.
+    closed_client = MCPClient(_config())
+    closed_client._client._transport = httpx.MockTransport(  # type: ignore[attr-defined]
+        mcp_server.handle
+    )
+    await closed_client.aclose()
+    with pytest.raises(MCPError) as exc:
+        await closed_client.discover()
+    _capture(exc.value)
+
+    # --- assert: both directions, with offending keys named ---------------
+    undocumented = runtime - documented
+    stale = documented - runtime
+    assert undocumented == set(), (
+        f"MCPError.context emits key(s) not in the class-docstring "
+        f"allow-list: {sorted(undocumented)}"
+    )
+    assert stale == set(), (
+        f"class-docstring allow-list names key(s) the runtime never "
+        f"emits (stale doc): {sorted(stale)}"
+    )
