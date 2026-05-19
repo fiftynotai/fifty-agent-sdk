@@ -412,6 +412,32 @@ class AgentRunner:
                 re-raised.
             asyncio.CancelledError: Propagated untouched from the loop
                 or from the consumer's cancellation.
+
+        Log events:
+            ``runner.run_started`` (INFO): Emitted once after the load
+                phase succeeds, before any persistence. Payload:
+                ``session_id``, ``run_id``, ``user_message_len``,
+                ``is_first_turn``, ``has_system_prompt``,
+                ``has_prior_messages``.
+            ``runner.run_completed`` (INFO): Emitted from the ``finally``
+                block for any run that passed the load gate — every exit
+                path, success or failure. Payload: ``session_id``,
+                ``run_id``, ``terminated_by``,
+                ``assistant_message_persisted``, ``event_count``,
+                ``final_event_type``, ``phase``. ``terminated_by`` is one
+                of ``"final_answer"``, ``"error"``,
+                ``"state_store_error"``, or ``"cancelled"``.
+            ``runner.persist_failed`` (ERROR): Emitted at each of the four
+                state-store boundaries — load, system-prompt persist, user
+                persist, assistant persist — when the underlying
+                :class:`agent_sdk.errors.StateStoreError` is raised.
+                Payload: ``phase`` (one of ``"load"``,
+                ``"persist_system"``, ``"persist_user"``,
+                ``"persist_assistant"``), ``session_id``, ``run_id``,
+                ``error_type``, ``error_message``. When the load phase
+                fails, ``runner.persist_failed`` with ``phase="load"`` is
+                the only log emitted — no ``runner.run_completed`` follows,
+                because the run never entered the ``finally`` block.
         """
         run_id = uuid4().hex
         # Monotonic start stamp for the `on_run_end` duration. `perf_counter`
