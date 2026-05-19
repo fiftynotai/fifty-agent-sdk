@@ -6,28 +6,136 @@ Google Distributed Cloud, local OSS servers, etc.), with pluggable tool
 sources (in-process registration + MCP discovery), pluggable conversation
 state storage, and a full-fidelity event stream.
 
-## Status
-
-**Skeleton.** Implementation lands brief-by-brief.
-
-## Planned shape
+## Installation
 
 ```
-agent_sdk/
-├── loop.py             # ReACT iterator
-├── runner.py           # Drives the loop with state load/save + event emit
-├── parser/             # json_mode (default), prose_mode, native_tools (reserved)
-├── prompts.py          # Templated system prompts
-├── safety.py           # Iter cap, tool timeout, fallback wrapping
-├── streaming.py        # Typed event stream protocol
-├── llm/                # LLMClient protocol + OpenAICompatibleClient
-├── tools/              # Tool protocol, Registry, MCPProvider, InProcProvider
-├── mcp/                # Generic MCP client (talks to any FastMCP server)
-├── state/              # StateStore protocol + Memory/SQL/Redis backends
-├── audit/              # AuditSink protocol + console/SQL backends
-├── observability/      # Hooks for logging/metrics/tracing
-└── errors.py           # Typed exceptions
+pip install agent-sdk
 ```
+
+The SDK requires Python 3.11 or newer. The core install ships with the
+in-memory backends, so an agent can run with no infrastructure dependency.
+
+Two optional extras add durable backends:
+
+- `pip install 'agent-sdk[sql]'` — pulls SQLAlchemy and enables
+  `SqlStateStore` (durable conversation state) and `SqlAuditSink` (durable
+  audit log).
+- `pip install 'agent-sdk[redis]'` — pulls redis-py and enables
+  `RedisStateStore` (Redis-backed conversation state).
+
+Importing `agent_sdk` itself pulls neither SQLAlchemy nor redis-py. The
+extra symbols are re-exported lazily; first access to one without the
+relevant extra installed raises a clear `ImportError`.
+
+## Quickstart
+
+A complete agent fits in a handful of lines. The example below defines a
+tool, wires the loop and runner, and drains the event stream:
+
+```python
+import asyncio
+from typing import Any
+
+from agent_sdk import (
+    AgentLoop,
+    AgentRunner,
+    JsonModeParser,
+    MemoryStateStore,
+    OpenAICompatibleClient,
+    PromptSections,
+    Registry,
+    SafetyConfig,
+    tool,
+)
+
+
+@tool()
+async def get_weather(city: str) -> dict[str, Any]:
+    """Return the current weather for a city."""
+    return {"city": city, "temp_c": 21}
+
+
+async def main() -> None:
+    # 1. An LLM client — points at any OpenAI-compatible endpoint.
+    llm = OpenAICompatibleClient(api_key="sk-...")
+
+    # 2. A tool registry — register the decorated tool.
+    registry = Registry()
+    registry.register(get_weather)
+
+    # 3. The ReACT loop — LLM + registry + parser + prompts + safety.
+    loop = AgentLoop(
+        llm=llm,
+        registry=registry,
+        parser=JsonModeParser(),
+        prompts=PromptSections(persona="You are helpful."),
+        safety=SafetyConfig(),
+        model="gpt-4o",
+    )
+
+    # 4. The runner — wraps the loop with conversation-state persistence.
+    runner = AgentRunner(
+        loop=loop,
+        state=MemoryStateStore(),
+        system_prompt="You are a helpful weather assistant.",
+    )
+
+    # 5. Drive a turn and consume the event stream.
+    async for event in runner.run("session-1", "What's the weather in Paris?"):
+        print(event)
+
+
+asyncio.run(main())
+```
+
+## Core concepts
+
+### Tools
+
+The `@tool` decorator turns an async function into a `Tool`: it derives a
+JSON Schema for the arguments from the function's type annotations and
+docstring. A `Registry` is the dispatch table the loop talks to —
+`Registry().register(my_tool)` adds a tool by name. `InProcProvider` is a
+convenience helper for bulk-registering a batch of decorated callables.
+
+### LLM clients
+
+`LLMClient` is the protocol the loop depends on — anything implementing it
+can drive the agent. `OpenAICompatibleClient` is the shipped implementation;
+it works against any OpenAI-compatible Chat Completions endpoint. Point it at
+GDC, a local OSS server, or OpenAI itself by passing `base_url` — the
+provider differences are absorbed entirely by that one argument.
+
+### State stores
+
+`StateStore` is the protocol for conversation-state persistence across turns.
+`MemoryStateStore` is the default in-memory implementation and needs no
+infrastructure. `SqlStateStore` and `RedisStateStore` are durable backends
+behind the `sql` and `redis` extras respectively.
+
+### The event stream
+
+Every step of the ReACT cycle emits exactly one event from the `AgentEvent`
+union: `ThoughtEvent`, `ActionEvent`, `ToolStartedEvent`,
+`ToolProgressEvent` (reserved — never emitted by the v1 loop),
+`ObservationEvent`, `ToolFailedEvent`, `TokenEvent`, `FinalEvent`, and
+`ErrorEvent`. Events carry a monotonic `sequence` counter and a `timestamp`
+so consumers can detect drops or reorders. Every run ends with exactly one
+`FinalEvent` — consumers can rely on it as the "iteration done" signal.
+
+### Safety
+
+`SafetyConfig` bounds a run: it caps the iteration count, sets per-tool
+timeouts, and supplies the fallback answer used when a run terminates on an
+error or safety cap.
+
+### Audit & observability
+
+Two optional collaborators plug into the runner. An `AuditSink` records an
+`AuditEvent` at session start, each tool invocation, the final answer, and
+any error. A `Hooks` instance fires lifecycle callbacks for logging, metrics,
+and tracing. Both are best-effort and isolated — a raising sink or hook
+never aborts a live run.
 
 ## Design principles
 
