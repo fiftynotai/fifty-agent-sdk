@@ -1,11 +1,14 @@
 """Shared test fakes for the loop integration tests.
 
-Two stand-ins:
+Three stand-ins:
 
 * :class:`FakeLLMClient` — replays a scripted sequence of
   :class:`agent_sdk.llm.types.ChatResponse` values (or exceptions) on
   successive :meth:`complete` / :meth:`stream` calls. Records every
   inbound :class:`agent_sdk.llm.types.ChatRequest` for assertion.
+* :class:`DriftsOnceFakeLLM` — returns scripted prose drift on the first
+  call and a clean JSON envelope on every subsequent call. Used by the
+  BR-018 parser-retry tests to model the real failure pattern.
 * :class:`FakeTool` — a configurable :class:`agent_sdk.tools.protocol.Tool`
   whose :meth:`invoke` either returns a scripted
   :class:`agent_sdk.tools.protocol.ToolResult` or raises a configured
@@ -116,6 +119,51 @@ def make_stream_chunks(parts: list[str]) -> list[ChatResponse]:
     return chunks
 
 
+class DriftsOnceFakeLLM:
+    """Returns scripted prose drift on first call, then ``json_reply`` on subsequent calls.
+
+    Models the BR-018 failure pattern: model emits a Markdown list outside
+    the envelope on the first call, then on the format-reminder retry
+    returns a clean envelope. Locks the retry mitigation: without the
+    retry, this fake causes a ``ParserError``-terminated run; with the
+    retry, the loop self-heals.
+
+    Args:
+        prose_reply: The drift content returned on the first call (the one
+            that triggers :class:`agent_sdk.errors.ParserError`).
+        json_reply: The well-formed JSON envelope returned on every
+            subsequent call.
+    """
+
+    def __init__(self, *, prose_reply: str, json_reply: str) -> None:
+        self._prose_reply = prose_reply
+        self._json_reply = json_reply
+        self.call_count = 0
+        self._calls: list[ChatRequest] = []
+
+    def _select_reply(self) -> str:
+        """Pick the prose drift on call 1, the JSON envelope on every call after."""
+        self.call_count += 1
+        if self.call_count == 1:
+            return self._prose_reply
+        return self._json_reply
+
+    async def complete(self, request: ChatRequest) -> ChatResponse:
+        self._calls.append(request)
+        return make_response(self._select_reply())
+
+    async def stream(
+        self, request: ChatRequest
+    ) -> AsyncIterator[ChatResponse]:
+        self._calls.append(request)
+        yield make_response(self._select_reply())
+
+    @property
+    def calls(self) -> list[ChatRequest]:
+        """Recorded inbound requests, in call order, for assertion."""
+        return self._calls
+
+
 class FakeTool:
     """Configurable :class:`agent_sdk.tools.protocol.Tool` for loop tests.
 
@@ -155,4 +203,10 @@ class FakeTool:
         return self._result
 
 
-__all__ = ["FakeLLMClient", "FakeTool", "make_response", "make_stream_chunks"]
+__all__ = [
+    "DriftsOnceFakeLLM",
+    "FakeLLMClient",
+    "FakeTool",
+    "make_response",
+    "make_stream_chunks",
+]

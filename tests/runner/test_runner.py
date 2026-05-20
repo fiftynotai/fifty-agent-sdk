@@ -320,8 +320,18 @@ async def test_llm_error_does_not_persist_assistant() -> None:
 
 
 async def test_parser_error_does_not_persist_assistant() -> None:
-    """ParserError inside the loop: assistant not persisted."""
-    llm = FakeLLMClient(replies=[make_response("not valid json at all")])
+    """ParserError inside the loop: assistant not persisted.
+
+    BR-018: the loop performs a one-shot parser-error retry by default,
+    so two prose replies are needed to exhaust the budget and drive the
+    run through to the terminal ParserError path that this test pins.
+    """
+    llm = FakeLLMClient(
+        replies=[
+            make_response("not valid json at all"),
+            make_response("still not valid json"),
+        ]
+    )
     runner, store = make_runner(llm=llm)
 
     events = await collect(runner.run("s1", "Hi"))

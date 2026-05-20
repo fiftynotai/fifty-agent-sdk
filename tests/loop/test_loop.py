@@ -20,8 +20,11 @@ from agent_sdk import (
     AgentEvent,
     AgentLoop,
     ChatMessage,
+    ChatRequest,
+    ChatResponse,
     ErrorEvent,
     FinalEvent,
+    Hooks,
     JsonModeParser,
     ObservationEvent,
     PromptSections,
@@ -36,6 +39,7 @@ from agent_sdk import (
 from agent_sdk.errors import LLMError
 from agent_sdk.streaming import ToolProgressEvent
 from tests.loop.conftest import (
+    DriftsOnceFakeLLM,
     FakeLLMClient,
     FakeTool,
     make_response,
@@ -381,7 +385,15 @@ async def test_iteration_cap_does_not_raise() -> None:
 
 
 async def test_parser_error_emits_error_event_and_fallback_final() -> None:
-    llm = FakeLLMClient(replies=[make_response("not valid json at all")])
+    # BR-018: the loop performs a one-shot parser-error retry by default, so
+    # we need TWO prose replies to drive the run through to the terminal
+    # ParserError path (drift → retry → drift again → exhausted).
+    llm = FakeLLMClient(
+        replies=[
+            make_response("not valid json at all"),
+            make_response("still not valid json"),
+        ]
+    )
     loop = _make_loop(llm=llm)
 
     events = await _collect(loop.run([ChatMessage(role="user", content="q")]))
@@ -396,11 +408,152 @@ async def test_parser_error_emits_error_event_and_fallback_final() -> None:
 
 
 async def test_parser_error_does_not_propagate() -> None:
-    llm = FakeLLMClient(replies=[make_response("garbage")])
+    # BR-018: see above — two prose replies to exhaust the retry budget.
+    llm = FakeLLMClient(
+        replies=[make_response("garbage"), make_response("more garbage")]
+    )
     loop = _make_loop(llm=llm)
     # Must not raise:
     events = await _collect(loop.run([ChatMessage(role="user", content="q")]))
     assert isinstance(events[-1], FinalEvent)
+
+
+# ---------------------------------------------------------------------------
+# Parser-error retry (BR-018)
+# ---------------------------------------------------------------------------
+
+
+async def test_parser_error_one_shot_retry_recovers() -> None:
+    """The default loop self-heals a single parse drift via the BR-018 retry.
+
+    Models the exact Gemini meta-query failure mode: the model emits a
+    Markdown list outside the envelope on call 1, then on the
+    format-reminder retry returns a clean envelope on call 2. The loop
+    must NOT surface an :class:`ErrorEvent` and must reach the parsed
+    final answer.
+    """
+    llm = DriftsOnceFakeLLM(
+        prose_reply="# Here are my tools:\n- echo",
+        json_reply=_final_json("ok"),
+    )
+    loop = AgentLoop(
+        llm=llm,
+        registry=Registry(),
+        parser=JsonModeParser(),
+        prompts=PromptSections(persona="P"),
+        safety=SafetyConfig(),
+        model="test-model",
+    )
+
+    events = await _collect(loop.run([ChatMessage(role="user", content="q")]))
+
+    # No ErrorEvent in the stream — the retry absorbs the drift.
+    assert not any(isinstance(e, ErrorEvent) for e in events)
+    final_event = events[-1]
+    assert isinstance(final_event, FinalEvent)
+    assert final_event.text == "ok"
+
+    # Two LLM calls: the drift attempt plus the post-reminder success.
+    assert len(llm.calls) == 2
+
+    # The reminder text was injected into the second call's messages.
+    second_request = llm.calls[1]
+    reminder = SafetyConfig().parser_retry_reminder
+    assert any(
+        message.role == "user" and message.content == reminder
+        for message in second_request.messages
+    ), "BR-018 reminder text must appear as a user-role message on the retry"
+
+
+async def test_parser_error_retry_exhausted_terminates() -> None:
+    """Two prose replies in a row exhaust the one-shot retry budget.
+
+    Locks the terminal ``ErrorEvent`` + fallback ``FinalEvent`` shape on
+    the retry-exhausted path and asserts the LLM was called exactly twice
+    — once for the drift, once for the retry that also drifted.
+    """
+    llm = FakeLLMClient(
+        replies=[make_response("drift one"), make_response("drift two")]
+    )
+    loop = _make_loop(llm=llm)
+
+    events = await _collect(loop.run([ChatMessage(role="user", content="q")]))
+
+    error_event = events[-2]
+    final_event = events[-1]
+    assert isinstance(error_event, ErrorEvent)
+    assert error_event.error_type == "ParserError"
+    assert isinstance(final_event, FinalEvent)
+    assert final_event.text == SafetyConfig().fallback_message
+    # The retry attempt fires a second LLM call before exhausting the budget.
+    assert len(llm.calls) == 2
+
+
+async def test_parser_error_retry_disabled_via_safety() -> None:
+    """``SafetyConfig(parser_retry_enabled=False)`` is the kill-switch.
+
+    A single prose reply terminates the run on the first ParserError, the
+    second reply is never consumed, and the LLM call count is exactly one.
+    """
+    llm = FakeLLMClient(replies=[make_response("drift only")])
+    safety = SafetyConfig(parser_retry_enabled=False)
+    loop = _make_loop(llm=llm, safety=safety)
+
+    events = await _collect(loop.run([ChatMessage(role="user", content="q")]))
+
+    error_event = events[-2]
+    final_event = events[-1]
+    assert isinstance(error_event, ErrorEvent)
+    assert error_event.error_type == "ParserError"
+    assert isinstance(final_event, FinalEvent)
+    # NO retry was attempted — the kill-switch held.
+    assert len(llm.calls) == 1
+
+
+async def test_parser_retry_does_not_increment_iteration_hook() -> None:
+    """The BR-018 retry is sub-iteration: ``on_iteration`` fires once, not twice.
+
+    Pins the hook-firing contract: a single outer ReACT iteration that
+    happens to retry once internally fires ``on_iteration`` exactly ONCE
+    (per outer iteration) and ``on_llm_call`` exactly TWICE (per inner
+    LLM call). If the retry ever leaks into the outer counter this test
+    catches the regression.
+    """
+    iteration_calls: list[int] = []
+    llm_call_records: list[tuple[ChatRequest, ChatResponse, float]] = []
+
+    def on_iteration(session_id: str | None, iteration_n: int) -> None:
+        iteration_calls.append(iteration_n)
+
+    def on_llm_call(
+        session_id: str | None,
+        request: ChatRequest,
+        response: ChatResponse,
+        duration_ms: float,
+    ) -> None:
+        llm_call_records.append((request, response, duration_ms))
+
+    hooks = Hooks(on_iteration=on_iteration, on_llm_call=on_llm_call)
+    llm = DriftsOnceFakeLLM(
+        prose_reply="# drift",
+        json_reply=_final_json("done"),
+    )
+    loop = AgentLoop(
+        llm=llm,
+        registry=Registry(),
+        parser=JsonModeParser(),
+        prompts=PromptSections(persona="P"),
+        safety=SafetyConfig(),
+        model="test-model",
+        hooks=hooks,
+    )
+
+    await _collect(loop.run([ChatMessage(role="user", content="q")]))
+
+    # Exactly one outer iteration despite the sub-iteration retry.
+    assert iteration_calls == [1]
+    # Two LLM calls: the drift + the post-reminder success.
+    assert len(llm_call_records) == 2
 
 
 # ---------------------------------------------------------------------------
@@ -598,7 +751,10 @@ async def test_run_always_terminates_with_final_event(scenario: str) -> None:
         llm = FakeLLMClient(replies=[make_response(_final_json("ok"))])
         loop = _make_loop(llm=llm)
     elif scenario == "parser_error":
-        llm = FakeLLMClient(replies=[make_response("garbage")])
+        # BR-018: two prose replies needed to exhaust the one-shot retry.
+        llm = FakeLLMClient(
+            replies=[make_response("garbage"), make_response("garbage")]
+        )
         loop = _make_loop(llm=llm)
     elif scenario == "iteration_cap":
         tool = FakeTool("t", result=ToolResult(output="ok"))

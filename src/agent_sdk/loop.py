@@ -48,7 +48,7 @@ from agent_sdk.llm.protocol import LLMClient
 from agent_sdk.llm.types import ChatMessage, ChatRequest, ChatResponse, Usage
 from agent_sdk.observability import Hooks
 from agent_sdk.observability.hooks import invoke_hook
-from agent_sdk.parser.base import FinalAnswer, Parser
+from agent_sdk.parser.base import FinalAnswer, Parser, ParseResult
 from agent_sdk.prompts import PromptSections, render_system_prompt
 from agent_sdk.safety import SafetyConfig
 from agent_sdk.streaming import (
@@ -371,78 +371,133 @@ class AgentLoop:
                 iteration,
             )
 
-            # ----- 1. Build request and call LLM ----------------------------
-            request = self._build_request(working)
-            try:
-                llm_t0 = time.perf_counter()
-                completion, deltas, response = await self._call_llm(request)
-                llm_duration_ms = (time.perf_counter() - llm_t0) * 1000
-            except LLMError as exc:
-                yield self._make_event(
-                    ErrorEvent,
-                    sequence_box,
-                    error_type="LLMError",
-                    message=exc.message,
-                    context=dict(exc.context),
-                )
-                yield self._make_event(
-                    FinalEvent,
-                    sequence_box,
-                    text=self._safety.fallback_message,
-                )
-                _log.info(
-                    "agent_loop_completed",
-                    iterations=iteration,
-                    run_id=run_id,
-                    terminated_by="llm_error",
-                )
-                return
+            # ----- 1+2. LLM call and parse, with BR-018 one-shot retry -----
+            # Retry budget is PER-iteration (not cumulative): every outer
+            # iteration starts fresh so multi-tool runs cannot silently
+            # exhaust a global budget on the first drift. The inner loop
+            # runs once on the success path, twice when a single parse
+            # failure triggers the format-reminder retry.
+            parser_retries_this_iteration: int = 0
+            completion: str = ""
+            deltas: list[str] = []
+            parsed: ParseResult
+            while True:
+                # ----- 1. Build request and call LLM ------------------------
+                request = self._build_request(working)
+                try:
+                    llm_t0 = time.perf_counter()
+                    completion, deltas, response = await self._call_llm(
+                        request
+                    )
+                    llm_duration_ms = (time.perf_counter() - llm_t0) * 1000
+                except LLMError as exc:
+                    yield self._make_event(
+                        ErrorEvent,
+                        sequence_box,
+                        error_type="LLMError",
+                        message=exc.message,
+                        context=dict(exc.context),
+                    )
+                    yield self._make_event(
+                        FinalEvent,
+                        sequence_box,
+                        text=self._safety.fallback_message,
+                    )
+                    _log.info(
+                        "agent_loop_completed",
+                        iterations=iteration,
+                        run_id=run_id,
+                        terminated_by="llm_error",
+                    )
+                    return
 
-            # `on_llm_call` fires once per SUCCESSFUL LLM call only — an
-            # LLMError surfaces via the Runner-tier `on_error` hook (driven
-            # by the ErrorEvent above), so firing here with no response
-            # would be ill-defined. In stream mode `_call_llm` returns
-            # `response is None` (a stream has no single response object);
-            # synthesize a minimal ChatResponse from the accumulated
-            # completion so the hook always receives a real ChatResponse.
-            if self._hooks is not None and self._hooks.on_llm_call is not None:
-                llm_response = (
-                    response
-                    if response is not None
-                    else _synthesize_stream_response(completion)
-                )
-                await self._invoke_hook(
-                    "on_llm_call",
-                    self._hooks.on_llm_call,
-                    session_id,
-                    request,
-                    llm_response,
-                    llm_duration_ms,
-                )
+                # `on_llm_call` fires once per SUCCESSFUL LLM call only — an
+                # LLMError surfaces via the Runner-tier `on_error` hook
+                # (driven by the ErrorEvent above), so firing here with no
+                # response would be ill-defined. In stream mode `_call_llm`
+                # returns `response is None` (a stream has no single
+                # response object); synthesize a minimal ChatResponse from
+                # the accumulated completion so the hook always receives a
+                # real ChatResponse. On a BR-018 retry this hook fires
+                # TWICE per outer iteration (once per inner LLM call) by
+                # design.
+                if (
+                    self._hooks is not None
+                    and self._hooks.on_llm_call is not None
+                ):
+                    llm_response = (
+                        response
+                        if response is not None
+                        else _synthesize_stream_response(completion)
+                    )
+                    await self._invoke_hook(
+                        "on_llm_call",
+                        self._hooks.on_llm_call,
+                        session_id,
+                        request,
+                        llm_response,
+                        llm_duration_ms,
+                    )
 
-            # ----- 2. Parse the completion ---------------------------------
-            try:
-                parsed = self._parser.parse(completion)
-            except ParserError as exc:
-                yield self._make_event(
-                    ErrorEvent,
-                    sequence_box,
-                    error_type="ParserError",
-                    message=exc.message,
-                    context=dict(exc.context),
-                )
-                yield self._make_event(
-                    FinalEvent,
-                    sequence_box,
-                    text=self._safety.fallback_message,
-                )
-                _log.info(
-                    "agent_loop_completed",
-                    iterations=iteration,
-                    run_id=run_id,
-                    terminated_by="parser_error",
-                )
-                return
+                # ----- 2. Parse the completion -----------------------------
+                try:
+                    parsed = self._parser.parse(completion)
+                except ParserError as exc:
+                    if (
+                        self._safety.parser_retry_enabled
+                        and parser_retries_this_iteration < 1
+                    ):
+                        # BR-018 one-shot retry: echo the malformed
+                        # completion back as an assistant turn (so the
+                        # model sees what it actually said) and inject
+                        # the reminder as a user turn, then re-enter the
+                        # inner loop. No events are emitted for the
+                        # failed attempt — the iteration is still "in
+                        # progress" from the consumer's view.
+                        _log.info(
+                            "parser_retry_triggered",
+                            iteration=iteration,
+                            error_phase=exc.context.get("error_phase"),
+                            run_id=run_id,
+                        )
+                        working.append(
+                            ChatMessage(
+                                role="assistant", content=completion
+                            )
+                        )
+                        working.append(
+                            ChatMessage(
+                                role="user",
+                                content=self._safety.parser_retry_reminder,
+                            )
+                        )
+                        parser_retries_this_iteration += 1
+                        continue
+                    # Retry disabled OR per-iteration budget exhausted:
+                    # preserve the pre-BR-018 terminal ParserError shape
+                    # verbatim — ErrorEvent + fallback FinalEvent + return.
+                    yield self._make_event(
+                        ErrorEvent,
+                        sequence_box,
+                        error_type="ParserError",
+                        message=exc.message,
+                        context=dict(exc.context),
+                    )
+                    yield self._make_event(
+                        FinalEvent,
+                        sequence_box,
+                        text=self._safety.fallback_message,
+                    )
+                    _log.info(
+                        "agent_loop_completed",
+                        iterations=iteration,
+                        run_id=run_id,
+                        terminated_by="parser_error",
+                    )
+                    return
+                # Parse succeeded — leave the inner retry loop and
+                # continue with the existing branching logic below.
+                break
 
             _log.debug("parsed_result", kind=parsed.kind, run_id=run_id)
 

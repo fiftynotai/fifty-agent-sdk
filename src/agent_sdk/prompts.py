@@ -17,7 +17,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 JSON_MODE_OUTPUT_FORMAT: str = """\
-Respond with a single JSON object. Schema:
+Respond with a SINGLE JSON object and nothing else. Schema:
 {
   "thought": string,           // your reasoning
   "action": "tool" | "final",  // tool to call, or final answer
@@ -25,8 +25,21 @@ Respond with a single JSON object. Schema:
   "tool_args": object|null,    // required when action == "tool"
   "answer": string|null        // required when action == "final"
 }
-Do not include any text outside the JSON object."""
-"""Strict JSON output schema for the BR-005 parser."""
+
+Hard rules:
+- Output ONLY the JSON object. No prose, no Markdown, no code fences, no headings, no lists outside the `answer` field.
+- This applies to EVERY question, including meta questions about yourself ("what tools do you have?", "what topics can you look up?", "what can you do?"). Wrap the entire response in the envelope with action="final" and put any prose, list, or explanation inside the `answer` string.
+- If your answer is naturally a list, put it inside `answer` as a single string (newline-separated or comma-separated). Do NOT emit a top-level Markdown list.
+- Never wrap the JSON in ```json fences."""
+"""Strict JSON output schema for the BR-005 parser.
+
+Reinforced in BR-018 against Gemini's list-shaped meta-query drift: the
+original one-line "Do not include any text outside the JSON object" was
+insufficient when the model interpreted meta questions ("what tools do you
+have?") as license to emit a top-level Markdown list. The strengthened
+schema spells out the envelope explicitly, names the meta-query failure
+mode, and forbids ``` ```json ``` fences outright.
+"""
 
 PROSE_MODE_OUTPUT_FORMAT: str = """\
 Use the classic ReACT format. On every step output exactly:

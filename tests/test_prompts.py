@@ -142,3 +142,17 @@ def test_json_template_schema_aligned_with_parser_keys() -> None:
     # These keys are the contract the BR-005 parser will consume.
     for key in ("thought", "action", "tool_name", "tool_args", "answer"):
         assert key in out
+
+
+def test_json_mode_output_format_carries_br018_strengthening() -> None:
+    """Structural pin (BR-018): the strengthened body carries the schema
+    keys, the Hard rules header, and the no-fences directive.
+
+    Structural assertions only — no byte-equality on the full body so the
+    text remains tunable without test churn.
+    """
+    body = JSON_MODE_OUTPUT_FORMAT
+    for key in ("thought", "action", "tool_name", "tool_args", "answer"):
+        assert key in body
+    assert "Hard rules:" in body
+    assert "Never wrap the JSON in ```json fences" in body
