@@ -11,7 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import AsyncIterator
-from typing import Any
+from typing import Any, Literal
 
 import pytest
 
@@ -78,6 +78,7 @@ def _make_loop(
     safety: SafetyConfig | None = None,
     stream: bool = False,
     persona: str = "You are a helpful agent.",
+    tool_message_role: Literal["tool", "user", "assistant"] = "tool",
 ) -> AgentLoop:
     return AgentLoop(
         llm=llm,
@@ -87,6 +88,7 @@ def _make_loop(
         safety=safety if safety is not None else SafetyConfig(),
         model="test-model",
         stream=stream,
+        tool_message_role=tool_message_role,
     )
 
 
@@ -831,3 +833,195 @@ def test_top_level_exports_loop_surface() -> None:
     assert _TokenEvent is TokenEvent
     assert _FinalEvent is FinalEvent
     assert _ErrorEvent is ErrorEvent
+
+
+# ---------------------------------------------------------------------------
+# Tool-message-role override (BR-017)
+# ---------------------------------------------------------------------------
+
+
+async def test_tool_message_role_user_emits_user_role_message() -> None:
+    """Happy path: ``tool_message_role="user"`` collapses the synthetic
+    post-tool message to ``role="user"`` carrying the tool name inline.
+
+    This is the wire-format the Kalvad GDC proxy at ``gemini.kalvad.cloud``
+    accepts — that provider rejects ``role="tool"`` with HTTP 500.
+    """
+    tool = FakeTool("search", result=ToolResult(output={"results": ["a", "b"]}))
+    registry = Registry()
+    registry.register(tool)
+    llm = FakeLLMClient(
+        replies=[
+            make_response(_tool_json("look it up", "search", {"q": "x"})),
+            make_response(_final_json("done")),
+        ]
+    )
+    loop = _make_loop(llm=llm, registry=registry, tool_message_role="user")
+
+    await _collect(loop.run([ChatMessage(role="user", content="q")]))
+
+    second_request = llm.calls[1]
+    # No role="tool" message must exist anywhere in the conversation.
+    assert not any(m.role == "tool" for m in second_request.messages)
+    # The synthesized message is a user-role message carrying the tool
+    # name inline and the serialized output.
+    synthesized = [
+        m
+        for m in second_request.messages
+        if m.role == "user" and m.content.startswith("Tool search returned:")
+    ]
+    assert len(synthesized) == 1
+    serialized = json.dumps({"results": ["a", "b"]})
+    assert serialized in synthesized[0].content
+    # tool_call_id / name fields are dropped in the collapsed envelope.
+    assert synthesized[0].tool_call_id is None
+    assert synthesized[0].name is None
+
+
+async def test_tool_message_role_user_for_tool_error_branch() -> None:
+    """``ToolResult(is_error=True)`` under ``tool_message_role="user"``
+    surfaces as a user-role message prefixed ``"Tool {name} failed:"``."""
+    tool = FakeTool(
+        "search",
+        result=ToolResult(output=None, is_error=True, error="boom"),
+    )
+    registry = Registry()
+    registry.register(tool)
+    llm = FakeLLMClient(
+        replies=[
+            make_response(_tool_json("t", "search", {})),
+            make_response(_final_json("recovered")),
+        ]
+    )
+    loop = _make_loop(llm=llm, registry=registry, tool_message_role="user")
+
+    await _collect(loop.run([ChatMessage(role="user", content="q")]))
+
+    second_request = llm.calls[1]
+    assert not any(m.role == "tool" for m in second_request.messages)
+    synthesized = [
+        m
+        for m in second_request.messages
+        if m.role == "user" and m.content.startswith("Tool search failed:")
+    ]
+    assert len(synthesized) == 1
+    assert synthesized[0].content == "Tool search failed: boom"
+
+
+async def test_tool_message_role_user_for_tool_not_found_branch() -> None:
+    """A ``ToolNotFound`` under ``tool_message_role="user"`` surfaces as a
+    user-role message prefixed ``"Tool {name} failed: ToolNotFound:"``."""
+    registry = Registry()  # no tools registered
+    llm = FakeLLMClient(
+        replies=[
+            make_response(_tool_json("t", "ghost", {})),
+            make_response(_final_json("gave up")),
+        ]
+    )
+    loop = _make_loop(llm=llm, registry=registry, tool_message_role="user")
+
+    await _collect(loop.run([ChatMessage(role="user", content="q")]))
+
+    second_request = llm.calls[1]
+    assert not any(m.role == "tool" for m in second_request.messages)
+    synthesized = [
+        m
+        for m in second_request.messages
+        if m.role == "user"
+        and m.content.startswith("Tool ghost failed: ToolNotFound:")
+    ]
+    assert len(synthesized) == 1
+
+
+async def test_tool_message_role_user_for_tool_timeout_branch() -> None:
+    """A ``ToolTimeout`` under ``tool_message_role="user"`` surfaces as a
+    user-role message prefixed ``"Tool {name} failed: ToolTimeout:"``."""
+    tool = FakeTool("slow", sleep_seconds=0.5)
+    registry = Registry()
+    registry.register(tool)
+    safety = SafetyConfig(max_iterations=4, tool_timeout_seconds=0.05)
+    llm = FakeLLMClient(
+        replies=[
+            make_response(_tool_json("t", "slow", {})),
+            make_response(_final_json("recovered")),
+        ]
+    )
+    loop = _make_loop(
+        llm=llm,
+        registry=registry,
+        safety=safety,
+        tool_message_role="user",
+    )
+
+    await _collect(loop.run([ChatMessage(role="user", content="q")]))
+
+    second_request = llm.calls[1]
+    assert not any(m.role == "tool" for m in second_request.messages)
+    synthesized = [
+        m
+        for m in second_request.messages
+        if m.role == "user"
+        and m.content.startswith("Tool slow failed: ToolTimeout:")
+    ]
+    assert len(synthesized) == 1
+
+
+async def test_tool_message_role_assistant_emits_assistant_role_message() -> None:
+    """Smoke test for ``tool_message_role="assistant"`` — the synthetic
+    post-tool message uses ``role="assistant"`` with the same inline
+    name-carrying content shape as the user-role variant."""
+    tool = FakeTool("search", result=ToolResult(output="ok"))
+    registry = Registry()
+    registry.register(tool)
+    llm = FakeLLMClient(
+        replies=[
+            make_response(_tool_json("t", "search", {})),
+            make_response(_final_json("done")),
+        ]
+    )
+    loop = _make_loop(
+        llm=llm, registry=registry, tool_message_role="assistant"
+    )
+
+    await _collect(loop.run([ChatMessage(role="user", content="q")]))
+
+    second_request = llm.calls[1]
+    assert not any(m.role == "tool" for m in second_request.messages)
+    # The model's assistant turn ALSO has role="assistant"; we look for our
+    # synthesized one by its content prefix.
+    synthesized = [
+        m
+        for m in second_request.messages
+        if m.role == "assistant"
+        and m.content.startswith("Tool search returned:")
+    ]
+    assert len(synthesized) == 1
+    assert "ok" in synthesized[0].content
+    assert synthesized[0].tool_call_id is None
+    assert synthesized[0].name is None
+
+
+async def test_tool_message_role_default_is_tool_unchanged() -> None:
+    """Lock the default: omitting ``tool_message_role`` keeps the OpenAI
+    tool-role envelope with ``tool_call_id`` and ``name`` populated."""
+    tool = FakeTool("search", result=ToolResult(output="ok"))
+    registry = Registry()
+    registry.register(tool)
+    llm = FakeLLMClient(
+        replies=[
+            make_response(_tool_json("t", "search", {})),
+            make_response(_final_json("done")),
+        ]
+    )
+    loop = _make_loop(llm=llm, registry=registry)  # default
+
+    await _collect(loop.run([ChatMessage(role="user", content="q")]))
+
+    second_request = llm.calls[1]
+    tool_msgs = [m for m in second_request.messages if m.role == "tool"]
+    assert len(tool_msgs) == 1
+    assert tool_msgs[0].name == "search"
+    assert tool_msgs[0].tool_call_id is not None
+    # Content must remain BYTE-IDENTICAL to the pre-BR-017 shape — the
+    # serialized output with no "Tool ... returned:" prefix.
+    assert tool_msgs[0].content == "ok"

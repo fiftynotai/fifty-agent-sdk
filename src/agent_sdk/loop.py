@@ -38,7 +38,7 @@ import json
 import time
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
-from typing import Any, Final, TypeVar
+from typing import Any, Final, Literal, TypeVar
 from uuid import uuid4
 
 import structlog
@@ -239,6 +239,18 @@ class AgentLoop:
             in ``prompts.output_format``. Useful for callers that want
             to pin the parser-aligned format without rebuilding
             ``prompts``.
+        tool_message_role: Wire-format role used for the synthetic message
+            the loop appends after a tool invocation. The default
+            ``"tool"`` preserves the OpenAI tool-role wire format and is
+            correct for any provider whose chat-message schema accepts
+            ``role="tool"`` with ``tool_call_id`` and ``name`` fields. Set
+            to ``"user"`` or ``"assistant"`` for providers whose
+            chat-message schema only accepts ``system | user | assistant``
+            (e.g. the Kalvad GDC proxy at ``gemini.kalvad.cloud``, which
+            returns HTTP 500 on ``role="tool"``). In non-``"tool"`` mode
+            the synthetic message carries the tool name inline in its
+            content (so the model retains identity context) and omits
+            ``tool_call_id`` / ``name``.
         hooks: Optional :class:`agent_sdk.observability.Hooks`. When set,
             the loop fires the two Loop-tier hooks — ``on_iteration`` once
             per ReACT iteration and ``on_llm_call`` once per successful LLM
@@ -263,6 +275,7 @@ class AgentLoop:
         model: str,
         stream: bool = False,
         output_format: str = "",
+        tool_message_role: Literal["tool", "user", "assistant"] = "tool",
         hooks: Hooks | None = None,
     ) -> None:
         self._llm = llm
@@ -271,6 +284,9 @@ class AgentLoop:
         self._safety = safety
         self._model = model
         self._stream = stream
+        self._tool_message_role: Literal["tool", "user", "assistant"] = (
+            tool_message_role
+        )
         self._hooks = hooks
         # Snapshot tool descriptions ONCE; subsequent registry mutations are
         # invisible to this loop instance. Documented behavior.
@@ -500,11 +516,14 @@ class AgentLoop:
                     error=f"ToolNotFound: {exc.message}",
                 )
                 working.append(
-                    ChatMessage(
-                        role="tool",
-                        tool_call_id=call_id,
-                        name=tool_name,
-                        content=(
+                    self._build_tool_message(
+                        tool_name=tool_name,
+                        call_id=call_id,
+                        content_for_tool_role=(
+                            f"ToolNotFound: tool '{tool_name}' is not registered."
+                        ),
+                        content_for_other_role=(
+                            f"Tool {tool_name} failed: "
                             f"ToolNotFound: tool '{tool_name}' is not registered."
                         ),
                     )
@@ -519,11 +538,13 @@ class AgentLoop:
                     error=f"ToolTimeout: {exc.message}",
                 )
                 working.append(
-                    ChatMessage(
-                        role="tool",
-                        tool_call_id=call_id,
-                        name=tool_name,
-                        content=f"ToolTimeout: {exc.message}",
+                    self._build_tool_message(
+                        tool_name=tool_name,
+                        call_id=call_id,
+                        content_for_tool_role=f"ToolTimeout: {exc.message}",
+                        content_for_other_role=(
+                            f"Tool {tool_name} failed: ToolTimeout: {exc.message}"
+                        ),
                     )
                 )
                 continue
@@ -543,11 +564,13 @@ class AgentLoop:
                     error=error_text,
                 )
                 working.append(
-                    ChatMessage(
-                        role="tool",
-                        tool_call_id=call_id,
-                        name=tool_name,
-                        content=f"Tool error: {error_text}",
+                    self._build_tool_message(
+                        tool_name=tool_name,
+                        call_id=call_id,
+                        content_for_tool_role=f"Tool error: {error_text}",
+                        content_for_other_role=(
+                            f"Tool {tool_name} failed: {error_text}"
+                        ),
                     )
                 )
             else:
@@ -559,11 +582,16 @@ class AgentLoop:
                     result=tool_result,
                 )
                 working.append(
-                    ChatMessage(
-                        role="tool",
-                        tool_call_id=call_id,
-                        name=tool_name,
-                        content=_serialize_tool_output(tool_result.output),
+                    self._build_tool_message(
+                        tool_name=tool_name,
+                        call_id=call_id,
+                        content_for_tool_role=_serialize_tool_output(
+                            tool_result.output
+                        ),
+                        content_for_other_role=(
+                            f"Tool {tool_name} returned: "
+                            f"{_serialize_tool_output(tool_result.output)}"
+                        ),
                     )
                 )
             # Loop continues.
@@ -596,6 +624,55 @@ class AgentLoop:
             iterations=iteration,
             run_id=run_id,
             terminated_by="safety_cap",
+        )
+
+    def _build_tool_message(
+        self,
+        *,
+        tool_name: str,
+        call_id: str,
+        content_for_tool_role: str,
+        content_for_other_role: str,
+    ) -> ChatMessage:
+        """Build the synthetic post-tool message in the configured wire-format role.
+
+        When :attr:`_tool_message_role` is the default ``"tool"``, the
+        message uses the OpenAI tool-role envelope: ``role="tool"`` with
+        ``tool_call_id`` and ``name`` populated and ``content_for_tool_role``
+        as the body. When it is ``"user"`` or ``"assistant"`` (used for
+        providers that reject ``role="tool"``), the envelope is collapsed
+        to a plain ``user``/``assistant`` message whose content is
+        ``content_for_other_role`` — the caller prefixes the tool name into
+        that string so the model retains identity context without
+        ``tool_call_id`` / ``name`` fields.
+
+        Args:
+            tool_name: The name of the tool that was invoked (only used in
+                the ``"tool"`` role branch; the caller embeds it into
+                ``content_for_other_role`` for the other branches).
+            call_id: The synthesized tool-call identifier (only used in the
+                ``"tool"`` role branch).
+            content_for_tool_role: Body string for the ``role="tool"``
+                envelope. MUST remain byte-identical to the previous
+                implementation so default-path callers see no wire change.
+            content_for_other_role: Body string for the
+                ``role="user"`` / ``role="assistant"`` envelope. Carries the
+                tool name inline since the envelope drops ``name``.
+
+        Returns:
+            A :class:`ChatMessage` ready to append to the loop's working
+            message list.
+        """
+        if self._tool_message_role == "tool":
+            return ChatMessage(
+                role="tool",
+                tool_call_id=call_id,
+                name=tool_name,
+                content=content_for_tool_role,
+            )
+        return ChatMessage(
+            role=self._tool_message_role,
+            content=content_for_other_role,
         )
 
     async def _call_llm(
