@@ -27,9 +27,10 @@ from agent_sdk import (
     SafetyConfig,
 )
 from agent_sdk.audit.protocol import AuditSink
+from agent_sdk.llm.types import ChatRequest, ChatResponse
 from agent_sdk.observability import Hooks
 from agent_sdk.state.protocol import StateStore
-from tests.loop.conftest import FakeLLMClient
+from tests.loop.conftest import FakeLLMClient, make_response
 
 
 def final_json(answer: str, thought: str = "done") -> str:
@@ -109,3 +110,57 @@ def make_runner(
 async def collect(iterator: AsyncIterator[AgentEvent]) -> list[AgentEvent]:
     """Drain an :class:`AsyncIterator[AgentEvent]` to a list."""
     return [event async for event in iterator]
+
+
+class FormatAwareFakeLLM:
+    """FakeLLM that mirrors real provider behavior: if the most recent assistant
+    message in the inbound ChatRequest is a JSON envelope (parses + has `action`
+    key), reply with json_reply; otherwise reply with prose_reply.
+
+    Locks BR-016: a runner that persists only the parsed answer feeds prose
+    back on turn 2, this fake then replies with prose, JsonModeParser raises
+    ParserError. The fix persists the raw envelope so turn 2 stays in format.
+    """
+
+    def __init__(self, *, json_reply: str, prose_reply: str) -> None:
+        self._json_reply = json_reply
+        self._prose_reply = prose_reply
+        self.calls: list[ChatRequest] = []
+
+    def _select_reply(self, request: ChatRequest) -> str:
+        """Pick ``json_reply`` or ``prose_reply`` based on the prior assistant turn.
+
+        Scans ``request.messages`` in reverse for the most recent
+        ``role="assistant"`` message:
+
+        * If its ``content`` parses as JSON AND the resulting dict has an
+          ``"action"`` key → format-following provider behavior is the
+          ``json_reply``.
+        * Otherwise (content is prose, or parses but lacks ``"action"``) →
+          the provider has drifted out of format and produces ``prose_reply``,
+          which is what JsonModeParser will reject as a ParserError.
+        * If no assistant message exists yet (turn 1) → default to
+          ``json_reply``: the system prompt is the format-pinning signal on
+          the first turn.
+        """
+        for message in reversed(request.messages):
+            if message.role != "assistant":
+                continue
+            try:
+                parsed = json.loads(message.content)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return self._prose_reply
+            if isinstance(parsed, dict) and "action" in parsed:
+                return self._json_reply
+            return self._prose_reply
+        return self._json_reply
+
+    async def complete(self, request: ChatRequest) -> ChatResponse:
+        self.calls.append(request)
+        return make_response(self._select_reply(request))
+
+    async def stream(
+        self, request: ChatRequest
+    ) -> AsyncIterator[ChatResponse]:
+        self.calls.append(request)
+        yield make_response(self._select_reply(request))

@@ -40,7 +40,13 @@ from agent_sdk import (
     ToolStartedEvent,
 )
 from tests.loop.conftest import FakeLLMClient, FakeTool, make_response
-from tests.runner.conftest import collect, final_json, make_runner, tool_json
+from tests.runner.conftest import (
+    FormatAwareFakeLLM,
+    collect,
+    final_json,
+    make_runner,
+    tool_json,
+)
 
 # ---------------------------------------------------------------------------
 # Round-trip across multiple turns
@@ -68,9 +74,12 @@ async def test_two_turn_conversation_preserves_history() -> None:
         "assistant",
     ]
     assert history[0].content == "Hello"
-    assert history[1].content == "hi back"
+    # BR-016: assistant turns persist the raw LLM completion (the JSON
+    # envelope), NOT the parsed answer text — so multi-turn sessions
+    # feed the same structured shape back to the provider on turn 2+.
+    assert history[1].content == final_json("hi back")
     assert history[2].content == "Tell me more"
-    assert history[3].content == "more details"
+    assert history[3].content == final_json("more details")
 
 
 async def test_second_run_sees_prior_history_in_loop_request() -> None:
@@ -92,7 +101,9 @@ async def test_second_run_sees_prior_history_in_loop_request() -> None:
     assert roles == ["system", "user", "assistant", "user"]
     contents = [m.content for m in second_request.messages]
     assert contents[1] == "msg1"
-    assert contents[2] == "first"
+    # BR-016: the prior assistant turn is the raw JSON envelope, not the
+    # parsed answer — that's the whole point of persisting raw_completion.
+    assert contents[2] == final_json("first")
     assert contents[3] == "msg2"
 
 
@@ -111,8 +122,40 @@ async def test_different_sessions_have_isolated_history() -> None:
 
     alice = await store.get_messages("alice")
     bob = await store.get_messages("bob")
-    assert [m.content for m in alice] == ["alice-msg", "ans1"]
-    assert [m.content for m in bob] == ["bob-msg", "ans2"]
+    assert [m.content for m in alice] == ["alice-msg", final_json("ans1")]
+    assert [m.content for m in bob] == ["bob-msg", final_json("ans2")]
+
+
+async def test_multi_turn_persists_raw_envelope_so_parser_succeeds() -> None:
+    """BR-016 regression: turn 2+ must see the prior turn's raw envelope.
+
+    Locks the live-reproduced GDC Gemini failure: if the runner persisted
+    only the parsed ``final_text`` ("hi back"), the provider's
+    format-detector would drift on turn 2 and return prose, and
+    :class:`agent_sdk.parser.json_mode.JsonModeParser` would raise a
+    :class:`agent_sdk.errors.ParserError`. The fix persists the raw JSON
+    envelope so the provider stays in format and turn 2 parses cleanly.
+    """
+    llm = FormatAwareFakeLLM(
+        json_reply=final_json("hi back"),
+        prose_reply="this is prose, no envelope",
+    )
+    runner, store = make_runner(llm=llm)
+
+    events_1 = await collect(runner.run("s1", "Hello"))
+    events_2 = await collect(runner.run("s1", "Tell me more"))
+
+    assert not any(isinstance(e, ErrorEvent) for e in events_1)
+    history = await store.get_messages("s1")
+    assert history[1].role == "assistant"
+    # The raw envelope — NOT the parsed "hi back" — is what hits state.
+    assert history[1].content == final_json("hi back")
+
+    # The bug-locking assertion: turn 2 must not error.
+    assert not any(isinstance(e, ErrorEvent) for e in events_2)
+    finals = [e for e in events_2 if isinstance(e, FinalEvent)]
+    assert len(finals) == 1
+    assert finals[0].text == "hi back"
 
 
 # ---------------------------------------------------------------------------
@@ -351,7 +394,8 @@ async def test_recoverable_tool_failure_still_persists_assistant() -> None:
 
     history = await store.get_messages("s1")
     assert [m.role for m in history] == ["user", "assistant"]
-    assert history[1].content == "recovered"
+    # BR-016: persisted assistant turn is the raw envelope.
+    assert history[1].content == final_json("recovered")
 
 
 # ---------------------------------------------------------------------------
@@ -384,7 +428,8 @@ async def test_tool_roundtrips_are_not_persisted_to_state() -> None:
     # No intermediate assistant turns either.
     assistant_msgs = [m for m in history if m.role == "assistant"]
     assert len(assistant_msgs) == 1
-    assert assistant_msgs[0].content == "done"
+    # BR-016: persisted assistant turn is the raw envelope.
+    assert assistant_msgs[0].content == final_json("done")
 
 
 # ---------------------------------------------------------------------------

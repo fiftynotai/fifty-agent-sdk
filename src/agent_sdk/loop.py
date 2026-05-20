@@ -441,7 +441,10 @@ class AgentLoop:
                             TokenEvent, sequence_box, text=delta
                         )
                 yield self._make_event(
-                    FinalEvent, sequence_box, text=parsed.content
+                    FinalEvent,
+                    sequence_box,
+                    text=parsed.content,
+                    raw_completion=completion,
                 )
                 _log.info(
                     "agent_loop_completed",

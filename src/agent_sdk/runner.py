@@ -384,8 +384,11 @@ class AgentRunner:
            conversation. Forward every event to the caller unchanged.
         5. If the run terminates with a :class:`FinalEvent` and no
            preceding :class:`ErrorEvent`, append the assistant message
-           to state. Otherwise skip — the fallback final answer is
-           yielded but not committed.
+           to state. The runner persists the raw LLM completion when the
+           loop supplies it (the happy-path :class:`FinalAnswer` branch
+           sets :attr:`FinalEvent.raw_completion`), falling back to the
+           parsed text on the safety paths. Otherwise skip — the
+           fallback final answer is yielded but not committed.
 
         On consumer cancellation (the consumer breaks out of the
         ``async for`` loop): :class:`asyncio.CancelledError` propagates
@@ -496,6 +499,7 @@ class AgentRunner:
         state_store_error_phase: str | None = None
         saw_error = False
         final_text: str | None = None
+        raw_final_completion: str | None = None
         event_count = 0
         # `run_error` carries the exception that terminated the run, for the
         # `on_run_end` hook. It is set ONLY by an exception that escaped the
@@ -618,6 +622,7 @@ class AgentRunner:
                     last_error = event
                 elif isinstance(event, FinalEvent):
                     final_text = event.text
+                    raw_final_completion = event.raw_completion
                 elif isinstance(event, ActionEvent):
                     pending_action = event
                 elif isinstance(event, ToolStartedEvent):
@@ -673,7 +678,25 @@ class AgentRunner:
 
             # ── PHASE 5: PERSIST ASSISTANT (SUCCESS PATH) ─────────────
             if not saw_error and final_text is not None:
-                asst_msg = ChatMessage(role="assistant", content=final_text)
+                # BR-016: prefer the raw LLM completion (the JSON envelope
+                # produced by the parser's source format) so multi-turn
+                # sessions persist a faithful assistant turn — the next
+                # ``run()`` then sees the same structured shape the
+                # provider produced, which is what JSON-mode parsers and
+                # provider format detectors rely on. Fall back to the
+                # parsed ``final_text`` only when the loop did NOT
+                # supply a raw completion (the safety-fallback paths —
+                # LLMError, ParserError, iteration cap — emit a
+                # :class:`FinalEvent` with ``raw_completion=None`` and
+                # ``not saw_error`` blocks those from entering this
+                # branch in practice, but the fallback keeps the
+                # contract explicit and the local invariant total).
+                persist_content = (
+                    raw_final_completion
+                    if raw_final_completion is not None
+                    else final_text
+                )
+                asst_msg = ChatMessage(role="assistant", content=persist_content)
                 try:
                     await self._state.append(session_id, asst_msg)
                 except StateStoreError as exc:

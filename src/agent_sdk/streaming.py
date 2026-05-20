@@ -195,10 +195,23 @@ class FinalEvent(_EventBase):
         text: The terminal answer text. On safety-cap / parser error / LLM
             error termination this is :attr:`agent_sdk.safety.SafetyConfig.
             fallback_message`.
+        raw_completion: The raw LLM completion that produced this answer
+            (the JSON envelope under JSON-mode). Set ONLY on the happy-path
+            :class:`agent_sdk.parser.base.FinalAnswer` branch; ``None`` on
+            every safety-fallback path (LLM error, parser error, iteration
+            cap). This is what the
+            :class:`agent_sdk.runner.AgentRunner` persists when present,
+            so multi-turn sessions get a faithful assistant turn — turn
+            ``N+1`` then sees the same structured envelope shape the
+            provider produced on turn ``N``, which is what JSON-mode
+            parsers (and provider format detectors) rely on. The default
+            of ``None`` keeps the model backward-compatible for callers
+            that ignore the field.
     """
 
     event_type: Literal["final"] = "final"
     text: str
+    raw_completion: str | None = None
 
 
 class ErrorEvent(_EventBase):
