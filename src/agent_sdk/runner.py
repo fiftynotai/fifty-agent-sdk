@@ -161,8 +161,9 @@ class AgentRunner:
     A typical end-to-end agent fits in roughly fifteen lines::
 
         from agent_sdk import (
-            AgentLoop, AgentRunner, JsonModeParser, MemoryStateStore,
-            OpenAICompatibleClient, PromptSections, Registry, SafetyConfig,
+            JSON_MODE_OUTPUT_FORMAT, AgentLoop, AgentRunner, JsonModeParser,
+            MemoryStateStore, OpenAICompatibleClient, PromptSections,
+            Registry, SafetyConfig,
         )
 
         llm = OpenAICompatibleClient(...)
@@ -171,6 +172,7 @@ class AgentRunner:
             llm=llm, registry=registry, parser=JsonModeParser(),
             prompts=PromptSections(persona="You are helpful."),
             safety=SafetyConfig(), model="gpt-4o",
+            output_format=JSON_MODE_OUTPUT_FORMAT,
         )
         runner = AgentRunner(
             loop=loop, state=MemoryStateStore(),

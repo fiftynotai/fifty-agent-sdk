@@ -37,6 +37,7 @@ import asyncio
 from typing import Any
 
 from agent_sdk import (
+    JSON_MODE_OUTPUT_FORMAT,
     AgentLoop,
     AgentRunner,
     JsonModeParser,
@@ -64,6 +65,8 @@ async def main() -> None:
     registry.register(get_weather)
 
     # 3. The ReACT loop — LLM + registry + parser + prompts + safety.
+    #    `output_format` shows the model the JSON envelope the parser
+    #    expects; without it JsonModeParser raises ParserError on every turn.
     loop = AgentLoop(
         llm=llm,
         registry=registry,
@@ -71,6 +74,7 @@ async def main() -> None:
         prompts=PromptSections(persona="You are helpful."),
         safety=SafetyConfig(),
         model="gpt-4o",
+        output_format=JSON_MODE_OUTPUT_FORMAT,
     )
 
     # 4. The runner — wraps the loop with conversation-state persistence.

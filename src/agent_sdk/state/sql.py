@@ -377,8 +377,9 @@ class SqlStateStore:
         and wire it into an :class:`AgentRunner`::
 
             from agent_sdk import (
-                AgentLoop, AgentRunner, JsonModeParser, PromptSections,
-                Registry, SafetyConfig, SqlStateStore,
+                JSON_MODE_OUTPUT_FORMAT, AgentLoop, AgentRunner,
+                JsonModeParser, PromptSections, Registry, SafetyConfig,
+                SqlStateStore,
             )
             from agent_sdk.llm import OpenAICompatibleClient
 
@@ -392,6 +393,7 @@ class SqlStateStore:
                         prompts=PromptSections(persona="You are helpful."),
                         safety=SafetyConfig(),
                         model="gpt-4o",
+                        output_format=JSON_MODE_OUTPUT_FORMAT,
                     ),
                     state=state,
                     system_prompt="You are a helpful customer-support agent.",

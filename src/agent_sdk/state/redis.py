@@ -165,8 +165,9 @@ class RedisStateStore:
         :class:`AgentRunner`, releasing the connection pool on exit::
 
             from agent_sdk import (
-                AgentLoop, AgentRunner, JsonModeParser, PromptSections,
-                Registry, RedisStateStore, SafetyConfig,
+                JSON_MODE_OUTPUT_FORMAT, AgentLoop, AgentRunner,
+                JsonModeParser, PromptSections, Registry, RedisStateStore,
+                SafetyConfig,
             )
             from agent_sdk.llm import OpenAICompatibleClient
 
@@ -182,6 +183,7 @@ class RedisStateStore:
                         prompts=PromptSections(persona="You are helpful."),
                         safety=SafetyConfig(),
                         model="gpt-4o",
+                        output_format=JSON_MODE_OUTPUT_FORMAT,
                     ),
                     state=state,
                     system_prompt="You are a helpful customer-support agent.",
