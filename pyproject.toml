@@ -41,3 +41,7 @@ dev = [
 [tool.setuptools.packages.find]
 where = ["src"]
 include = ["agent_sdk*"]
+
+[tool.setuptools.package-data]
+# Ship the PEP 561 marker so downstream type-checkers see agent-sdk as typed.
+agent_sdk = ["py.typed"]
