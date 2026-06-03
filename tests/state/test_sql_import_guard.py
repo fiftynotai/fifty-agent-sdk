@@ -38,9 +38,7 @@ def sqlalchemy_unavailable(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     removed: list[str] = [
         name
         for name in list(sys.modules)
-        if name == "sqlalchemy"
-        or name.startswith("sqlalchemy.")
-        or name == "agent_sdk.state.sql"
+        if name == "sqlalchemy" or name.startswith("sqlalchemy.") or name == "agent_sdk.state.sql"
     ]
     for name in removed:
         monkeypatch.delitem(sys.modules, name, raising=False)

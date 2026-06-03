@@ -93,9 +93,7 @@ def test_tool_args_missing_key_defaults_to_empty() -> None:
 
 
 def test_code_fence_wrapped_json_is_recovered() -> None:
-    inner = json.dumps(
-        {"thought": "t", "action": "final", "answer": "ok"}
-    )
+    inner = json.dumps({"thought": "t", "action": "final", "answer": "ok"})
     completion = f"```json\n{inner}\n```"
     result = _parser().parse(completion)
     assert isinstance(result, FinalAnswer)
@@ -103,9 +101,7 @@ def test_code_fence_wrapped_json_is_recovered() -> None:
 
 
 def test_code_fence_without_lang_tag_is_recovered() -> None:
-    inner = json.dumps(
-        {"thought": "t", "action": "final", "answer": "ok"}
-    )
+    inner = json.dumps({"thought": "t", "action": "final", "answer": "ok"})
     completion = f"```\n{inner}\n```"
     result = _parser().parse(completion)
     assert isinstance(result, FinalAnswer)
@@ -159,9 +155,7 @@ def test_action_tool_missing_tool_name_raises() -> None:
 
 
 def test_action_tool_empty_tool_name_raises() -> None:
-    completion = json.dumps(
-        {"thought": "t", "action": "tool", "tool_name": "", "tool_args": {}}
-    )
+    completion = json.dumps({"thought": "t", "action": "tool", "tool_name": "", "tool_args": {}})
     with pytest.raises(ParserError) as excinfo:
         _parser().parse(completion)
     assert excinfo.value.context["missing"] == "tool_name"
@@ -177,9 +171,7 @@ def test_action_final_missing_answer_raises() -> None:
 
 
 def test_unknown_action_value_raises() -> None:
-    completion = json.dumps(
-        {"thought": "t", "action": "banana", "answer": "x"}
-    )
+    completion = json.dumps({"thought": "t", "action": "banana", "answer": "x"})
     with pytest.raises(ParserError) as excinfo:
         _parser().parse(completion)
     assert excinfo.value.context["error_phase"] == "schema_validation"

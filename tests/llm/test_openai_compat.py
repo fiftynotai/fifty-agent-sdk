@@ -490,7 +490,5 @@ async def test_stream_malformed_chunk_raises_llm_error(httpx_mock: HTTPXMock) ->
 
 
 def test_client_satisfies_llmclient_protocol_at_runtime() -> None:
-    client = OpenAICompatibleClient(
-        api_key="x", base_url=BASE_URL, model="gpt-4o", max_retries=0
-    )
+    client = OpenAICompatibleClient(api_key="x", base_url=BASE_URL, model="gpt-4o", max_retries=0)
     assert isinstance(client, LLMClient)

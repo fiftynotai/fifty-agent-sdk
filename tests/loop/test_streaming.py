@@ -40,18 +40,14 @@ def test_thought_event_constructs_without_event_type() -> None:
 
 
 def test_action_event_constructs_without_event_type() -> None:
-    ev = ActionEvent(
-        sequence=0, timestamp=_ts(), tool_name="search", args={"q": "x"}
-    )
+    ev = ActionEvent(sequence=0, timestamp=_ts(), tool_name="search", args={"q": "x"})
     assert ev.event_type == "action"
     assert ev.tool_name == "search"
     assert ev.args == {"q": "x"}
 
 
 def test_tool_started_event_constructs_without_event_type() -> None:
-    ev = ToolStartedEvent(
-        sequence=0, timestamp=_ts(), tool_name="t", call_id="abc"
-    )
+    ev = ToolStartedEvent(sequence=0, timestamp=_ts(), tool_name="t", call_id="abc")
     assert ev.event_type == "tool_started"
 
 
@@ -99,9 +95,7 @@ def test_final_event_constructs_without_event_type() -> None:
 
 
 def test_error_event_constructs_without_event_type() -> None:
-    ev = ErrorEvent(
-        sequence=0, timestamp=_ts(), error_type="X", message="m"
-    )
+    ev = ErrorEvent(sequence=0, timestamp=_ts(), error_type="X", message="m")
     assert ev.event_type == "error"
 
 
@@ -189,12 +183,8 @@ def test_observation_event_carries_full_tool_result() -> None:
     "event",
     [
         ThoughtEvent(sequence=0, timestamp=_ts(), text="t"),
-        ActionEvent(
-            sequence=1, timestamp=_ts(), tool_name="n", args={"a": 1}
-        ),
-        ToolStartedEvent(
-            sequence=2, timestamp=_ts(), tool_name="n", call_id="id"
-        ),
+        ActionEvent(sequence=1, timestamp=_ts(), tool_name="n", args={"a": 1}),
+        ToolStartedEvent(sequence=2, timestamp=_ts(), tool_name="n", call_id="id"),
         ToolProgressEvent(
             sequence=3,
             timestamp=_ts(),

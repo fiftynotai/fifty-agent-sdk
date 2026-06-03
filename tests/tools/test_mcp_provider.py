@@ -38,15 +38,11 @@ def _config() -> MCPClientConfig:
 
 
 def _make_client(transport_handler: Any) -> MCPClient:
-    http_client = httpx.AsyncClient(
-        transport=httpx.MockTransport(transport_handler)
-    )
+    http_client = httpx.AsyncClient(transport=httpx.MockTransport(transport_handler))
     return MCPClient(_config(), client=http_client)
 
 
-def _tool_def(
-    name: str, *, schema: dict[str, Any] | None = None
-) -> dict[str, Any]:
+def _tool_def(name: str, *, schema: dict[str, Any] | None = None) -> dict[str, Any]:
     return {
         "name": name,
         "description": f"Tool {name}",
@@ -64,9 +60,7 @@ def _tool_def(
 async def test_attach_registers_one_adapter_per_tool(
     mcp_server: MockMCPServer,
 ) -> None:
-    mcp_server.set_tool_catalog(
-        [_tool_def("alpha"), _tool_def("beta"), _tool_def("gamma")]
-    )
+    mcp_server.set_tool_catalog([_tool_def("alpha"), _tool_def("beta"), _tool_def("gamma")])
     client = _make_client(mcp_server.handle)
     provider = MCPProvider(client)
     registry = Registry()
@@ -253,18 +247,14 @@ async def test_periodic_refresh_runs_and_can_be_cancelled(
     provider = MCPProvider(client)
     registry = Registry()
     await provider.attach(registry)
-    initial_calls = len(
-        [e for e in mcp_server.observed_envelopes if e["method"] == "tools/list"]
-    )
+    initial_calls = len([e for e in mcp_server.observed_envelopes if e["method"] == "tools/list"])
     assert initial_calls == 1
 
     await provider.start_periodic_refresh(interval_seconds=0.02)
     await asyncio.sleep(0.07)
     await provider.aclose()
 
-    discovers = [
-        e for e in mcp_server.observed_envelopes if e["method"] == "tools/list"
-    ]
+    discovers = [e for e in mcp_server.observed_envelopes if e["method"] == "tools/list"]
     # At least one periodic refresh fired (in addition to the attach one).
     assert len(discovers) >= 2
 
@@ -396,12 +386,9 @@ async def test_attach_warns_on_name_collision(
     overwrites = [
         entry
         for entry in logs
-        if entry.get("event") == "mcp.tool_overwrite"
-        and entry.get("name") == "search"
+        if entry.get("event") == "mcp.tool_overwrite" and entry.get("name") == "search"
     ]
-    assert len(overwrites) == 1, (
-        f"expected exactly one MCPProvider overwrite warning, got {logs}"
-    )
+    assert len(overwrites) == 1, f"expected exactly one MCPProvider overwrite warning, got {logs}"
     assert overwrites[0]["log_level"] == "warning"
 
 

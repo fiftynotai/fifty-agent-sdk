@@ -51,12 +51,8 @@ class FakeLLMClient:
     tests can assert on what was sent to the LLM.
     """
 
-    def __init__(
-        self, replies: list[ChatResponse | list[ChatResponse] | Exception]
-    ) -> None:
-        self._replies: list[ChatResponse | list[ChatResponse] | Exception] = list(
-            replies
-        )
+    def __init__(self, replies: list[ChatResponse | list[ChatResponse] | Exception]) -> None:
+        self._replies: list[ChatResponse | list[ChatResponse] | Exception] = list(replies)
         self.calls: list[ChatRequest] = []
 
     async def complete(self, request: ChatRequest) -> ChatResponse:
@@ -87,9 +83,7 @@ class FakeLLMClient:
         yield reply
 
 
-def make_response(
-    content: str, finish_reason: FinishReason = "stop"
-) -> ChatResponse:
+def make_response(content: str, finish_reason: FinishReason = "stop") -> ChatResponse:
     """Build a non-streaming :class:`ChatResponse` with zeroed usage figures."""
     return ChatResponse(
         message=ChatMessage(role="assistant", content=content),
@@ -152,9 +146,7 @@ class DriftsOnceFakeLLM:
         self._calls.append(request)
         return make_response(self._select_reply())
 
-    async def stream(
-        self, request: ChatRequest
-    ) -> AsyncIterator[ChatResponse]:
+    async def stream(self, request: ChatRequest) -> AsyncIterator[ChatResponse]:
         self._calls.append(request)
         yield make_response(self._select_reply())
 

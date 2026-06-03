@@ -87,18 +87,14 @@ class MockMCPServer:
         # Path strictness — reject anything that didn't hit the canonical URL.
         if str(request.url) != MCP_URL:
             raise AssertionError(
-                f"MockMCPServer received unexpected URL: {request.url!r} "
-                f"(expected {MCP_URL!r})"
+                f"MockMCPServer received unexpected URL: {request.url!r} (expected {MCP_URL!r})"
             )
         if request.method != "POST":
-            raise AssertionError(
-                f"MockMCPServer received non-POST method: {request.method!r}"
-            )
+            raise AssertionError(f"MockMCPServer received non-POST method: {request.method!r}")
         content_type = request.headers.get("content-type")
         if content_type is None or "application/json" not in content_type:
             raise AssertionError(
-                f"MockMCPServer expected Content-Type: application/json; "
-                f"got {content_type!r}"
+                f"MockMCPServer expected Content-Type: application/json; got {content_type!r}"
             )
 
         body = request.read()
@@ -113,9 +109,7 @@ class MockMCPServer:
         try:
             envelope = json.loads(body)
         except ValueError as exc:
-            raise AssertionError(
-                f"MockMCPServer expected valid JSON body; got {body!r}"
-            ) from exc
+            raise AssertionError(f"MockMCPServer expected valid JSON body; got {body!r}") from exc
 
         # JSON-RPC 2.0 envelope shape — the heart of the L-356 mitigation.
         if not isinstance(envelope, dict):
@@ -124,19 +118,14 @@ class MockMCPServer:
             )
         if envelope.get("jsonrpc") != "2.0":
             raise AssertionError(
-                f"JSON-RPC envelope missing jsonrpc=2.0; got "
-                f"{envelope.get('jsonrpc')!r}"
+                f"JSON-RPC envelope missing jsonrpc=2.0; got {envelope.get('jsonrpc')!r}"
             )
         req_id = envelope.get("id")
         if not isinstance(req_id, str) or not req_id:
-            raise AssertionError(
-                f"JSON-RPC envelope missing string id; got {req_id!r}"
-            )
+            raise AssertionError(f"JSON-RPC envelope missing string id; got {req_id!r}")
         method = envelope.get("method")
         if not isinstance(method, str) or not method:
-            raise AssertionError(
-                f"JSON-RPC envelope missing string method; got {method!r}"
-            )
+            raise AssertionError(f"JSON-RPC envelope missing string method; got {method!r}")
         if "params" in envelope and not isinstance(envelope["params"], dict):
             raise AssertionError(
                 f"JSON-RPC envelope params must be an object; got "
@@ -163,14 +152,10 @@ class MockMCPServer:
     # Internals
     # ------------------------------------------------------------------
 
-    def _handle_tools_call(
-        self, req_id: str, params: dict[str, Any]
-    ) -> httpx.Response:
+    def _handle_tools_call(self, req_id: str, params: dict[str, Any]) -> httpx.Response:
         name = params.get("name")
         if not isinstance(name, str) or not name:
-            return self._respond_error(
-                req_id, code=-32602, message="tools/call: name required"
-            )
+            return self._respond_error(req_id, code=-32602, message="tools/call: name required")
         if "arguments" not in params or not isinstance(params["arguments"], dict):
             return self._respond_error(
                 req_id,

@@ -80,7 +80,7 @@ class SafetyConfig(BaseModel):
             "Respond again with a single JSON object exactly matching the schema in "
             "the system prompt. Output ONLY the JSON object — no prose, no Markdown, "
             "no code fences. If the answer is a list or explanation, put it as a "
-            "string inside the `answer` field with action=\"final\"."
+            'string inside the `answer` field with action="final".'
         ),
         min_length=1,
     )

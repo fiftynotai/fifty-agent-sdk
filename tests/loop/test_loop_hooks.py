@@ -157,9 +157,7 @@ async def test_on_iteration_fires_once_per_iteration() -> None:
         ]
     )
     rec = IterationRecorder()
-    loop = _make_loop(
-        llm=llm, registry=registry, hooks=Hooks(on_iteration=rec.hook())
-    )
+    loop = _make_loop(llm=llm, registry=registry, hooks=Hooks(on_iteration=rec.hook()))
 
     await _collect(loop.run(_user("Hi"), session_id="s1"))
 
@@ -205,9 +203,7 @@ async def test_on_llm_call_fires_per_successful_call() -> None:
         ]
     )
     rec = LlmCallRecorder()
-    loop = _make_loop(
-        llm=llm, registry=registry, hooks=Hooks(on_llm_call=rec.hook())
-    )
+    loop = _make_loop(llm=llm, registry=registry, hooks=Hooks(on_llm_call=rec.hook()))
 
     await _collect(loop.run(_user("Hi"), session_id="s1"))
 
@@ -276,9 +272,7 @@ async def test_loop_hooks_sync_variant() -> None:
     llm_rec = LlmCallRecorder(sync=True)
     loop = _make_loop(
         llm=llm,
-        hooks=Hooks(
-            on_iteration=it_rec.hook(), on_llm_call=llm_rec.hook()
-        ),
+        hooks=Hooks(on_iteration=it_rec.hook(), on_llm_call=llm_rec.hook()),
     )
 
     await _collect(loop.run(_user("Hi"), session_id="s1"))
@@ -294,9 +288,7 @@ async def test_loop_hooks_async_variant() -> None:
     llm_rec = LlmCallRecorder(sync=False)
     loop = _make_loop(
         llm=llm,
-        hooks=Hooks(
-            on_iteration=it_rec.hook(), on_llm_call=llm_rec.hook()
-        ),
+        hooks=Hooks(on_iteration=it_rec.hook(), on_llm_call=llm_rec.hook()),
     )
 
     await _collect(loop.run(_user("Hi"), session_id="s1"))

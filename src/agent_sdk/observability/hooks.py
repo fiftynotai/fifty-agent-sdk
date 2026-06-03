@@ -161,13 +161,9 @@ class Hooks:
     """
 
     on_run_start: Callable[[str, str], Any] | None = None
-    on_run_end: (
-        Callable[[str, float, BaseException | None], Any] | None
-    ) = None
+    on_run_end: Callable[[str, float, BaseException | None], Any] | None = None
     on_iteration: Callable[[str | None, int], Any] | None = None
-    on_llm_call: (
-        Callable[[str | None, ChatRequest, ChatResponse, float], Any] | None
-    ) = None
+    on_llm_call: Callable[[str | None, ChatRequest, ChatResponse, float], Any] | None = None
     on_tool_start: Callable[[str, str, dict[str, Any]], Any] | None = None
     on_tool_end: Callable[[str, str, Any, float], Any] | None = None
     # `error` is `Exception`, not `BaseException` (cf. `on_run_end`): a

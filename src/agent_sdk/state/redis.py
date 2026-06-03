@@ -84,8 +84,7 @@ try:
     from redis.exceptions import RedisError
 except ImportError as exc:  # pragma: no cover - exercised via importlib in tests
     raise ImportError(
-        "agent_sdk.state.redis requires redis-py. "
-        "Install with: pip install 'agent-sdk[redis]'"
+        "agent_sdk.state.redis requires redis-py. Install with: pip install 'agent-sdk[redis]'"
     ) from exc
 
 from agent_sdk.errors import StateStoreError
@@ -282,9 +281,7 @@ class RedisStateStore:
             # the awaitable arm so ``await`` is unambiguous under mypy
             # --strict. ``decode_responses=True`` guarantees ``str``
             # members; LRANGE on a missing key returns an empty list.
-            raw: list[str] = await cast(
-                "Any", self._client.lrange(self._key(session_id), 0, -1)
-            )
+            raw: list[str] = await cast("Any", self._client.lrange(self._key(session_id), 0, -1))
             # A fresh list per call satisfies the defensive-copy invariant
             # automatically — callers mutating it cannot affect the store.
             # ValidationError from a corrupt member is intentionally NOT
@@ -338,9 +335,7 @@ class RedisStateStore:
                 ttl=self._ttl_seconds,
             )
         except RedisError as exc:
-            raise _wrap_state_store_error(
-                exc, session_id=session_id, operation="append"
-            ) from exc
+            raise _wrap_state_store_error(exc, session_id=session_id, operation="append") from exc
 
     async def delete(self, session_id: str) -> None:
         """Remove all persisted state for ``session_id``.
@@ -363,18 +358,14 @@ class RedisStateStore:
             # bodies; ``cast`` pins the awaitable arm so ``await`` is
             # unambiguous under mypy --strict. The DEL reply is an int
             # count of keys removed.
-            removed = int(
-                await cast("Any", self._client.delete(self._key(session_id)))
-            )
+            removed = int(await cast("Any", self._client.delete(self._key(session_id))))
             _log.debug(
                 "redis_state_store.delete",
                 session_id=session_id,
                 existed=removed >= 1,
             )
         except RedisError as exc:
-            raise _wrap_state_store_error(
-                exc, session_id=session_id, operation="delete"
-            ) from exc
+            raise _wrap_state_store_error(exc, session_id=session_id, operation="delete") from exc
 
 
 __all__ = ["RedisStateStore"]

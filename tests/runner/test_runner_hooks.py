@@ -66,9 +66,7 @@ class HookRecorder:
 
     def __init__(self, *, sync: bool = True) -> None:
         self.counts: dict[str, int] = {name: 0 for name in _HOOK_NAMES}
-        self.args: dict[str, list[tuple[Any, ...]]] = {
-            name: [] for name in _HOOK_NAMES
-        }
+        self.args: dict[str, list[tuple[Any, ...]]] = {name: [] for name in _HOOK_NAMES}
         self._sync = sync
 
     def _make(self, name: str) -> Any:
@@ -112,9 +110,7 @@ async def test_counting_hooks_two_step_run_fires_runner_tier_once() -> None:
         ]
     )
     rec = HookRecorder()
-    runner, _store = make_runner(
-        llm=llm, registry=registry, hooks=rec.hooks()
-    )
+    runner, _store = make_runner(llm=llm, registry=registry, hooks=rec.hooks())
 
     await collect(runner.run("s1", "Hi"))
 
@@ -143,9 +139,7 @@ async def test_runner_does_not_fire_loop_tier_hooks() -> None:
         ]
     )
     rec = HookRecorder()
-    runner, _store = make_runner(
-        llm=llm, registry=registry, hooks=rec.hooks()
-    )
+    runner, _store = make_runner(llm=llm, registry=registry, hooks=rec.hooks())
 
     await collect(runner.run("s1", "Hi"))
 
@@ -176,9 +170,7 @@ async def test_on_tool_start_and_end_carry_correlated_data() -> None:
         ]
     )
     rec = HookRecorder()
-    runner, _store = make_runner(
-        llm=llm, registry=registry, hooks=rec.hooks()
-    )
+    runner, _store = make_runner(llm=llm, registry=registry, hooks=rec.hooks())
 
     await collect(runner.run("s1", "Hi"))
 
@@ -213,9 +205,7 @@ async def test_counting_hooks_multi_tool_run() -> None:
         ]
     )
     rec = HookRecorder()
-    runner, _store = make_runner(
-        llm=llm, registry=registry, hooks=rec.hooks()
-    )
+    runner, _store = make_runner(llm=llm, registry=registry, hooks=rec.hooks())
 
     await collect(runner.run("s1", "Hi"))
 
@@ -349,9 +339,7 @@ async def test_raising_on_tool_start_does_not_abort_run() -> None:
     def boom(*_args: Any) -> None:
         raise RuntimeError("hook down")
 
-    runner, store = make_runner(
-        llm=llm, registry=registry, hooks=Hooks(on_tool_start=boom)
-    )
+    runner, store = make_runner(llm=llm, registry=registry, hooks=Hooks(on_tool_start=boom))
 
     events = await collect(runner.run("s1", "Hi"))
 
@@ -389,9 +377,7 @@ async def test_raising_on_run_end_does_not_mask_state_store_error() -> None:
     def boom(*_args: Any) -> None:
         raise RuntimeError("run-end hook down")
 
-    runner, _store = make_runner(
-        llm=llm, state=failing, hooks=Hooks(on_run_end=boom)
-    )
+    runner, _store = make_runner(llm=llm, state=failing, hooks=Hooks(on_run_end=boom))
 
     with pytest.raises(StateStoreError):
         await collect(runner.run("s1", "Hi"))
@@ -432,9 +418,7 @@ async def test_sync_hook_variant_two_step_run() -> None:
         ]
     )
     rec = HookRecorder(sync=True)
-    runner, _store = make_runner(
-        llm=llm, registry=registry, hooks=rec.hooks()
-    )
+    runner, _store = make_runner(llm=llm, registry=registry, hooks=rec.hooks())
 
     await collect(runner.run("s1", "Hi"))
 
@@ -455,9 +439,7 @@ async def test_async_hook_variant_two_step_run() -> None:
         ]
     )
     rec = HookRecorder(sync=False)
-    runner, _store = make_runner(
-        llm=llm, registry=registry, hooks=rec.hooks()
-    )
+    runner, _store = make_runner(llm=llm, registry=registry, hooks=rec.hooks())
 
     await collect(runner.run("s1", "Hi"))
 
@@ -485,9 +467,7 @@ async def test_hooks_none_does_not_change_behaviour() -> None:
 
     registry_a = Registry()
     registry_a.register(FakeTool("search", result=ToolResult(output={"x": 1})))
-    runner_a, store_a = make_runner(
-        llm=build_llm(), registry=registry_a, hooks=None
-    )
+    runner_a, store_a = make_runner(llm=build_llm(), registry=registry_a, hooks=None)
     events_a = await collect(runner_a.run("s1", "Hi"))
 
     registry_b = Registry()
@@ -553,9 +533,7 @@ async def test_on_run_end_fires_and_cancelled_error_propagates() -> None:
         end_calls.append(args)
         raise RuntimeError("run-end hook down")
 
-    runner, _store = make_runner(
-        llm=llm, registry=registry, hooks=Hooks(on_run_end=on_run_end)
-    )
+    runner, _store = make_runner(llm=llm, registry=registry, hooks=Hooks(on_run_end=on_run_end))
 
     agen = runner.run("s1", "Hi")
     # Consume the first event, then cancel by closing the generator.

@@ -52,9 +52,7 @@ def test_render_all_slots_emits_every_section_in_order() -> None:
 
 
 def test_render_skips_empty_persona_cleanly() -> None:
-    out = render_system_prompt(
-        PromptSections(persona="", tool_descriptions="just tools")
-    )
+    out = render_system_prompt(PromptSections(persona="", tool_descriptions="just tools"))
     assert "# Persona" not in out
     assert "# Tools" in out
     assert "just tools" in out

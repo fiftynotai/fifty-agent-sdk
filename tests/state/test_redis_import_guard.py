@@ -40,9 +40,7 @@ def redis_unavailable(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     removed: list[str] = [
         name
         for name in list(sys.modules)
-        if name == "redis"
-        or name.startswith("redis.")
-        or name == "agent_sdk.state.redis"
+        if name == "redis" or name.startswith("redis.") or name == "agent_sdk.state.redis"
     ]
     for name in removed:
         monkeypatch.delitem(sys.modules, name, raising=False)

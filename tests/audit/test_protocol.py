@@ -29,28 +29,20 @@ def test_audit_event_constructs_with_required_fields() -> None:
 
 def test_audit_event_user_id_defaults_to_none() -> None:
     """``user_id`` is optional and defaults to ``None``."""
-    event = AuditEvent(
-        session_id="s1", timestamp=datetime.now(UTC), event_type="error"
-    )
+    event = AuditEvent(session_id="s1", timestamp=datetime.now(UTC), event_type="error")
     assert event.user_id is None
 
 
 def test_audit_event_payload_defaults_to_empty_dict() -> None:
     """``payload`` is optional and defaults to a fresh empty dict."""
-    event = AuditEvent(
-        session_id="s1", timestamp=datetime.now(UTC), event_type="error"
-    )
+    event = AuditEvent(session_id="s1", timestamp=datetime.now(UTC), event_type="error")
     assert event.payload == {}
 
 
 def test_audit_event_payload_default_is_not_shared() -> None:
     """Each event gets its own ``payload`` dict (``default_factory``)."""
-    a = AuditEvent(
-        session_id="s1", timestamp=datetime.now(UTC), event_type="error"
-    )
-    b = AuditEvent(
-        session_id="s2", timestamp=datetime.now(UTC), event_type="error"
-    )
+    a = AuditEvent(session_id="s1", timestamp=datetime.now(UTC), event_type="error")
+    b = AuditEvent(session_id="s2", timestamp=datetime.now(UTC), event_type="error")
     a.payload["k"] = "v"
     assert b.payload == {}
 

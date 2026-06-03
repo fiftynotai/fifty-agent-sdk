@@ -230,16 +230,12 @@ async def test_sequence_starts_at_one(store: SqlStateStore, engine: AsyncEngine)
     await store.append("s1", ChatMessage(role="user", content="a"))
     async with engine.connect() as conn:
         rows = (
-            await conn.execute(
-                select(AgentMessage.sequence).where(AgentMessage.session_id == "s1")
-            )
+            await conn.execute(select(AgentMessage.sequence).where(AgentMessage.session_id == "s1"))
         ).all()
     assert [r[0] for r in rows] == [1]
 
 
-async def test_sequence_is_monotonic(
-    store: SqlStateStore, engine: AsyncEngine
-) -> None:
+async def test_sequence_is_monotonic(store: SqlStateStore, engine: AsyncEngine) -> None:
     """Sequential appends produce 1, 2, 3, ... in order."""
     for index in range(5):
         await store.append("s1", ChatMessage(role="user", content=f"m{index}"))
@@ -254,9 +250,7 @@ async def test_sequence_is_monotonic(
     assert [r[0] for r in rows] == [1, 2, 3, 4, 5]
 
 
-async def test_sequence_is_per_session(
-    store: SqlStateStore, engine: AsyncEngine
-) -> None:
+async def test_sequence_is_per_session(store: SqlStateStore, engine: AsyncEngine) -> None:
     """Each session has its own sequence counter — they don't share."""
     await store.append("s1", ChatMessage(role="user", content="a"))
     await store.append("s2", ChatMessage(role="user", content="b"))
@@ -293,23 +287,17 @@ async def test_sequence_is_per_session(
 # ---------------------------------------------------------------------------
 
 
-async def test_delete_cascades_to_messages(
-    store: SqlStateStore, engine: AsyncEngine
-) -> None:
+async def test_delete_cascades_to_messages(store: SqlStateStore, engine: AsyncEngine) -> None:
     """Deleting a session removes all its messages (ORM cascade)."""
     for index in range(3):
         await store.append("s1", ChatMessage(role="user", content=f"m{index}"))
     await store.delete("s1")
     async with engine.connect() as conn:
         msg_rows = (
-            await conn.execute(
-                select(AgentMessage).where(AgentMessage.session_id == "s1")
-            )
+            await conn.execute(select(AgentMessage).where(AgentMessage.session_id == "s1"))
         ).all()
         sess_rows = (
-            await conn.execute(
-                select(AgentSession).where(AgentSession.session_id == "s1")
-            )
+            await conn.execute(select(AgentSession).where(AgentSession.session_id == "s1"))
         ).all()
     assert msg_rows == []
     assert sess_rows == []
@@ -343,9 +331,7 @@ async def test_delete_then_reappend_starts_fresh_sequence(
     await store.append("s1", ChatMessage(role="user", content="z"))
     async with engine.connect() as conn:
         rows = (
-            await conn.execute(
-                select(AgentMessage.sequence).where(AgentMessage.session_id == "s1")
-            )
+            await conn.execute(select(AgentMessage.sequence).where(AgentMessage.session_id == "s1"))
         ).all()
     assert [r[0] for r in rows] == [1]
 
@@ -524,9 +510,7 @@ async def test_store_wraps_integrity_error_on_duplicate_sequence(
 
             try:
                 async with self._session_factory() as session, session.begin():
-                    parent = await session.scalar(
-                        _select(_AS).where(_AS.session_id == session_id)
-                    )
+                    parent = await session.scalar(_select(_AS).where(_AS.session_id == session_id))
                     assert parent is not None  # seeded by the first append
                     session.add(
                         AgentMessage(
@@ -697,13 +681,10 @@ def test_metadata_unique_constraint_on_session_sequence() -> None:
     """The unique constraint on (session_id, sequence) is declared in the schema."""
     messages = sql_metadata.tables["agent_messages"]
     uq_constraints: list[Any] = [
-        c
-        for c in messages.constraints
-        if type(c).__name__ == "UniqueConstraint"
+        c for c in messages.constraints if type(c).__name__ == "UniqueConstraint"
     ]
     assert any(
-        {col.name for col in c.columns} == {"session_id", "sequence"}
-        for c in uq_constraints
+        {col.name for col in c.columns} == {"session_id", "sequence"} for c in uq_constraints
     )
 
 

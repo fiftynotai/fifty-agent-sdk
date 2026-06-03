@@ -149,9 +149,7 @@ async def test_concurrent_appends_same_session_preserve_count() -> None:
     store = MemoryStateStore()
 
     async def appender(index: int) -> None:
-        await store.append(
-            "s1", ChatMessage(role="user", content=f"msg-{index}")
-        )
+        await store.append("s1", ChatMessage(role="user", content=f"msg-{index}"))
 
     await asyncio.gather(*(appender(i) for i in range(100)))
 
@@ -172,9 +170,7 @@ async def test_concurrent_sessions_do_not_block() -> None:
     store = MemoryStateStore()
 
     async def append_to(session: str) -> None:
-        await store.append(
-            session, ChatMessage(role="user", content="x")
-        )
+        await store.append(session, ChatMessage(role="user", content="x"))
 
     # Use gather with a tight timeout — both ops should finish well under
     # the limit because they don't share a lock.

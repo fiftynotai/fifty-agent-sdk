@@ -409,9 +409,7 @@ async def test_parser_error_emits_error_event_and_fallback_final() -> None:
 
 async def test_parser_error_does_not_propagate() -> None:
     # BR-018: see above — two prose replies to exhaust the retry budget.
-    llm = FakeLLMClient(
-        replies=[make_response("garbage"), make_response("more garbage")]
-    )
+    llm = FakeLLMClient(replies=[make_response("garbage"), make_response("more garbage")])
     loop = _make_loop(llm=llm)
     # Must not raise:
     events = await _collect(loop.run([ChatMessage(role="user", content="q")]))
@@ -472,9 +470,7 @@ async def test_parser_error_retry_exhausted_terminates() -> None:
     the retry-exhausted path and asserts the LLM was called exactly twice
     — once for the drift, once for the retry that also drifted.
     """
-    llm = FakeLLMClient(
-        replies=[make_response("drift one"), make_response("drift two")]
-    )
+    llm = FakeLLMClient(replies=[make_response("drift one"), make_response("drift two")])
     loop = _make_loop(llm=llm)
 
     events = await _collect(loop.run([ChatMessage(role="user", content="q")]))
@@ -562,9 +558,7 @@ async def test_parser_retry_does_not_increment_iteration_hook() -> None:
 
 
 async def test_llm_error_emits_error_event_and_fallback_final() -> None:
-    llm = FakeLLMClient(
-        replies=[LLMError("provider down", context={"model": "test-model"})]
-    )
+    llm = FakeLLMClient(replies=[LLMError("provider down", context={"model": "test-model"})])
     loop = _make_loop(llm=llm)
 
     events = await _collect(loop.run([ChatMessage(role="user", content="q")]))
@@ -588,8 +582,7 @@ async def test_stream_mode_emits_token_events_on_final_answer() -> None:
     # Split into 3 non-empty chunks.
     chunk_size = max(1, len(final_completion) // 3)
     parts = [
-        final_completion[i : i + chunk_size]
-        for i in range(0, len(final_completion), chunk_size)
+        final_completion[i : i + chunk_size] for i in range(0, len(final_completion), chunk_size)
     ]
     llm = FakeLLMClient(replies=[make_stream_chunks(parts)])
     loop = _make_loop(llm=llm, stream=True)
@@ -606,15 +599,9 @@ async def test_stream_mode_emits_token_events_on_final_answer() -> None:
     assert final_event.text == "42"
 
     # Order: Thought before Tokens before Final.
-    thought_idx = next(
-        i for i, e in enumerate(events) if isinstance(e, ThoughtEvent)
-    )
-    token_indices = [
-        i for i, e in enumerate(events) if isinstance(e, TokenEvent)
-    ]
-    final_idx = next(
-        i for i, e in enumerate(events) if isinstance(e, FinalEvent)
-    )
+    thought_idx = next(i for i, e in enumerate(events) if isinstance(e, ThoughtEvent))
+    token_indices = [i for i, e in enumerate(events) if isinstance(e, TokenEvent)]
+    final_idx = next(i for i, e in enumerate(events) if isinstance(e, FinalEvent))
     assert thought_idx < token_indices[0]
     assert token_indices[-1] < final_idx
 
@@ -637,9 +624,7 @@ async def test_stream_mode_does_not_emit_token_events_on_tool_call() -> None:
 
     # Iteration 1: tool call — no TokenEvents in that iteration.
     # Iteration 2: final answer — TokenEvents allowed.
-    tool_started_idx = next(
-        i for i, e in enumerate(events) if isinstance(e, ToolStartedEvent)
-    )
+    tool_started_idx = next(i for i, e in enumerate(events) if isinstance(e, ToolStartedEvent))
     iter1_events = events[: tool_started_idx + 1]
     assert not any(isinstance(e, TokenEvent) for e in iter1_events)
 
@@ -683,9 +668,7 @@ async def test_cancellation_propagates() -> None:
     loop = _make_loop(llm=llm, registry=registry, safety=safety)
 
     async def consume() -> list[AgentEvent]:
-        return await _collect(
-            loop.run([ChatMessage(role="user", content="q")])
-        )
+        return await _collect(loop.run([ChatMessage(role="user", content="q")]))
 
     task = asyncio.create_task(consume())
     await asyncio.sleep(0.05)
@@ -709,9 +692,7 @@ async def test_cancellation_does_not_call_more_tools() -> None:
     loop = _make_loop(llm=llm, registry=registry, safety=safety)
 
     async def consume() -> list[AgentEvent]:
-        return await _collect(
-            loop.run([ChatMessage(role="user", content="q")])
-        )
+        return await _collect(loop.run([ChatMessage(role="user", content="q")]))
 
     task = asyncio.create_task(consume())
     await asyncio.sleep(0.1)
@@ -752,9 +733,7 @@ async def test_run_always_terminates_with_final_event(scenario: str) -> None:
         loop = _make_loop(llm=llm)
     elif scenario == "parser_error":
         # BR-018: two prose replies needed to exhaust the one-shot retry.
-        llm = FakeLLMClient(
-            replies=[make_response("garbage"), make_response("garbage")]
-        )
+        llm = FakeLLMClient(replies=[make_response("garbage"), make_response("garbage")])
         loop = _make_loop(llm=llm)
     elif scenario == "iteration_cap":
         tool = FakeTool("t", result=ToolResult(output="ok"))
@@ -762,9 +741,7 @@ async def test_run_always_terminates_with_final_event(scenario: str) -> None:
         registry.register(tool)
         tool_call = make_response(_tool_json("t", "t", {}))
         llm = FakeLLMClient(replies=[tool_call, tool_call])
-        loop = _make_loop(
-            llm=llm, registry=registry, safety=SafetyConfig(max_iterations=2)
-        )
+        loop = _make_loop(llm=llm, registry=registry, safety=SafetyConfig(max_iterations=2))
     else:  # llm_error
         llm = FakeLLMClient(replies=[LLMError("fail")])
         loop = _make_loop(llm=llm)
@@ -863,9 +840,7 @@ async def test_run_does_not_mutate_input_messages() -> None:
         ]
     )
     loop = _make_loop(llm=llm, registry=registry)
-    user_messages: list[ChatMessage] = [
-        ChatMessage(role="user", content="hello")
-    ]
+    user_messages: list[ChatMessage] = [ChatMessage(role="user", content="hello")]
     snapshot_id = id(user_messages)
     snapshot_contents = list(user_messages)
 
@@ -1083,8 +1058,7 @@ async def test_tool_message_role_user_for_tool_not_found_branch() -> None:
     synthesized = [
         m
         for m in second_request.messages
-        if m.role == "user"
-        and m.content.startswith("Tool ghost failed: ToolNotFound:")
+        if m.role == "user" and m.content.startswith("Tool ghost failed: ToolNotFound:")
     ]
     assert len(synthesized) == 1
 
@@ -1116,8 +1090,7 @@ async def test_tool_message_role_user_for_tool_timeout_branch() -> None:
     synthesized = [
         m
         for m in second_request.messages
-        if m.role == "user"
-        and m.content.startswith("Tool slow failed: ToolTimeout:")
+        if m.role == "user" and m.content.startswith("Tool slow failed: ToolTimeout:")
     ]
     assert len(synthesized) == 1
 
@@ -1135,9 +1108,7 @@ async def test_tool_message_role_assistant_emits_assistant_role_message() -> Non
             make_response(_final_json("done")),
         ]
     )
-    loop = _make_loop(
-        llm=llm, registry=registry, tool_message_role="assistant"
-    )
+    loop = _make_loop(llm=llm, registry=registry, tool_message_role="assistant")
 
     await _collect(loop.run([ChatMessage(role="user", content="q")]))
 
@@ -1148,8 +1119,7 @@ async def test_tool_message_role_assistant_emits_assistant_role_message() -> Non
     synthesized = [
         m
         for m in second_request.messages
-        if m.role == "assistant"
-        and m.content.startswith("Tool search returned:")
+        if m.role == "assistant" and m.content.startswith("Tool search returned:")
     ]
     assert len(synthesized) == 1
     assert "ok" in synthesized[0].content

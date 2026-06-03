@@ -328,9 +328,7 @@ async def test_decorated_callable_preserves_nested_basemodel_instance() -> None:
     async def describe(address: _Address) -> dict[str, Any]:
         # The function body asserts the parameter type itself so the bug
         # surfaces inside the tool, not just in the returned payload.
-        assert isinstance(address, _Address), (
-            f"expected _Address, got {type(address).__name__}"
-        )
+        assert isinstance(address, _Address), f"expected _Address, got {type(address).__name__}"
         return {
             "type": type(address).__name__,
             "street": address.street,

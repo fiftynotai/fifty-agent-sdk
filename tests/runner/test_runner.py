@@ -208,9 +208,7 @@ async def test_system_prompt_with_preexisting_non_system_history_does_not_insert
     await store.append("s1", ChatMessage(role="assistant", content="prior-ans"))
 
     llm = FakeLLMClient(replies=[make_response(final_json("new"))])
-    runner, _ = make_runner(
-        llm=llm, state=store, system_prompt="You are pirate."
-    )
+    runner, _ = make_runner(llm=llm, state=store, system_prompt="You are pirate.")
     await collect(runner.run("s1", "new question"))
 
     history = await store.get_messages("s1")
@@ -514,9 +512,7 @@ class _FailingAppendStore:
         self.get_calls += 1
         return []
 
-    async def append(
-        self, session_id: str, message: ChatMessage
-    ) -> None:
+    async def append(self, session_id: str, message: ChatMessage) -> None:
         raise StateStoreError(
             "backend unavailable",
             context={"session_id": session_id, "wrapped": "BackendDown"},
@@ -535,9 +531,7 @@ class _FailingGetStore:
             context={"session_id": session_id},
         )
 
-    async def append(
-        self, session_id: str, message: ChatMessage
-    ) -> None:
+    async def append(self, session_id: str, message: ChatMessage) -> None:
         return None
 
     async def delete(self, session_id: str) -> None:
@@ -586,9 +580,7 @@ class _FailingNthAppendStore:
     async def get_messages(self, session_id: str) -> list[ChatMessage]:
         return await self._inner.get_messages(session_id)
 
-    async def append(
-        self, session_id: str, message: ChatMessage
-    ) -> None:
+    async def append(self, session_id: str, message: ChatMessage) -> None:
         self.append_calls += 1
         if self.append_calls == self._fail_on_call:
             raise StateStoreError(

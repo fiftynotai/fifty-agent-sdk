@@ -46,9 +46,7 @@ def final_json(answer: str, thought: str = "done") -> str:
     )
 
 
-def tool_json(
-    thought: str, name: str, args: dict[str, Any] | None
-) -> str:
+def tool_json(thought: str, name: str, args: dict[str, Any] | None) -> str:
     """Render a JSON envelope for a :class:`ThoughtAction` parse."""
     return json.dumps(
         {
@@ -159,8 +157,6 @@ class FormatAwareFakeLLM:
         self.calls.append(request)
         return make_response(self._select_reply(request))
 
-    async def stream(
-        self, request: ChatRequest
-    ) -> AsyncIterator[ChatResponse]:
+    async def stream(self, request: ChatRequest) -> AsyncIterator[ChatResponse]:
         self.calls.append(request)
         yield make_response(self._select_reply(request))

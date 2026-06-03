@@ -106,12 +106,8 @@ def _to_tool_schema(input_schema: dict[str, Any]) -> ToolSchema:
         )
     properties_raw = input_schema.get("properties", {})
     required_raw = input_schema.get("required", [])
-    properties: dict[str, Any] = (
-        dict(properties_raw) if isinstance(properties_raw, dict) else {}
-    )
-    required: list[str] = (
-        [str(r) for r in required_raw] if isinstance(required_raw, list) else []
-    )
+    properties: dict[str, Any] = dict(properties_raw) if isinstance(properties_raw, dict) else {}
+    required: list[str] = [str(r) for r in required_raw] if isinstance(required_raw, list) else []
     return ToolSchema(
         type="object",
         properties=properties,
@@ -242,9 +238,7 @@ class MCPProvider:
             agent_sdk.errors.MCPError: On discovery failure.
         """
         if self._registry is None:
-            raise RuntimeError(
-                "MCPProvider.refresh() requires a prior attach(registry) call"
-            )
+            raise RuntimeError("MCPProvider.refresh() requires a prior attach(registry) call")
         return await self._discover_and_register(self._registry)
 
     async def start_periodic_refresh(self, interval_seconds: float) -> None:
@@ -263,18 +257,14 @@ class MCPProvider:
             ValueError: If ``interval_seconds`` is not positive.
         """
         if interval_seconds <= 0:
-            raise ValueError(
-                f"interval_seconds must be > 0; got {interval_seconds!r}"
-            )
+            raise ValueError(f"interval_seconds must be > 0; got {interval_seconds!r}")
         if self._refresh_task is not None and not self._refresh_task.done():
             raise RuntimeError(
-                "MCPProvider periodic refresh is already running; "
-                "call aclose() first"
+                "MCPProvider periodic refresh is already running; call aclose() first"
             )
         if self._registry is None:
             raise RuntimeError(
-                "MCPProvider.start_periodic_refresh() requires a prior "
-                "attach(registry) call"
+                "MCPProvider.start_periodic_refresh() requires a prior attach(registry) call"
             )
         self._refresh_task = asyncio.create_task(
             self._periodic_loop(interval_seconds),

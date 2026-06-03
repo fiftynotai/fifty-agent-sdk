@@ -20,9 +20,7 @@ from pydantic import BaseModel, ConfigDict, Field
 Role = Literal["system", "user", "assistant", "tool"]
 """Discriminator for the speaker of a :class:`ChatMessage`."""
 
-FinishReason = Literal[
-    "stop", "length", "tool_calls", "content_filter", "error", "in_progress"
-]
+FinishReason = Literal["stop", "length", "tool_calls", "content_filter", "error", "in_progress"]
 """Standard terminal reason for a chat completion — plus the streaming sentinel.
 
 Mirrors the OpenAI chat-completion ``finish_reason`` field. Adapters MUST map

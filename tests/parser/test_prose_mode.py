@@ -18,11 +18,7 @@ def _parser() -> ProseModeParser:
 
 
 def test_happy_path_action() -> None:
-    completion = (
-        "Thought: I need to search.\n"
-        "Action: search\n"
-        'Action Input: {"q": "x"}'
-    )
+    completion = 'Thought: I need to search.\nAction: search\nAction Input: {"q": "x"}'
     result = _parser().parse(completion)
     assert isinstance(result, ThoughtAction)
     assert result.thought == "I need to search."
@@ -40,12 +36,7 @@ def test_happy_path_final_answer() -> None:
 
 def test_action_input_multiline_json_is_decoded() -> None:
     completion = (
-        "Thought: Looking it up.\n"
-        "Action: search\n"
-        "Action Input: {\n"
-        '  "q": "x",\n'
-        '  "limit": 5\n'
-        "}"
+        'Thought: Looking it up.\nAction: search\nAction Input: {\n  "q": "x",\n  "limit": 5\n}'
     )
     result = _parser().parse(completion)
     assert isinstance(result, ThoughtAction)
@@ -53,11 +44,7 @@ def test_action_input_multiline_json_is_decoded() -> None:
 
 
 def test_action_input_with_code_fences_is_recovered() -> None:
-    completion = (
-        "Thought: t\n"
-        "Action: search\n"
-        'Action Input: ```json\n{"q": "x"}\n```'
-    )
+    completion = 'Thought: t\nAction: search\nAction Input: ```json\n{"q": "x"}\n```'
     result = _parser().parse(completion)
     assert isinstance(result, ThoughtAction)
     assert result.tool_call.args == {"q": "x"}
@@ -107,9 +94,7 @@ def test_case_variants_are_tolerated_for_action(completion: str) -> None:
 
 def test_whitespace_around_headers_tolerated() -> None:
     completion = (
-        "\n\n   Thought:    T   \n"
-        "   Action:    search   \n"
-        '   Action Input:    {"q": "x"}   \n\n'
+        '\n\n   Thought:    T   \n   Action:    search   \n   Action Input:    {"q": "x"}   \n\n'
     )
     result = _parser().parse(completion)
     assert isinstance(result, ThoughtAction)
@@ -125,12 +110,7 @@ def test_whitespace_around_headers_tolerated() -> None:
 
 def test_both_action_and_final_answer_present_prefers_action() -> None:
     """Documented tie-break: tool path wins when both shapes are present."""
-    completion = (
-        "Thought: T\n"
-        "Action: search\n"
-        'Action Input: {"q": "x"}\n'
-        "Final Answer: stale"
-    )
+    completion = 'Thought: T\nAction: search\nAction Input: {"q": "x"}\nFinal Answer: stale'
     result = _parser().parse(completion)
     assert isinstance(result, ThoughtAction)
     assert result.tool_call.name == "search"

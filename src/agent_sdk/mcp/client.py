@@ -269,10 +269,7 @@ def _redact_headers(
     replaces every redacted value verbatim.
     """
     sensitive = _BUILTIN_SENSITIVE_HEADERS | extra_sensitive_keys
-    return {
-        k: (_REDACTION_SENTINEL if k.lower() in sensitive else v)
-        for k, v in headers.items()
-    }
+    return {k: (_REDACTION_SENTINEL if k.lower() in sensitive else v) for k, v in headers.items()}
 
 
 # ---------------------------------------------------------------------------
@@ -333,9 +330,7 @@ class MCPClient:
         # auth. Callables are resolved per-request, so their declared keys
         # are added to the sensitive set on the fly.
         self._declared_auth_keys: frozenset[str] = (
-            frozenset(k.lower() for k in auth)
-            if isinstance(auth, Mapping)
-            else frozenset()
+            frozenset(k.lower() for k in auth) if isinstance(auth, Mapping) else frozenset()
         )
         if client is not None:
             self._client = client

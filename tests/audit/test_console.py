@@ -56,9 +56,7 @@ async def test_record_spreads_all_event_fields() -> None:
 async def test_record_handles_none_user_id() -> None:
     """A ``None`` ``user_id`` is logged as ``None``, not omitted."""
     sink = ConsoleAuditSink()
-    event = AuditEvent(
-        session_id="s1", timestamp=datetime.now(UTC), event_type="error"
-    )
+    event = AuditEvent(session_id="s1", timestamp=datetime.now(UTC), event_type="error")
     with structlog.testing.capture_logs() as logs:
         await sink.record(event)
 

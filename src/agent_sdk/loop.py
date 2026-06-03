@@ -143,9 +143,7 @@ def _serialize_tool_output(output: Any) -> str:
         return repr(output)
 
 
-async def _accumulate_stream(
-    llm: LLMClient, request: ChatRequest
-) -> tuple[str, list[str]]:
+async def _accumulate_stream(llm: LLMClient, request: ChatRequest) -> tuple[str, list[str]]:
     """Drain :meth:`LLMClient.stream` into the joined completion plus per-chunk deltas.
 
     Stops as soon as a chunk reports a non-``"in_progress"`` finish reason.
@@ -284,17 +282,13 @@ class AgentLoop:
         self._safety = safety
         self._model = model
         self._stream = stream
-        self._tool_message_role: Literal["tool", "user", "assistant"] = (
-            tool_message_role
-        )
+        self._tool_message_role: Literal["tool", "user", "assistant"] = tool_message_role
         self._hooks = hooks
         # Snapshot tool descriptions ONCE; subsequent registry mutations are
         # invisible to this loop instance. Documented behavior.
         self._system_prompt = self._build_system_prompt(prompts, output_format)
 
-    def _build_system_prompt(
-        self, prompts: PromptSections, output_format: str
-    ) -> str:
+    def _build_system_prompt(self, prompts: PromptSections, output_format: str) -> str:
         """Render the system prompt from a registry snapshot and the provided slots."""
         tool_block = _render_tool_descriptions(self._registry.list())
         chosen_format = output_format or prompts.output_format
@@ -386,9 +380,7 @@ class AgentLoop:
                 request = self._build_request(working)
                 try:
                     llm_t0 = time.perf_counter()
-                    completion, deltas, response = await self._call_llm(
-                        request
-                    )
+                    completion, deltas, response = await self._call_llm(request)
                     llm_duration_ms = (time.perf_counter() - llm_t0) * 1000
                 except LLMError as exc:
                     yield self._make_event(
@@ -421,10 +413,7 @@ class AgentLoop:
                 # real ChatResponse. On a BR-018 retry this hook fires
                 # TWICE per outer iteration (once per inner LLM call) by
                 # design.
-                if (
-                    self._hooks is not None
-                    and self._hooks.on_llm_call is not None
-                ):
+                if self._hooks is not None and self._hooks.on_llm_call is not None:
                     llm_response = (
                         response
                         if response is not None
@@ -443,10 +432,7 @@ class AgentLoop:
                 try:
                     parsed = self._parser.parse(completion)
                 except ParserError as exc:
-                    if (
-                        self._safety.parser_retry_enabled
-                        and parser_retries_this_iteration < 1
-                    ):
+                    if self._safety.parser_retry_enabled and parser_retries_this_iteration < 1:
                         # BR-018 one-shot retry: echo the malformed
                         # completion back as an assistant turn (so the
                         # model sees what it actually said) and inject
@@ -460,11 +446,7 @@ class AgentLoop:
                             error_phase=exc.context.get("error_phase"),
                             run_id=run_id,
                         )
-                        working.append(
-                            ChatMessage(
-                                role="assistant", content=completion
-                            )
-                        )
+                        working.append(ChatMessage(role="assistant", content=completion))
                         working.append(
                             ChatMessage(
                                 role="user",
@@ -503,14 +485,10 @@ class AgentLoop:
 
             # ----- 3. Branch on parse result -------------------------------
             if isinstance(parsed, FinalAnswer):
-                yield self._make_event(
-                    ThoughtEvent, sequence_box, text=parsed.thought
-                )
+                yield self._make_event(ThoughtEvent, sequence_box, text=parsed.thought)
                 if self._stream:
                     for delta in deltas:
-                        yield self._make_event(
-                            TokenEvent, sequence_box, text=delta
-                        )
+                        yield self._make_event(TokenEvent, sequence_box, text=delta)
                 yield self._make_event(
                     FinalEvent,
                     sequence_box,
@@ -526,9 +504,7 @@ class AgentLoop:
                 return
 
             # parsed is a ThoughtAction (narrowed by isinstance check above).
-            yield self._make_event(
-                ThoughtEvent, sequence_box, text=parsed.thought
-            )
+            yield self._make_event(ThoughtEvent, sequence_box, text=parsed.thought)
             yield self._make_event(
                 ActionEvent,
                 sequence_box,
@@ -623,9 +599,7 @@ class AgentLoop:
                         tool_name=tool_name,
                         call_id=call_id,
                         content_for_tool_role=f"Tool error: {error_text}",
-                        content_for_other_role=(
-                            f"Tool {tool_name} failed: {error_text}"
-                        ),
+                        content_for_other_role=(f"Tool {tool_name} failed: {error_text}"),
                     )
                 )
             else:
@@ -640,9 +614,7 @@ class AgentLoop:
                     self._build_tool_message(
                         tool_name=tool_name,
                         call_id=call_id,
-                        content_for_tool_role=_serialize_tool_output(
-                            tool_result.output
-                        ),
+                        content_for_tool_role=_serialize_tool_output(tool_result.output),
                         content_for_other_role=(
                             f"Tool {tool_name} returned: "
                             f"{_serialize_tool_output(tool_result.output)}"
@@ -662,18 +634,13 @@ class AgentLoop:
             ErrorEvent,
             sequence_box,
             error_type="MaxIterationsExceeded",
-            message=(
-                f"loop did not terminate within "
-                f"{self._safety.max_iterations} iterations"
-            ),
+            message=(f"loop did not terminate within {self._safety.max_iterations} iterations"),
             context={
                 "max_iterations": self._safety.max_iterations,
                 "iteration_count": iteration,
             },
         )
-        yield self._make_event(
-            FinalEvent, sequence_box, text=self._safety.fallback_message
-        )
+        yield self._make_event(FinalEvent, sequence_box, text=self._safety.fallback_message)
         _log.info(
             "agent_loop_completed",
             iterations=iteration,
@@ -730,9 +697,7 @@ class AgentLoop:
             content=content_for_other_role,
         )
 
-    async def _call_llm(
-        self, request: ChatRequest
-    ) -> tuple[str, list[str], ChatResponse | None]:
+    async def _call_llm(self, request: ChatRequest) -> tuple[str, list[str], ChatResponse | None]:
         """Call the LLM in either streaming or non-streaming mode.
 
         Returns a tuple ``(completion, deltas, response)``:
@@ -764,9 +729,7 @@ class AgentLoop:
         response: ChatResponse = await self._llm.complete(request)
         return response.message.content, [], response
 
-    async def _invoke_hook(
-        self, hook_name: str, hook: Any, *args: Any
-    ) -> None:
+    async def _invoke_hook(self, hook_name: str, hook: Any, *args: Any) -> None:
         """Dispatch a single Loop-tier observability hook.
 
         A thin wrapper over :func:`agent_sdk.observability.hooks.invoke_hook`

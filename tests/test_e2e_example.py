@@ -74,9 +74,7 @@ async def test_e2e_define_tool_wire_registry_run_stream() -> None:
     # FinalAnswer respectively.
     llm = FakeLLMClient(
         replies=[
-            make_response(
-                tool_json("checking weather", "get_weather", {"city": "Paris"})
-            ),
+            make_response(tool_json("checking weather", "get_weather", {"city": "Paris"})),
             make_response(final_json("It is 21°C in Paris.")),
         ]
     )
@@ -95,12 +93,7 @@ async def test_e2e_define_tool_wire_registry_run_stream() -> None:
     runner = AgentRunner(loop=loop, state=store)
 
     # ── Step 4: drive one turn and drain the event stream ─────────────────
-    events = [
-        event
-        async for event in runner.run(
-            "session-e2e", "What's the weather in Paris?"
-        )
-    ]
+    events = [event async for event in runner.run("session-e2e", "What's the weather in Paris?")]
 
     # ── Step 5: assert on every observable property of the run ────────────
     # 5a. The event-type sequence is the canonical tool-using ReACT cycle:

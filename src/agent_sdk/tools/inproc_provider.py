@@ -114,13 +114,9 @@ def tool(
 
     def decorator(fn: ToolFn) -> Tool:
         if not inspect.iscoroutinefunction(fn):
-            raise TypeError(
-                f"@tool requires an async function; '{fn.__name__}' is not async"
-            )
+            raise TypeError(f"@tool requires an async function; '{fn.__name__}' is not async")
         resolved_name = name or fn.__name__
-        resolved_description = (
-            description or (inspect.getdoc(fn) or "").strip() or resolved_name
-        )
+        resolved_description = description or (inspect.getdoc(fn) or "").strip() or resolved_name
         input_model = _build_model_from_signature(fn)
         schema = _schema_from_model(input_model)
         decorated = _DecoratedTool(
@@ -185,23 +181,17 @@ def _build_model_from_signature(fn: ToolFn) -> type[BaseModel]:
         if pname == "self":
             continue
         if param.kind in (Parameter.VAR_POSITIONAL, Parameter.VAR_KEYWORD):
-            raise TypeError(
-                f"@tool callable '{fn.__name__}' cannot use *args/**kwargs"
-            )
+            raise TypeError(f"@tool callable '{fn.__name__}' cannot use *args/**kwargs")
         if param.kind == Parameter.POSITIONAL_ONLY:
             raise TypeError(
-                f"@tool callable '{fn.__name__}' cannot use positional-only "
-                f"parameter '{pname}'"
+                f"@tool callable '{fn.__name__}' cannot use positional-only parameter '{pname}'"
             )
         if pname not in hints:
             raise TypeError(
-                f"@tool callable '{fn.__name__}' parameter '{pname}' has no "
-                f"type annotation"
+                f"@tool callable '{fn.__name__}' parameter '{pname}' has no type annotation"
             )
         annotation = hints[pname]
-        default = (
-            param.default if param.default is not Parameter.empty else PydanticUndefined
-        )
+        default = param.default if param.default is not Parameter.empty else PydanticUndefined
         fields[pname] = (annotation, Field(default=default))
     model_name = f"{_camel(fn.__name__)}Args"
     return cast(
@@ -224,12 +214,8 @@ def _schema_from_model(model: type[BaseModel]) -> ToolSchema:
     raw = model.model_json_schema()
     properties_raw = raw.get("properties", {})
     required_raw = raw.get("required", [])
-    properties: dict[str, Any] = (
-        properties_raw if isinstance(properties_raw, dict) else {}
-    )
-    required: list[str] = (
-        list(required_raw) if isinstance(required_raw, list) else []
-    )
+    properties: dict[str, Any] = properties_raw if isinstance(properties_raw, dict) else {}
+    required: list[str] = list(required_raw) if isinstance(required_raw, list) else []
     return ToolSchema(
         type=str(raw.get("type", "object")),
         properties=properties,

@@ -57,9 +57,7 @@ async def store() -> AsyncIterator[RedisStateStore]:
     instance clean even when it shares a database with other data.
     """
     assert REDIS_TEST_URL is not None  # narrowed by the module-level skip
-    s = RedisStateStore(
-        REDIS_TEST_URL, key_prefix=_TEST_KEY_PREFIX, ttl_seconds=3600
-    )
+    s = RedisStateStore(REDIS_TEST_URL, key_prefix=_TEST_KEY_PREFIX, ttl_seconds=3600)
     try:
         yield s
     finally:
@@ -111,9 +109,7 @@ async def test_redis_no_ttl_when_ttl_seconds_is_none() -> None:
     ``test_no_ttl_when_ttl_seconds_is_none`` in ``test_redis.py``.
     """
     assert REDIS_TEST_URL is not None  # narrowed by the module-level skip
-    s = RedisStateStore(
-        REDIS_TEST_URL, key_prefix=_TEST_KEY_PREFIX, ttl_seconds=None
-    )
+    s = RedisStateStore(REDIS_TEST_URL, key_prefix=_TEST_KEY_PREFIX, ttl_seconds=None)
     try:
         await s.append("s1", ChatMessage(role="user", content="a"))
         # Redis returns -1 for a key that exists but has no associated expiry.
@@ -132,9 +128,7 @@ async def test_redis_short_ttl_key_expires() -> None:
     (something fakeredis cannot validate without simulated time).
     """
     assert REDIS_TEST_URL is not None
-    s = RedisStateStore(
-        REDIS_TEST_URL, key_prefix=_TEST_KEY_PREFIX, ttl_seconds=1
-    )
+    s = RedisStateStore(REDIS_TEST_URL, key_prefix=_TEST_KEY_PREFIX, ttl_seconds=1)
     try:
         await s.append("expiring", ChatMessage(role="user", content="a"))
         assert await s.get_messages("expiring") != []

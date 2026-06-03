@@ -137,8 +137,7 @@ try:
     from sqlalchemy.types import JSON
 except ImportError as exc:  # pragma: no cover - exercised via importlib in tests
     raise ImportError(
-        "agent_sdk.state.sql requires SQLAlchemy. "
-        "Install with: pip install 'agent-sdk[sql]'"
+        "agent_sdk.state.sql requires SQLAlchemy. Install with: pip install 'agent-sdk[sql]'"
     ) from exc
 
 from agent_sdk.errors import StateStoreError
@@ -636,9 +635,7 @@ class SqlStateStore:
                 sequence=next_seq,
             )
         except SQLAlchemyError as exc:
-            raise _wrap_state_store_error(
-                exc, session_id=session_id, operation="append"
-            ) from exc
+            raise _wrap_state_store_error(exc, session_id=session_id, operation="append") from exc
 
     async def delete(self, session_id: str) -> None:
         """Remove the session row and all its messages.
@@ -680,9 +677,7 @@ class SqlStateStore:
                 existed=True,
             )
         except SQLAlchemyError as exc:
-            raise _wrap_state_store_error(
-                exc, session_id=session_id, operation="delete"
-            ) from exc
+            raise _wrap_state_store_error(exc, session_id=session_id, operation="delete") from exc
 
 
 __all__ = [

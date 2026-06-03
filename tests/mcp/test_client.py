@@ -99,9 +99,7 @@ async def test_discover_rejects_wrong_jsonrpc_version(
     mcp_server: MockMCPServer, mcp_http_client: httpx.AsyncClient
 ) -> None:
     # Force the next response to carry an invalid jsonrpc version.
-    bad = json.dumps(
-        {"jsonrpc": "1.0", "id": "irrelevant", "result": {"tools": []}}
-    ).encode()
+    bad = json.dumps({"jsonrpc": "1.0", "id": "irrelevant", "result": {"tools": []}}).encode()
     mcp_server.force_next_raw(bad)
     client = _make_client(mcp_http_client)
     with pytest.raises(MCPError) as exc:
@@ -315,9 +313,7 @@ async def test_static_auth_header_propagated(
     mcp_server: MockMCPServer, mcp_http_client: httpx.AsyncClient
 ) -> None:
     mcp_server.set_tool_catalog([])
-    client = _make_client(
-        mcp_http_client, auth={"Authorization": "Bearer test-token"}
-    )
+    client = _make_client(mcp_http_client, auth={"Authorization": "Bearer test-token"})
     await client.discover()
     headers = mcp_server.observed_headers[-1]
     assert headers.get("authorization") == "Bearer test-token"
@@ -482,9 +478,7 @@ async def test_caller_provided_client_not_disposed(
 async def test_discover_rejects_malformed_envelope(
     mcp_server: MockMCPServer, mcp_http_client: httpx.AsyncClient
 ) -> None:
-    bad = json.dumps(
-        {"jsonrpc": "2.0", "id": "x", "result": {"tools": "oops"}}
-    ).encode()
+    bad = json.dumps({"jsonrpc": "2.0", "id": "x", "result": {"tools": "oops"}}).encode()
     mcp_server.force_next_raw(bad)
     client = _make_client(mcp_http_client)
     # The strict mock validates envelope shape before the parser sees it,
@@ -516,9 +510,7 @@ async def test_discover_handles_snake_case_input_schema(
 async def test_discover_rejects_missing_tool_name(
     mcp_server: MockMCPServer, mcp_http_client: httpx.AsyncClient
 ) -> None:
-    mcp_server.set_tool_catalog(
-        [{"description": "anonymous", "inputSchema": {"type": "object"}}]
-    )
+    mcp_server.set_tool_catalog([{"description": "anonymous", "inputSchema": {"type": "object"}}])
     client = _make_client(mcp_http_client)
     with pytest.raises(MCPError) as exc:
         await client.discover()
@@ -574,17 +566,13 @@ async def test_mcperror_context_keys_match_class_docstring_allowlist(
     # --- (a) documented set: parse the brace-delimited allow-list ----------
     doc = MCPClient.__doc__
     assert doc is not None, "MCPClient must carry a class docstring"
-    brace_match = re.search(
-        r"allow-list\s*``\{(?P<keys>[^}]*)\}``", doc, re.DOTALL
-    )
+    brace_match = re.search(r"allow-list\s*``\{(?P<keys>[^}]*)\}``", doc, re.DOTALL)
     assert brace_match is not None, (
         "could not locate the brace-delimited allow-list after the "
         "'allow-list' keyword in MCPClient.__doc__"
     )
     documented: set[str] = {
-        token.strip()
-        for token in brace_match.group("keys").split(",")
-        if token.strip()
+        token.strip() for token in brace_match.group("keys").split(",") if token.strip()
     }
 
     # --- (b) runtime set: trigger one MCPError per context-key group ------
@@ -595,9 +583,7 @@ async def test_mcperror_context_keys_match_class_docstring_allowlist(
 
     # Group 1: envelope wrong jsonrpc version -> envelope_jsonrpc.
     mcp_server.force_next_raw(
-        json.dumps(
-            {"jsonrpc": "1.0", "id": "irrelevant", "result": {"tools": []}}
-        ).encode()
+        json.dumps({"jsonrpc": "1.0", "id": "irrelevant", "result": {"tools": []}}).encode()
     )
     client = _make_client(mcp_http_client)
     with pytest.raises(MCPError) as exc:
@@ -606,9 +592,7 @@ async def test_mcperror_context_keys_match_class_docstring_allowlist(
 
     # Group 2: envelope id mismatch -> expected_id, received_id.
     mcp_server.force_next_raw(
-        json.dumps(
-            {"jsonrpc": "2.0", "id": "wrong-id", "result": {"tools": []}}
-        ).encode()
+        json.dumps({"jsonrpc": "2.0", "id": "wrong-id", "result": {"tools": []}}).encode()
     )
     with pytest.raises(MCPError) as exc:
         await client.discover()
@@ -645,9 +629,7 @@ async def test_mcperror_context_keys_match_class_docstring_allowlist(
     _capture(exc.value)
 
     # Group 5: result carries isError=True -> tool_name, content.
-    mcp_server.register_tool(
-        "fail", lambda _args: {"isError": True, "content": "tool said no"}
-    )
+    mcp_server.register_tool("fail", lambda _args: {"isError": True, "content": "tool said no"})
     with pytest.raises(MCPError) as exc:
         await client.invoke("fail", {})
     _capture(exc.value)
@@ -657,9 +639,7 @@ async def test_mcperror_context_keys_match_class_docstring_allowlist(
         return httpx.Response(503, text="upstream down")
 
     down_client = MCPClient(
-        _config(), client=httpx.AsyncClient(
-            transport=httpx.MockTransport(_server_down)
-        )
+        _config(), client=httpx.AsyncClient(transport=httpx.MockTransport(_server_down))
     )
     with pytest.raises(MCPError) as exc:
         await down_client.invoke("search", {"q": "x"})

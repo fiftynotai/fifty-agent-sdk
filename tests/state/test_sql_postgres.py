@@ -104,9 +104,7 @@ async def test_postgres_round_trip(store: SqlStateStore) -> None:
     assert got == msgs
 
 
-async def test_postgres_cascade_via_db_level_fk(
-    store: SqlStateStore, engine: AsyncEngine
-) -> None:
+async def test_postgres_cascade_via_db_level_fk(store: SqlStateStore, engine: AsyncEngine) -> None:
     """Raw ``DELETE FROM agent_sessions`` cascades to messages on Postgres.
 
     Proves the schema-level ``ON DELETE CASCADE`` is in effect — not just
@@ -121,9 +119,7 @@ async def test_postgres_cascade_via_db_level_fk(
 
     async with engine.connect() as conn:
         rows = (
-            await conn.execute(
-                select(AgentMessage).where(AgentMessage.session_id == "s1")
-            )
+            await conn.execute(select(AgentMessage).where(AgentMessage.session_id == "s1"))
         ).all()
     assert rows == []
 
@@ -178,8 +174,7 @@ async def test_postgres_jsonb_column_is_queryable(
     async with engine.begin() as conn:
         await conn.execute(
             text(
-                "INSERT INTO agent_sessions (session_id, metadata) "
-                "VALUES ('s1', :payload::jsonb)"
+                "INSERT INTO agent_sessions (session_id, metadata) VALUES ('s1', :payload::jsonb)"
             ),
             {"payload": '{"tag": "alpha"}'},
         )
@@ -188,18 +183,13 @@ async def test_postgres_jsonb_column_is_queryable(
     async with engine.connect() as conn:
         rows = (
             await conn.execute(
-                text(
-                    "SELECT session_id FROM agent_sessions "
-                    "WHERE metadata->>'tag' = 'alpha'"
-                )
+                text("SELECT session_id FROM agent_sessions WHERE metadata->>'tag' = 'alpha'")
             )
         ).all()
     assert [r[0] for r in rows] == ["s1"]
 
 
-async def test_postgres_integrity_error_wrapping(
-    store: SqlStateStore, engine: AsyncEngine
-) -> None:
+async def test_postgres_integrity_error_wrapping(store: SqlStateStore, engine: AsyncEngine) -> None:
     """Forced duplicate (session_id, sequence) wraps to StateStoreError."""
     await store.append("s1", ChatMessage(role="user", content="first"))
 
@@ -227,9 +217,7 @@ async def test_postgres_integrity_error_wrapping(
 
             try:
                 async with self._session_factory() as session, session.begin():
-                    parent = await session.scalar(
-                        _select(_AS).where(_AS.session_id == session_id)
-                    )
+                    parent = await session.scalar(_select(_AS).where(_AS.session_id == session_id))
                     assert parent is not None
                     session.add(
                         AgentMessage(

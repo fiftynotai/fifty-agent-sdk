@@ -357,21 +357,13 @@ class AgentRunner:
             result_summary = _bounded_repr(event.error)
         return {
             "tool_name": event.tool_name,
-            "call_id": (
-                pending_call.call_id
-                if pending_call is not None
-                else event.call_id
-            ),
-            "args": (
-                pending_action.args if pending_action is not None else {}
-            ),
+            "call_id": (pending_call.call_id if pending_call is not None else event.call_id),
+            "args": (pending_action.args if pending_action is not None else {}),
             "outcome": outcome,
             "result_summary": result_summary,
         }
 
-    async def run(
-        self, session_id: str, user_message: str
-    ) -> AsyncIterator[AgentEvent]:
+    async def run(self, session_id: str, user_message: str) -> AsyncIterator[AgentEvent]:
         """Drive a single conversational turn for ``session_id``.
 
         Algorithm (full edge-case detail in the module docstring):
@@ -615,9 +607,7 @@ class AgentRunner:
             # as a second correlation pass.
             tool_started_at: float | None = None
 
-            async for event in self._loop.run(
-                loop_messages, session_id=session_id
-            ):
+            async for event in self._loop.run(loop_messages, session_id=session_id):
                 event_count += 1
                 if isinstance(event, ErrorEvent):
                     saw_error = True
@@ -639,9 +629,7 @@ class AgentRunner:
                         "on_tool_start",
                         session_id,
                         event.tool_name,
-                        pending_action.args
-                        if pending_action is not None
-                        else {},
+                        pending_action.args if pending_action is not None else {},
                     )
                 # Emit `tool_invocation` AFTER yielding so consumer event
                 # delivery is never blocked on audit latency.
@@ -649,9 +637,7 @@ class AgentRunner:
                     await self._emit_audit(
                         session_id,
                         "tool_invocation",
-                        self._tool_invocation_payload(
-                            event, pending_action, pending_call
-                        ),
+                        self._tool_invocation_payload(event, pending_action, pending_call),
                     )
                     # `on_tool_end` fires beside the audit emission, BEFORE
                     # the pending slots are cleared. `result` is the tool's
@@ -663,9 +649,7 @@ class AgentRunner:
                         else 0.0
                     )
                     tool_result = (
-                        event.result.output
-                        if isinstance(event, ObservationEvent)
-                        else event.error
+                        event.result.output if isinstance(event, ObservationEvent) else event.error
                     )
                     await self._invoke_hook(
                         "on_tool_end",
@@ -694,9 +678,7 @@ class AgentRunner:
                 # branch in practice, but the fallback keeps the
                 # contract explicit and the local invariant total).
                 persist_content = (
-                    raw_final_completion
-                    if raw_final_completion is not None
-                    else final_text
+                    raw_final_completion if raw_final_completion is not None else final_text
                 )
                 asst_msg = ChatMessage(role="assistant", content=persist_content)
                 try:
@@ -757,15 +739,9 @@ class AgentRunner:
                     {
                         "run_id": run_id,
                         "error_type": (
-                            last_error.error_type
-                            if last_error is not None
-                            else "Unknown"
+                            last_error.error_type if last_error is not None else "Unknown"
                         ),
-                        "error_message": (
-                            last_error.message
-                            if last_error is not None
-                            else ""
-                        ),
+                        "error_message": (last_error.message if last_error is not None else ""),
                     },
                 )
                 # `on_error` fires for the loop-internal failure. The loop
@@ -815,9 +791,7 @@ class AgentRunner:
             # `Exception` and re-raise only `CancelledError`, so a raising
             # `on_run_end` cannot mask an in-flight `StateStoreError`.
             run_duration_ms = (time.perf_counter() - run_start) * 1000
-            await self._invoke_hook(
-                "on_run_end", session_id, run_duration_ms, run_error
-            )
+            await self._invoke_hook("on_run_end", session_id, run_duration_ms, run_error)
 
 
 __all__ = ["AgentRunner"]

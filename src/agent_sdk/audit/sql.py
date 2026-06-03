@@ -91,8 +91,7 @@ try:
     from sqlalchemy.types import JSON
 except ImportError as exc:  # pragma: no cover - exercised via importlib in tests
     raise ImportError(
-        "agent_sdk.audit.sql requires SQLAlchemy. "
-        "Install with: pip install 'agent-sdk[sql]'"
+        "agent_sdk.audit.sql requires SQLAlchemy. Install with: pip install 'agent-sdk[sql]'"
     ) from exc
 
 from agent_sdk.audit.protocol import AuditEvent

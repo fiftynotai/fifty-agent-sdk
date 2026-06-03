@@ -57,9 +57,7 @@ class Registry:
                 ``schema``, and an ``invoke`` attribute are all present.
         """
         if not isinstance(tool, Tool):
-            raise TypeError(
-                f"register() requires a Tool; got {type(tool).__name__}"
-            )
+            raise TypeError(f"register() requires a Tool; got {type(tool).__name__}")
         if tool.name in self._tools:
             _log.warning("tool overwritten", name=tool.name)
         self._tools[tool.name] = tool

@@ -78,9 +78,7 @@ async def sink(engine: AsyncEngine) -> AsyncIterator[SqlAuditSink]:
 # ---------------------------------------------------------------------------
 
 
-async def test_record_round_trips_all_fields(
-    sink: SqlAuditSink, engine: AsyncEngine
-) -> None:
+async def test_record_round_trips_all_fields(sink: SqlAuditSink, engine: AsyncEngine) -> None:
     """Every :class:`AuditEvent` field survives a record + read-back."""
     ts = datetime.now(UTC)
     event = AuditEvent(
@@ -112,9 +110,7 @@ async def test_record_round_trips_all_fields(
     assert row.timestamp.replace(tzinfo=None) == ts.replace(tzinfo=None)
 
 
-async def test_record_nested_payload_round_trips(
-    sink: SqlAuditSink, engine: AsyncEngine
-) -> None:
+async def test_record_nested_payload_round_trips(sink: SqlAuditSink, engine: AsyncEngine) -> None:
     """A ``payload`` with nested dict/list survives the JSON column."""
     payload = {
         "args": {"query": "weather", "limits": [1, 2, 3]},
@@ -129,9 +125,7 @@ async def test_record_nested_payload_round_trips(
         )
     )
     async with engine.connect() as conn:
-        stored = (
-            await conn.execute(select(AgentAuditLog.payload))
-        ).scalar_one()
+        stored = (await conn.execute(select(AgentAuditLog.payload))).scalar_one()
     assert stored == payload
 
 
@@ -147,15 +141,11 @@ async def test_record_user_id_none_round_trips_as_null(
         )
     )
     async with engine.connect() as conn:
-        stored = (
-            await conn.execute(select(AgentAuditLog.user_id))
-        ).scalar_one()
+        stored = (await conn.execute(select(AgentAuditLog.user_id))).scalar_one()
     assert stored is None
 
 
-async def test_record_appends_rows(
-    sink: SqlAuditSink, engine: AsyncEngine
-) -> None:
+async def test_record_appends_rows(sink: SqlAuditSink, engine: AsyncEngine) -> None:
     """Multiple ``record`` calls append distinct rows (append-only)."""
     for index in range(3):
         await sink.record(
@@ -168,13 +158,7 @@ async def test_record_appends_rows(
         )
     async with engine.connect() as conn:
         payloads = (
-            (
-                await conn.execute(
-                    select(AgentAuditLog.payload).order_by(
-                        AgentAuditLog.id.asc()
-                    )
-                )
-            )
+            (await conn.execute(select(AgentAuditLog.payload).order_by(AgentAuditLog.id.asc())))
             .scalars()
             .all()
         )
@@ -182,9 +166,7 @@ async def test_record_appends_rows(
     assert [p["n"] for p in payloads] == [0, 1, 2]
 
 
-async def test_recorded_at_is_populated(
-    sink: SqlAuditSink, engine: AsyncEngine
-) -> None:
+async def test_recorded_at_is_populated(sink: SqlAuditSink, engine: AsyncEngine) -> None:
     """The server-default ``recorded_at`` column is populated on insert."""
     await sink.record(
         AuditEvent(
@@ -194,9 +176,7 @@ async def test_recorded_at_is_populated(
         )
     )
     async with engine.connect() as conn:
-        recorded_at = (
-            await conn.execute(select(AgentAuditLog.recorded_at))
-        ).scalar_one()
+        recorded_at = (await conn.execute(select(AgentAuditLog.recorded_at))).scalar_one()
     assert recorded_at is not None
 
 
@@ -319,7 +299,5 @@ async def test_metadata_create_all_is_idempotent(engine: AsyncEngine) -> None:
         )
     )
     async with engine.connect() as conn:
-        count = (
-            await conn.execute(select(AgentAuditLog.id))
-        ).all()
+        count = (await conn.execute(select(AgentAuditLog.id))).all()
     assert len(count) == 1

@@ -238,9 +238,7 @@ async def test_state_store_error_on_assistant_persist_is_audited() -> None:
         async def get_messages(self, session_id: str) -> list[ChatMessage]:
             return await self._inner.get_messages(session_id)
 
-        async def append(
-            self, session_id: str, message: ChatMessage
-        ) -> None:
+        async def append(self, session_id: str, message: ChatMessage) -> None:
             self.append_calls += 1
             if self.append_calls == 2:
                 raise StateStoreError(
@@ -288,17 +286,13 @@ async def test_audit_none_does_not_change_behaviour() -> None:
     # Run once with no audit.
     registry_a = Registry()
     registry_a.register(FakeTool("search", result=ToolResult(output={"x": 1})))
-    runner_a, store_a = make_runner(
-        llm=build_run(), registry=registry_a, audit=None
-    )
+    runner_a, store_a = make_runner(llm=build_run(), registry=registry_a, audit=None)
     events_a = await collect(runner_a.run("s1", "Hi"))
 
     # Run again with a spy sink — the agent-visible behaviour is unchanged.
     registry_b = Registry()
     registry_b.register(FakeTool("search", result=ToolResult(output={"x": 1})))
-    runner_b, store_b = make_runner(
-        llm=build_run(), registry=registry_b, audit=SpyAuditSink()
-    )
+    runner_b, store_b = make_runner(llm=build_run(), registry=registry_b, audit=SpyAuditSink())
     events_b = await collect(runner_b.run("s1", "Hi"))
     _ = tool  # silence unused — registries build their own fakes
 
@@ -411,9 +405,7 @@ async def test_iteration_cap_error_is_audited() -> None:
     tool_call = make_response(tool_json("t", "t", {}))
     llm = FakeLLMClient(replies=[tool_call, tool_call])
     spy = SpyAuditSink()
-    runner, _store = make_runner(
-        llm=llm, registry=registry, safety=safety, audit=spy
-    )
+    runner, _store = make_runner(llm=llm, registry=registry, safety=safety, audit=spy)
 
     await collect(runner.run("s1", "Hi"))
 
