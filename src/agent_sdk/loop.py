@@ -354,6 +354,16 @@ class AgentLoop:
             *messages,
         ]
 
+        # BR-036 require-tool-before-final state, scoped to THIS run() call.
+        # `tool_invoked_this_run` starts False so a brand-new conversational
+        # turn cannot inherit "a tool already ran" from a prior turn — the
+        # current turn must invoke a tool of its own to satisfy the guard.
+        # `tool_final_forced` makes the force-reconsider strictly one-shot per
+        # run (mirrors the per-iteration parser-retry budget): after one forced
+        # reconsideration the next `final` is accepted at the loop layer.
+        tool_invoked_this_run = False
+        tool_final_forced = False
+
         iteration = 0
         while iteration < self._safety.max_iterations:
             iteration += 1
@@ -485,6 +495,53 @@ class AgentLoop:
 
             # ----- 3. Branch on parse result -------------------------------
             if isinstance(parsed, FinalAnswer):
+                # BR-036 force-reconsider: if the consumer opted in, the model
+                # tried to finalize without invoking ANY tool this run, and we
+                # have not already forced once, do NOT emit the final. Instead
+                # echo the completion back as an assistant turn, inject the
+                # permissive tool-required reminder as a user turn, mark the
+                # one-shot budget spent, and `continue` — re-entering the outer
+                # iteration (still bounded by `max_iterations`). This mirrors
+                # the BR-018 parser-retry mechanism. When the flag is OFF (the
+                # default), or a tool already ran, or the budget is spent, this
+                # block is skipped entirely and the original emit-and-return
+                # logic below runs byte-for-byte unchanged.
+                if (
+                    self._safety.require_tool_before_final
+                    and not tool_invoked_this_run
+                    and not tool_final_forced
+                ):
+                    _log.info(
+                        "tool_required_force_triggered",
+                        iteration=iteration,
+                        run_id=run_id,
+                    )
+                    working.append(ChatMessage(role="assistant", content=completion))
+                    working.append(
+                        ChatMessage(
+                            role="user",
+                            content=self._safety.tool_required_reminder,
+                        )
+                    )
+                    # Re-anchor the ORIGINAL question as the model's latest
+                    # message. Without this the reminder is the most recent
+                    # user turn, and the model tends to "reply to the reminder"
+                    # with a meta-acknowledgment ("Thank you, I will use the
+                    # tool…") as its next final instead of acting. Re-appending
+                    # the current turn's last user message makes the question —
+                    # not the reminder — the thing the model must answer next.
+                    # The reminder still precedes it, so it frames HOW to act
+                    # (search-then-answer, or direct-answer a greeting). When
+                    # the caller sent no user message (degenerate), nothing is
+                    # re-anchored and the reminder alone drives the retry.
+                    last_user_message = next(
+                        (m for m in reversed(messages) if m.role == "user"), None
+                    )
+                    if last_user_message is not None:
+                        working.append(ChatMessage(role="user", content=last_user_message.content))
+                    tool_final_forced = True
+                    continue
+
                 yield self._make_event(ThoughtEvent, sequence_box, text=parsed.thought)
                 if self._stream:
                     for delta in deltas:
@@ -515,6 +572,11 @@ class AgentLoop:
             # Append the assistant turn to history before emitting ToolStarted, so the
             # subsequent tool reply sits on top of the model's reasoning turn.
             working.append(ChatMessage(role="assistant", content=completion))
+
+            # BR-036: a tool is being dispatched this run, so a later `final`
+            # is now grounded (from the loop's structural view) and must NOT
+            # trigger the force-reconsider guard.
+            tool_invoked_this_run = True
 
             # ----- 4. Invoke tool ------------------------------------------
             call_id = uuid4().hex

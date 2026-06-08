@@ -553,6 +553,318 @@ async def test_parser_retry_does_not_increment_iteration_hook() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Require-tool-before-final force-reconsider (BR-036)
+#
+# POLARITY NOTE: this guard fires on a NEGATIVE condition — "NO tool ran this
+# run". Every scenario below pairs a FIRE case (guard nudges) with a NO-FIRE
+# case (guard stays out of the way), so a flipped boolean is caught.
+# ---------------------------------------------------------------------------
+
+
+def _require_tool_safety() -> SafetyConfig:
+    """A SafetyConfig with the BR-036 force-reconsider opted in (custom reminder)."""
+    return SafetyConfig(
+        require_tool_before_final=True,
+        tool_required_reminder="REMINDER: call a tool first or re-answer.",
+    )
+
+
+async def test_require_tool_forces_reconsider_then_search() -> None:
+    """FIRE then recover: a no-tool final is nudged, the model searches, then grounds.
+
+    Call 1 = a no-tool ``final`` (the model tried to answer a policy
+    question without searching). The guard MUST NOT emit that final;
+    instead it injects the reminder and re-prompts. Call 2 = a
+    ``policy_search`` tool call (satisfying "a tool ran"). Call 3 = a
+    grounded ``final`` that now passes unguarded.
+    """
+    tool = FakeTool("policy_search", result=ToolResult(output="passage about leave"))
+    registry = Registry()
+    registry.register(tool)
+    llm = FakeLLMClient(
+        replies=[
+            make_response(_final_json("Annual leave is 30 days.")),  # no-tool final → nudged
+            make_response(_tool_json("search", "policy_search", {"q": "leave"})),  # forced search
+            make_response(_final_json("Annual leave is 30 days [leave-policy].")),  # grounded
+        ]
+    )
+    loop = _make_loop(llm=llm, registry=registry, safety=_require_tool_safety())
+
+    events = await _collect(loop.run([ChatMessage(role="user", content="leave days?")]))
+
+    # An ActionEvent for policy_search appears (the forced search ran).
+    action_events = [e for e in events if isinstance(e, ActionEvent)]
+    assert len(action_events) == 1
+    assert action_events[0].tool_name == "policy_search"
+
+    # Exactly ONE terminal FinalEvent, and it is the grounded answer — the
+    # call-1 no-tool final was suppressed (not emitted).
+    final_events = [e for e in events if isinstance(e, FinalEvent)]
+    assert len(final_events) == 1
+    assert final_events[0].text == "Annual leave is 30 days [leave-policy]."
+
+    # Three LLM calls: nudged drift + forced search + grounded final.
+    assert len(llm.calls) == 3
+
+    # The reminder text landed as a user-role message on the SECOND call.
+    reminder = _require_tool_safety().tool_required_reminder
+    assert any(
+        message.role == "user" and message.content == reminder for message in llm.calls[1].messages
+    ), "BR-036 reminder must appear as a user-role message after the no-tool final"
+
+
+async def test_require_tool_reanchors_original_question_after_reminder() -> None:
+    """The forced reconsideration re-anchors the ORIGINAL question last.
+
+    Locks the UX fix for the meta-acknowledgment failure mode: after the
+    reminder is injected, the loop re-appends the current turn's original user
+    message so the model's LATEST message is the question (not the reminder).
+    Asserts, on the second LLM call's messages:
+
+    * the reminder is present as a user turn, AND
+    * the original question is re-appended as a user turn AFTER it, AND
+    * the very last message is the original question (so the model answers
+      THAT, not the reminder).
+    """
+    original = "What is the leave policy?"
+    tool = FakeTool("policy_search", result=ToolResult(output="passage about leave"))
+    registry = Registry()
+    registry.register(tool)
+    llm = FakeLLMClient(
+        replies=[
+            make_response(_final_json("Annual leave is 30 days.")),  # no-tool final → nudged
+            make_response(_tool_json("search", "policy_search", {"q": "leave"})),  # forced search
+            make_response(_final_json("Annual leave is 30 days [leave-policy].")),  # grounded
+        ]
+    )
+    loop = _make_loop(llm=llm, registry=registry, safety=_require_tool_safety())
+
+    await _collect(loop.run([ChatMessage(role="user", content=original)]))
+
+    second_call_messages = llm.calls[1].messages
+    reminder = _require_tool_safety().tool_required_reminder
+    reminder_indices = [
+        i for i, m in enumerate(second_call_messages) if m.role == "user" and m.content == reminder
+    ]
+    reanchor_indices = [
+        i for i, m in enumerate(second_call_messages) if m.role == "user" and m.content == original
+    ]
+    assert reminder_indices, "reminder must be a user turn on the forced reconsideration"
+    # The original question appears twice now: the genuine first turn AND the
+    # re-anchored copy after the reminder. The re-anchored copy is the one that
+    # follows the reminder.
+    assert any(ri > reminder_indices[-1] for ri in reanchor_indices), (
+        "original question must be re-appended AFTER the reminder"
+    )
+    # The model's latest message is the original question, not the reminder.
+    last = second_call_messages[-1]
+    assert last.role == "user"
+    assert last.content == original
+
+
+async def test_require_tool_greeting_passes_after_one_nudge() -> None:
+    """NO-FIRE-ish: a greeting is nudged once, re-confirmed, and allowed through.
+
+    The reminder is PERMISSIVE, so a genuine greeting is NOT coerced into a
+    search. Call 1 = a no-tool greeting ``final``; call 2 = the SAME no-tool
+    ``final`` (model re-confirms it is just a greeting). The loop accepts the
+    second final — exactly one nudge, no tool ever runs.
+    """
+    greeting = "Hi! I'm the MOCA policy assistant."
+    llm = FakeLLMClient(
+        replies=[
+            make_response(_final_json(greeting)),
+            make_response(_final_json(greeting)),
+        ]
+    )
+    loop = _make_loop(llm=llm, safety=_require_tool_safety())
+
+    events = await _collect(loop.run([ChatMessage(role="user", content="hi")]))
+
+    # The greeting passes through — never forced to search.
+    assert not any(isinstance(e, ActionEvent) for e in events)
+    final_events = [e for e in events if isinstance(e, FinalEvent)]
+    assert len(final_events) == 1
+    assert final_events[0].text == greeting
+    # Exactly one nudge: two LLM calls, no more.
+    assert len(llm.calls) == 2
+
+
+async def test_require_tool_bounded_one_shot() -> None:
+    """BOUNDED: the force is strictly one-shot — it never loops forever.
+
+    Call 1 and call 2 are BOTH no-tool ``final``s. The loop forces exactly
+    ONCE, then ACCEPTS the second no-tool final at the loop layer (the hard
+    decline is the app backstop's job, asserted separately). It must not
+    nudge again and must not spin.
+    """
+    llm = FakeLLMClient(
+        replies=[
+            make_response(_final_json("first ungrounded answer")),
+            make_response(_final_json("second ungrounded answer")),
+        ]
+    )
+    loop = _make_loop(llm=llm, safety=_require_tool_safety())
+
+    events = await _collect(loop.run([ChatMessage(role="user", content="q")]))
+
+    # Exactly two calls — one forced reconsideration, then acceptance.
+    assert len(llm.calls) == 2
+    final_events = [e for e in events if isinstance(e, FinalEvent)]
+    assert len(final_events) == 1
+    # The second (accepted) final is emitted; the loop did not spin.
+    assert final_events[0].text == "second ungrounded answer"
+    assert not any(isinstance(e, ActionEvent) for e in events)
+
+
+async def test_require_tool_off_by_default_unchanged() -> None:
+    """NO-FIRE: default SafetyConfig (flag OFF) accepts a no-tool final immediately.
+
+    Locks backward-compat for every other agent/test: with
+    ``require_tool_before_final=False`` (the default), a no-tool final on
+    call 1 is accepted with NO nudge and exactly ONE LLM call.
+    """
+    llm = FakeLLMClient(replies=[make_response(_final_json("immediate answer"))])
+    loop = _make_loop(llm=llm)  # default SafetyConfig → flag OFF
+
+    events = await _collect(loop.run([ChatMessage(role="user", content="q")]))
+
+    assert len(llm.calls) == 1
+    types = [type(e) for e in events]
+    assert types == [ThoughtEvent, FinalEvent]
+    final_event = events[-1]
+    assert isinstance(final_event, FinalEvent)
+    assert final_event.text == "immediate answer"
+
+
+async def test_require_tool_does_not_fire_when_tool_already_ran() -> None:
+    """NO-FIRE: a tool ran this run, so a later final is accepted unguarded.
+
+    Call 1 = a ``policy_search`` tool call (sets "a tool ran"); call 2 = a
+    grounded ``final``. The guard targets ONLY no-tool finals, so no nudge
+    happens and the final is accepted normally.
+    """
+    tool = FakeTool("policy_search", result=ToolResult(output="passage"))
+    registry = Registry()
+    registry.register(tool)
+    llm = FakeLLMClient(
+        replies=[
+            make_response(_tool_json("search", "policy_search", {"q": "x"})),
+            make_response(_final_json("Grounded answer [policy].")),
+        ]
+    )
+    loop = _make_loop(llm=llm, registry=registry, safety=_require_tool_safety())
+
+    events = await _collect(loop.run([ChatMessage(role="user", content="q")]))
+
+    # Exactly two calls — no forced reconsideration was inserted.
+    assert len(llm.calls) == 2
+    final_events = [e for e in events if isinstance(e, FinalEvent)]
+    assert len(final_events) == 1
+    assert final_events[0].text == "Grounded answer [policy]."
+    # The reminder text never appears (guard did not fire).
+    reminder = _require_tool_safety().tool_required_reminder
+    assert not any(
+        message.role == "user" and message.content == reminder
+        for call in llm.calls
+        for message in call.messages
+    )
+
+
+async def test_require_tool_resets_per_run_across_reused_loop() -> None:
+    """INVARIANT: ``tool_invoked_this_run`` resets each ``run()`` on a reused loop.
+
+    Drives the SAME ``AgentLoop`` instance for TWO turns:
+
+    * Turn 1 = a ``policy_search`` tool call then a grounded ``final`` —
+      accepted (a tool ran this run), NO nudge.
+    * Turn 2 = a no-tool ``final`` — it MUST STILL be nudged, proving turn 2
+      did not inherit turn 1's "a tool ran" state.
+
+    Locks the core per-run scoping against a future refactor that lifts the
+    flag to instance state (which would wrongly exempt turn 2). The scripted
+    ``FakeLLMClient`` consumes its replies sequentially ACROSS both ``run()``
+    calls, so the reply order is: [t1 tool, t1 final, t2 nudged final, t2
+    re-confirmed final].
+    """
+    tool = FakeTool("policy_search", result=ToolResult(output="passage"))
+    registry = Registry()
+    registry.register(tool)
+    llm = FakeLLMClient(
+        replies=[
+            # Turn 1: search → grounded final (accepted, no nudge).
+            make_response(_tool_json("search", "policy_search", {"q": "leave"})),
+            make_response(_final_json("Turn 1 grounded [leave-policy].")),
+            # Turn 2: no-tool final → nudged → re-confirmed → accepted.
+            make_response(_final_json("Turn 2 ungrounded answer")),
+            make_response(_final_json("Turn 2 ungrounded answer")),
+        ]
+    )
+    loop = _make_loop(llm=llm, registry=registry, safety=_require_tool_safety())
+    reminder = _require_tool_safety().tool_required_reminder
+
+    # ----- Turn 1: a tool ran, so the final is accepted WITHOUT a nudge. -----
+    turn1 = await _collect(loop.run([ChatMessage(role="user", content="leave days?")]))
+    assert len(llm.calls) == 2  # tool call + grounded final, no force
+    t1_finals = [e for e in turn1 if isinstance(e, FinalEvent)]
+    assert len(t1_finals) == 1
+    assert t1_finals[0].text == "Turn 1 grounded [leave-policy]."
+    # No reminder was injected on turn 1 (a tool ran).
+    assert not any(
+        m.role == "user" and m.content == reminder for call in llm.calls for m in call.messages
+    )
+
+    # ----- Turn 2: SAME loop, no tool — the guard MUST still fire. -----
+    turn2 = await _collect(loop.run([ChatMessage(role="user", content="hi")]))
+    # Two MORE calls on turn 2 (nudged final + re-confirmed), total 4.
+    assert len(llm.calls) == 4
+    t2_finals = [e for e in turn2 if isinstance(e, FinalEvent)]
+    assert len(t2_finals) == 1
+    assert t2_finals[0].text == "Turn 2 ungrounded answer"
+    assert not any(isinstance(e, ActionEvent) for e in turn2)
+    # The reminder WAS injected on turn 2 — turn 2 did NOT inherit turn 1's
+    # "a tool ran" state. This is the invariant under test.
+    assert any(m.role == "user" and m.content == reminder for m in llm.calls[3].messages), (
+        "turn 2 must be nudged: tool_invoked_this_run must reset per run()"
+    )
+
+
+async def test_require_tool_coexists_with_parser_retry() -> None:
+    """REGRESSION: the BR-036 force and the BR-018 parser-retry fire independently.
+
+    Guard ON. Call 1 = prose drift (triggers the per-iteration parser
+    retry); call 2 = a no-tool ``final`` (triggers the per-run force);
+    call 3 = a ``policy_search`` tool call; call 4 = a grounded ``final``.
+    Both mechanisms fire once each and the run reaches the grounded answer.
+    """
+    tool = FakeTool("policy_search", result=ToolResult(output="passage"))
+    registry = Registry()
+    registry.register(tool)
+    llm = FakeLLMClient(
+        replies=[
+            make_response("prose drift, not json"),  # parser retry
+            make_response(_final_json("ungrounded answer")),  # force-reconsider
+            make_response(_tool_json("search", "policy_search", {"q": "x"})),  # forced search
+            make_response(_final_json("Grounded answer [policy].")),  # grounded final
+        ]
+    )
+    loop = _make_loop(llm=llm, registry=registry, safety=_require_tool_safety())
+
+    events = await _collect(loop.run([ChatMessage(role="user", content="q")]))
+
+    # No ErrorEvent — the parser retry absorbed the drift.
+    assert not any(isinstance(e, ErrorEvent) for e in events)
+    # All four calls consumed: drift + ungrounded + search + grounded.
+    assert len(llm.calls) == 4
+    action_events = [e for e in events if isinstance(e, ActionEvent)]
+    assert len(action_events) == 1
+    assert action_events[0].tool_name == "policy_search"
+    final_events = [e for e in events if isinstance(e, FinalEvent)]
+    assert len(final_events) == 1
+    assert final_events[0].text == "Grounded answer [policy]."
+
+
+# ---------------------------------------------------------------------------
 # LLM error
 # ---------------------------------------------------------------------------
 

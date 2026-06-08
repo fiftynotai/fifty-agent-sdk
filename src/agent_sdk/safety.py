@@ -26,6 +26,26 @@ Parser-error retry (BR-018)
     :attr:`SafetyConfig.parser_retry_enabled` ``= False`` — useful for
     callers that prefer fast-fail semantics or for golden-path tests that
     want the original terminal-ParserError behavior.
+
+Require-tool-before-final force-reconsider (BR-036)
+    When :attr:`SafetyConfig.require_tool_before_final` is ``True`` (it is
+    ``False`` by default, so every existing agent and test is unaffected),
+    the loop refuses to accept the FIRST ``final`` answer of a run if NO
+    tool has been invoked yet on that run. Instead — mirroring the BR-018
+    parser-retry mechanism exactly — it echoes the model's completion back
+    as an ``assistant`` turn, injects :attr:`tool_required_reminder` as a
+    ``user`` turn, and re-prompts ONCE. The force is strictly one-shot per
+    ``run()`` (a per-run budget, analogous to the parser-retry per-iteration
+    budget): after the single forced reconsideration the loop accepts the
+    next ``final`` regardless. The reminder is intentionally PERMISSIVE — it
+    asks the model to call a tool only if the task needs one, and to simply
+    re-answer otherwise — so a genuine greeting or capability question is
+    never coerced into a tool call, it just costs one extra round-trip. The
+    "tool ran this run" signal is per-``run()`` (one conversational turn), so
+    a multi-turn session that searched on a PRIOR turn does NOT exempt the
+    current turn. This is OFF by default to keep the loop domain-generic; the
+    policy-specific reminder text and any hard grounding guarantee live in
+    the consuming application, not here.
 """
 
 from __future__ import annotations
@@ -63,6 +83,22 @@ class SafetyConfig(BaseModel):
         parser_retry_reminder: ``user``-role message body injected on the
             retry to remind the model of the JSON envelope schema. Must
             be non-empty.
+        require_tool_before_final: BR-036 opt-in force-reconsider knob.
+            When ``True``, the loop refuses to accept the FIRST ``final``
+            answer of a run if no tool has been invoked yet that run,
+            injecting :attr:`tool_required_reminder` and re-prompting ONCE
+            (one-shot per run). ``False`` by default — the whole guard
+            branch is skipped unless a consumer opts in, so existing agents
+            and tests see byte-for-byte unchanged behavior.
+        tool_required_reminder: ``user``-role message body injected on the
+            one-shot force-reconsider when
+            :attr:`require_tool_before_final` fires. Must be non-empty. The
+            default is domain-neutral; consumers that need a domain-specific
+            prompt (e.g. "call policy_search first") override it. The text
+            should be PERMISSIVE — it must allow the model to simply
+            re-answer when no tool is actually needed (greetings, capability
+            questions), or the guard would wrongly coerce those into tool
+            calls.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -81,6 +117,15 @@ class SafetyConfig(BaseModel):
             "the system prompt. Output ONLY the JSON object — no prose, no Markdown, "
             "no code fences. If the answer is a list or explanation, put it as a "
             'string inside the `answer` field with action="final".'
+        ),
+        min_length=1,
+    )
+    require_tool_before_final: bool = Field(default=False)
+    tool_required_reminder: str = Field(
+        default=(
+            "You produced a final answer without calling any tool. If this task "
+            "requires a tool, call it first; if it does not, reply again with your "
+            "final answer."
         ),
         min_length=1,
     )

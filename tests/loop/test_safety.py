@@ -65,3 +65,31 @@ def test_safety_config_extra_field_forbidden() -> None:
 def test_safety_config_custom_fallback_message() -> None:
     cfg = SafetyConfig(fallback_message="hit the cap")
     assert cfg.fallback_message == "hit the cap"
+
+
+# ---------------------------------------------------------------------------
+# Require-tool-before-final (BR-036)
+# ---------------------------------------------------------------------------
+
+
+def test_safety_config_require_tool_defaults_false() -> None:
+    """The BR-036 knob is OFF by default — backward-compat for every consumer."""
+    cfg = SafetyConfig()
+    assert cfg.require_tool_before_final is False
+    # A sensible non-empty generic default reminder is present.
+    assert isinstance(cfg.tool_required_reminder, str)
+    assert cfg.tool_required_reminder
+
+
+def test_safety_config_require_tool_custom_round_trips() -> None:
+    cfg = SafetyConfig(
+        require_tool_before_final=True,
+        tool_required_reminder="call a tool first",
+    )
+    assert cfg.require_tool_before_final is True
+    assert cfg.tool_required_reminder == "call a tool first"
+
+
+def test_safety_config_require_tool_empty_reminder_rejected() -> None:
+    with pytest.raises(ValidationError):
+        SafetyConfig(tool_required_reminder="")
