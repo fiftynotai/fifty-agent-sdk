@@ -1,225 +1,249 @@
-"""Strict-mock MCP server fixture for the protocol-only client tests.
+"""Test harnesses for :class:`agent_sdk.mcp.client.MCPClient`.
 
-The fixture implements the L-356 mock-looseness mitigation: every observed
-HTTP request is validated as a JSON-RPC 2.0 envelope (``jsonrpc == "2.0"``,
-str ``id``, str ``method``, optional ``params`` object), POSTed to the
-configured server URL with ``Content-Type: application/json``. Unknown
-JSON-RPC methods are rejected with ``error.code == -32601`` (Method not
-found) — they MUST NOT silently return 200/empty so tests cannot
-accidentally certify a client that drifted from the spec.
+The client now wraps the official ``mcp`` SDK's :class:`mcp.ClientSession`,
+so the protocol wire / JSON-RPC envelope is owned by ``mcp`` and is validated
+by the in-memory **official-client oracle** rather than a hand-rolled
+strict-JSON-RPC mock. This module ships two complementary harnesses:
 
-Test-side wiring
-    Each test gets a fresh :class:`MockMCPServer`. ``register_tool(name,
-    handler_fn)`` registers a per-tool ``tools/call`` handler;
-    ``set_tool_catalog(defs)`` configures the ``tools/list`` payload.
+1. :class:`InMemorySessionTransport` + :func:`make_compat_client` — drive our
+   ``MCPClient`` mapping/unwrap code through a REAL official
+   :class:`mcp.ClientSession` connected to a :class:`FastMCP` server via
+   :func:`mcp.shared.memory.create_connected_server_and_client_session`. This
+   is the compatibility oracle (learning #760 pt6): the official client/server
+   pair certifies handshake + envelope; our wrapper is NOT its own oracle.
 
-Captured envelopes
-    Every successfully-routed request envelope is appended to
-    :attr:`MockMCPServer.observed_envelopes` so individual tests can
-    assert on exact method names, params shapes, and id values.
+2. A thin httpx-level mock (``httpx.MockTransport``) used ONLY for the
+   transport-error + redaction paths (connect error / timeout / HTTP status).
+   These flow through the real ``streamable_http_client`` over an injected
+   ``httpx.AsyncClient``, so the failure surfaces exactly as production would
+   (an anyio ``ExceptionGroup`` wrapping the httpx exception). The mock
+   asserts request shape (L-356): every request must POST to the canonical
+   URL — it is not a permissive blob.
 """
 
 from __future__ import annotations
 
-import json
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager
 from typing import Any
 
 import httpx
 import pytest
+from mcp import ClientSession
+from mcp.server.fastmcp import FastMCP
+from mcp.shared.memory import create_connected_server_and_client_session
+from mcp.types import CallToolResult, ListToolsResult, TextContent, Tool
+
+from agent_sdk.mcp import MCPClient, MCPClientConfig
 
 MCP_URL = "https://mcp.test.local/mcp"
-"""Single canonical URL the strict mock serves. Any other path is rejected."""
+"""Single canonical URL the thin transport-error mock serves."""
 
 ToolHandler = Callable[[dict[str, Any]], Any]
-"""``params.arguments`` -> the ``content`` of a ``tools/call`` result.
-
-Handlers MAY also return a full dict including ``isError`` to exercise the
-error-path branch of :meth:`agent_sdk.mcp.client.MCPClient.invoke`.
-"""
+"""``arguments`` -> a value placed into ``structuredContent`` of a result."""
 
 
-class MockMCPServer:
-    """In-process MCP server registered with :class:`httpx.MockTransport`.
+# ---------------------------------------------------------------------------
+# In-memory official-client oracle harness
+# ---------------------------------------------------------------------------
 
-    Wires a single endpoint at :data:`MCP_URL` that dispatches JSON-RPC
-    requests by ``method`` field. Asserts envelope shape on every call.
+
+class InMemorySessionTransport:
+    """A test-only :class:`agent_sdk.mcp.transport.Transport`.
+
+    Yields a pre-built, already-``initialize()``d official
+    :class:`mcp.ClientSession` (the one created by
+    :func:`create_connected_server_and_client_session`). It satisfies the
+    ``Transport`` protocol structurally so the SAME ``MCPClient`` mapping and
+    unwrap code runs against a real official client/server pair.
     """
+
+    def __init__(self, session: ClientSession) -> None:
+        self._session = session
+
+    @asynccontextmanager
+    async def connect(self) -> AsyncIterator[ClientSession]:
+        yield self._session
+
+
+@asynccontextmanager
+async def make_compat_client(
+    server: FastMCP,
+    *,
+    auth: Any = None,
+) -> AsyncIterator[MCPClient]:
+    """Connect a real official session to ``server`` and wire an ``MCPClient``.
+
+    The returned client's ``_build_transport`` is replaced with one that
+    yields the in-memory official session, so ``discover``/``invoke`` exercise
+    the production mapping/unwrap path against the official client/server pair.
+    """
+    config = MCPClientConfig(base_url=MCP_URL)
+    async with create_connected_server_and_client_session(server) as session:
+        await session.initialize()
+        client = MCPClient(config, auth=auth)
+        transport = InMemorySessionTransport(session)
+
+        def _build_transport(headers: Any) -> InMemorySessionTransport:
+            # discover()/invoke() resolve auth (once) BEFORE calling this, so
+            # the misbehaved-callable fail-fast already happened upstream; this
+            # override just yields the in-memory official session.
+            return transport
+
+        client._build_transport = _build_transport  # type: ignore[method-assign]
+        yield client
+
+
+# ---------------------------------------------------------------------------
+# Controllable in-memory server for the MCPProvider consumer regression
+# ---------------------------------------------------------------------------
+#
+# The MCPProvider tests need a MUTABLE catalog (refresh re-discovers a changed
+# catalog) and per-tool handlers — FastMCP declares its tools at build time, so
+# instead we feed a programmable "server" through the REAL MCPClient mapping and
+# unwrap code via a fake session that returns genuine mcp.types objects. This
+# keeps MCPProvider exercising the production MCPClient.discover()/invoke()
+# contract while letting tests mutate the advertised tools mid-test.
+
+
+class ControllableServer:
+    """A mutable tool catalog + handlers, surfaced as ``mcp.types`` results."""
 
     def __init__(self) -> None:
         self._catalog: list[dict[str, Any]] = []
-        self._tool_handlers: dict[str, ToolHandler] = {}
-        self.observed_envelopes: list[dict[str, Any]] = []
-        self.observed_headers: list[httpx.Headers] = []
-        # Optional override: when set, the next request returns this raw
-        # body verbatim regardless of method (used by malformed-envelope
-        # tests like envelope-version mismatch or id mismatch).
-        self.raw_body_override: bytes | None = None
-        self.raw_status_override: int = 200
-
-    # ------------------------------------------------------------------
-    # Test-facing helpers
-    # ------------------------------------------------------------------
+        self._handlers: dict[str, ToolHandler] = {}
+        self.list_calls: int = 0
 
     def set_tool_catalog(self, defs: list[dict[str, Any]]) -> None:
-        """Configure the response payload for ``tools/list``."""
         self._catalog = list(defs)
 
     def register_tool(self, name: str, handler: ToolHandler) -> None:
-        """Register a per-tool ``tools/call`` handler."""
-        self._tool_handlers[name] = handler
+        self._handlers[name] = handler
 
-    def force_next_raw(self, body: bytes, *, status: int = 200) -> None:
-        """Force the next request to return the given raw body.
+    def list_tools_result(self) -> ListToolsResult:
+        self.list_calls += 1
+        tools = [
+            Tool(
+                name=d["name"],
+                description=d.get("description", ""),
+                inputSchema=d.get(
+                    "inputSchema", {"type": "object", "properties": {}, "required": []}
+                ),
+            )
+            for d in self._catalog
+        ]
+        return ListToolsResult(tools=tools)
 
-        Used to exercise malformed-envelope handling — the body bypasses
-        the dispatcher entirely.
-        """
-        self.raw_body_override = body
-        self.raw_status_override = status
+    def call_tool_result(self, name: str, arguments: dict[str, Any]) -> CallToolResult:
+        handler = self._handlers.get(name)
+        if handler is None:
+            # Unknown/unregistered tool -> isError (carries tool_name via the
+            # MCPClient unwrap), mirroring the old strict mock's -32602 intent
+            # at the MCPError-contract boundary the provider tests assert on.
+            return CallToolResult(
+                content=[TextContent(type="text", text=f"unknown tool {name!r}")],
+                isError=True,
+            )
+        payload = handler(arguments)
+        return CallToolResult(
+            content=[TextContent(type="text", text="ok")],
+            structuredContent=payload if isinstance(payload, dict) else {"result": payload},
+            isError=False,
+        )
 
-    # ------------------------------------------------------------------
-    # Transport handler
-    # ------------------------------------------------------------------
+
+class _ControllableSession:
+    """Minimal session satisfying the calls MCPClient makes on a session."""
+
+    def __init__(self, server: ControllableServer) -> None:
+        self._server = server
+
+    async def list_tools(self) -> ListToolsResult:
+        return self._server.list_tools_result()
+
+    async def call_tool(self, name: str, arguments: dict[str, Any] | None = None) -> CallToolResult:
+        return self._server.call_tool_result(name, arguments or {})
+
+
+class _ControllableTransport:
+    """Yields a :class:`_ControllableSession` — satisfies the Transport seam."""
+
+    def __init__(self, server: ControllableServer) -> None:
+        self._server = server
+
+    @asynccontextmanager
+    async def connect(self) -> AsyncIterator[Any]:
+        yield _ControllableSession(self._server)
+
+
+def make_controllable_client(server: ControllableServer) -> MCPClient:
+    """Wire an ``MCPClient`` whose transport is driven by ``server``.
+
+    The returned client runs the production mapping/unwrap/error-translation
+    code, but its catalog/handlers are programmable and mutable mid-test.
+    """
+    client = MCPClient(MCPClientConfig(base_url=MCP_URL))
+    transport = _ControllableTransport(server)
+
+    def _build_transport(headers: Any) -> _ControllableTransport:
+        return transport
+
+    client._build_transport = _build_transport  # type: ignore[method-assign]
+    return client
+
+
+@pytest.fixture
+def controllable_server() -> ControllableServer:
+    """A fresh mutable controllable server per test."""
+    return ControllableServer()
+
+
+# ---------------------------------------------------------------------------
+# Thin httpx-level transport-error mock (L-356: asserts request shape)
+# ---------------------------------------------------------------------------
+
+
+class StrictTransportMock:
+    """Records and shape-asserts every httpx request before delegating.
+
+    Used only by the transport-error / redaction tests. It is NOT a permissive
+    blob: every request must be a POST to :data:`MCP_URL`. The wrapped handler
+    decides the actual response/exception (connect error, timeout, HTTP
+    status). The point is to fail loudly if the wrapper ever stops POSTing to
+    the configured endpoint.
+    """
+
+    def __init__(self, handler: Callable[[httpx.Request], httpx.Response]) -> None:
+        self._handler = handler
+        self.observed_requests: list[httpx.Request] = []
 
     def handle(self, request: httpx.Request) -> httpx.Response:
-        """Dispatch one request, asserting envelope shape on the way in."""
-        # Path strictness — reject anything that didn't hit the canonical URL.
-        if str(request.url) != MCP_URL:
-            raise AssertionError(
-                f"MockMCPServer received unexpected URL: {request.url!r} (expected {MCP_URL!r})"
-            )
-        if request.method != "POST":
-            raise AssertionError(f"MockMCPServer received non-POST method: {request.method!r}")
-        content_type = request.headers.get("content-type")
-        if content_type is None or "application/json" not in content_type:
-            raise AssertionError(
-                f"MockMCPServer expected Content-Type: application/json; got {content_type!r}"
-            )
-
-        body = request.read()
-        # Raw body override path (malformed-envelope tests).
-        if self.raw_body_override is not None:
-            override = self.raw_body_override
-            status = self.raw_status_override
-            self.raw_body_override = None
-            self.raw_status_override = 200
-            return httpx.Response(status, content=override)
-
-        try:
-            envelope = json.loads(body)
-        except ValueError as exc:
-            raise AssertionError(f"MockMCPServer expected valid JSON body; got {body!r}") from exc
-
-        # JSON-RPC 2.0 envelope shape — the heart of the L-356 mitigation.
-        if not isinstance(envelope, dict):
-            raise AssertionError(
-                f"JSON-RPC envelope must be a JSON object; got {type(envelope).__name__}"
-            )
-        if envelope.get("jsonrpc") != "2.0":
-            raise AssertionError(
-                f"JSON-RPC envelope missing jsonrpc=2.0; got {envelope.get('jsonrpc')!r}"
-            )
-        req_id = envelope.get("id")
-        if not isinstance(req_id, str) or not req_id:
-            raise AssertionError(f"JSON-RPC envelope missing string id; got {req_id!r}")
-        method = envelope.get("method")
-        if not isinstance(method, str) or not method:
-            raise AssertionError(f"JSON-RPC envelope missing string method; got {method!r}")
-        if "params" in envelope and not isinstance(envelope["params"], dict):
-            raise AssertionError(
-                f"JSON-RPC envelope params must be an object; got "
-                f"{type(envelope['params']).__name__}"
-            )
-
-        self.observed_envelopes.append(envelope)
-        self.observed_headers.append(httpx.Headers(request.headers))
-
-        # Dispatch by method.
-        params = envelope.get("params") or {}
-        if method == "tools/list":
-            return self._respond_result(req_id, {"tools": self._catalog})
-        if method == "tools/call":
-            return self._handle_tools_call(req_id, params)
-        # Unknown method — REJECT with -32601 per JSON-RPC 2.0 spec.
-        return self._respond_error(
-            req_id,
-            code=-32601,
-            message=f"Method not found: {method}",
+        assert request.method == "POST", (
+            f"StrictTransportMock expected POST; got {request.method!r}"
         )
-
-    # ------------------------------------------------------------------
-    # Internals
-    # ------------------------------------------------------------------
-
-    def _handle_tools_call(self, req_id: str, params: dict[str, Any]) -> httpx.Response:
-        name = params.get("name")
-        if not isinstance(name, str) or not name:
-            return self._respond_error(req_id, code=-32602, message="tools/call: name required")
-        if "arguments" not in params or not isinstance(params["arguments"], dict):
-            return self._respond_error(
-                req_id,
-                code=-32602,
-                message="tools/call: arguments object required",
-            )
-        handler = self._tool_handlers.get(name)
-        if handler is None:
-            return self._respond_error(
-                req_id,
-                code=-32602,
-                message=f"tools/call: unknown tool {name!r}",
-            )
-        payload = handler(params["arguments"])
-        # If the handler returns a dict that already looks like a
-        # ``tools/call`` result envelope (carries ``isError`` or
-        # ``content``), pass it through; otherwise wrap it as content.
-        if isinstance(payload, dict) and ("isError" in payload or "content" in payload):
-            return self._respond_result(req_id, payload)
-        return self._respond_result(req_id, {"content": payload})
-
-    @staticmethod
-    def _respond_result(req_id: str, result: Any) -> httpx.Response:
-        return httpx.Response(
-            200,
-            json={"jsonrpc": "2.0", "id": req_id, "result": result},
+        assert str(request.url) == MCP_URL, (
+            f"StrictTransportMock expected URL {MCP_URL!r}; got {str(request.url)!r}"
         )
-
-    @staticmethod
-    def _respond_error(
-        req_id: str,
-        *,
-        code: int,
-        message: str,
-        data: Any = None,
-    ) -> httpx.Response:
-        error_obj: dict[str, Any] = {"code": code, "message": message}
-        if data is not None:
-            error_obj["data"] = data
-        return httpx.Response(
-            200,
-            json={"jsonrpc": "2.0", "id": req_id, "error": error_obj},
-        )
+        self.observed_requests.append(request)
+        return self._handler(request)
 
 
-@pytest.fixture
-def mcp_server() -> MockMCPServer:
-    """One :class:`MockMCPServer` per test, freshly constructed."""
-    return MockMCPServer()
+def make_strict_http_client(
+    handler: Callable[[httpx.Request], httpx.Response],
+) -> tuple[httpx.AsyncClient, StrictTransportMock]:
+    """Build an injectable httpx client whose transport asserts request shape.
 
-
-@pytest.fixture
-def mcp_transport(mcp_server: MockMCPServer) -> httpx.MockTransport:
-    """An :class:`httpx.MockTransport` wired to :attr:`mcp_server.handle`."""
-    return httpx.MockTransport(mcp_server.handle)
-
-
-@pytest.fixture
-def mcp_http_client(
-    mcp_transport: httpx.MockTransport,
-) -> httpx.AsyncClient:
-    """An :class:`httpx.AsyncClient` backed by the strict mock transport.
-
-    Suitable for direct injection into :class:`agent_sdk.mcp.MCPClient`'s
-    ``client`` constructor argument.
+    Returns the client and the :class:`StrictTransportMock` so a test can
+    inspect ``observed_requests``.
     """
-    return httpx.AsyncClient(transport=mcp_transport)
+    mock = StrictTransportMock(handler)
+    client = httpx.AsyncClient(transport=httpx.MockTransport(mock.handle))
+    return client, mock
+
+
+@pytest.fixture
+def fastmcp_server() -> FastMCP:
+    """A fresh FastMCP test server with sanitised tools per test."""
+    from ._fastmcp_server import build_test_server
+
+    return build_test_server()

@@ -57,18 +57,26 @@ class LLMError(AgentSdkError):
 class MCPError(AgentSdkError):
     """MCP transport, protocol, or tool-call failure.
 
-    Raised by :class:`agent_sdk.mcp.client.MCPClient` for:
+    Raised by :class:`agent_sdk.mcp.client.MCPClient`, which wraps the
+    official ``mcp`` SDK's :class:`mcp.ClientSession`, for:
 
-    - Transport failures (connection refused, timeout, non-2xx HTTP)
-    - Malformed JSON-RPC envelopes (missing ``jsonrpc``/``id``, bad ``result``)
-    - Server-returned JSON-RPC ``error`` payloads (``error.code``,
-      ``error.message``)
-    - Argument validation errors surfaced by the remote tool
+    - Transport failures (connection refused, timeout, non-2xx HTTP) — the
+      underlying ``httpx`` exception is unwrapped from the ``mcp`` transport's
+      anyio ``ExceptionGroup`` and translated here.
+    - Protocol/handshake failures and server-returned JSON-RPC errors
+      surfaced by the SDK as :class:`mcp.shared.exceptions.McpError`
+      (``error.code``/``error.data``).
+    - A ``tools/call`` result carrying ``isError=True``.
+
+    The wrapping guarantees the uniform-MCPError contract (TD-007): neither
+    ``mcp``'s ``McpError`` nor any ``httpx`` exception leaks from
+    :meth:`agent_sdk.mcp.client.MCPClient.discover`/``invoke``.
 
     ``context`` typically carries ``server_url``, ``method``, ``tool_name``,
-    ``error_code``, ``status_code``, or ``wrapped`` (the underlying httpx
-    exception class name). It NEVER includes auth headers — they are stripped
-    before recording (see :class:`agent_sdk.mcp.client.MCPClient`).
+    ``error_code``, ``error_data``, ``status_code``, ``content``,
+    ``operation``, or ``wrapped`` (the underlying httpx exception class name).
+    It NEVER includes auth headers — auth lives on the httpx client and is
+    stripped before recording (see :class:`agent_sdk.mcp.client.MCPClient`).
 
     Because :class:`MCPError` is an :class:`AgentSdkError`, the tool
     :class:`agent_sdk.tools.registry.Registry` re-raises it untouched rather

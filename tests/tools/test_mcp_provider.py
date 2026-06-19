@@ -1,10 +1,16 @@
 """Tests for :class:`agent_sdk.tools.mcp_provider.MCPProvider`.
 
-These tests pair each scenario from the BR-008 plan §9 with the strict-mock
-MCP server defined in :mod:`tests.mcp.conftest`. The provider tests live in
-``tests/tools/`` rather than ``tests/mcp/`` so they sit alongside the rest
-of the tool-layer suite — they exercise the bridge between protocol and
-registry, not the protocol itself.
+These tests pair each scenario from the BR-008 plan §9 with a controllable
+in-memory MCP server (:class:`tests.mcp.conftest.ControllableServer`) driven
+through the REAL :class:`agent_sdk.mcp.client.MCPClient` mapping/unwrap code.
+The provider tests live in ``tests/tools/`` rather than ``tests/mcp/`` so they
+sit alongside the rest of the tool-layer suite — they exercise the bridge
+between protocol and registry, not the protocol itself.
+
+This file is the primary "vendored consumers unaffected" regression for
+BR-042: it asserts the ``MCPProvider`` behavior is byte-for-byte stable across
+the swap to the official ``mcp`` SDK. Only the client-construction helper was
+rewired to the new harness; no ``MCPProvider`` assertion changed.
 """
 
 from __future__ import annotations
@@ -13,12 +19,10 @@ import asyncio
 import inspect
 from typing import Any
 
-import httpx
 import pytest
 import structlog
 
 from agent_sdk.errors import MCPError
-from agent_sdk.mcp import MCPClient, MCPClientConfig
 from agent_sdk.tools.mcp_provider import (
     MCPProvider,
     RefreshSummary,
@@ -26,20 +30,7 @@ from agent_sdk.tools.mcp_provider import (
 )
 from agent_sdk.tools.protocol import ToolResult, ToolSchema
 from agent_sdk.tools.registry import Registry
-from tests.mcp.conftest import MCP_URL, MockMCPServer
-
-
-def _config() -> MCPClientConfig:
-    return MCPClientConfig(
-        base_url=MCP_URL,
-        connect_timeout_seconds=1.0,
-        read_timeout_seconds=1.0,
-    )
-
-
-def _make_client(transport_handler: Any) -> MCPClient:
-    http_client = httpx.AsyncClient(transport=httpx.MockTransport(transport_handler))
-    return MCPClient(_config(), client=http_client)
+from tests.mcp.conftest import ControllableServer, make_controllable_client
 
 
 def _tool_def(name: str, *, schema: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -58,10 +49,12 @@ def _tool_def(name: str, *, schema: dict[str, Any] | None = None) -> dict[str, A
 
 
 async def test_attach_registers_one_adapter_per_tool(
-    mcp_server: MockMCPServer,
+    controllable_server: ControllableServer,
 ) -> None:
-    mcp_server.set_tool_catalog([_tool_def("alpha"), _tool_def("beta"), _tool_def("gamma")])
-    client = _make_client(mcp_server.handle)
+    controllable_server.set_tool_catalog(
+        [_tool_def("alpha"), _tool_def("beta"), _tool_def("gamma")]
+    )
+    client = make_controllable_client(controllable_server)
     provider = MCPProvider(client)
     registry = Registry()
     await provider.attach(registry)
@@ -118,11 +111,11 @@ def test_schema_translation_falls_back_for_non_object_top_level() -> None:
 
 
 async def test_adapter_invoke_returns_tool_result_on_success(
-    mcp_server: MockMCPServer,
+    controllable_server: ControllableServer,
 ) -> None:
-    mcp_server.set_tool_catalog([_tool_def("answer")])
-    mcp_server.register_tool("answer", lambda _args: {"answer": 42})
-    client = _make_client(mcp_server.handle)
+    controllable_server.set_tool_catalog([_tool_def("answer")])
+    controllable_server.register_tool("answer", lambda _args: {"answer": 42})
+    client = make_controllable_client(controllable_server)
     provider = MCPProvider(client)
     registry = Registry()
     await provider.attach(registry)
@@ -134,11 +127,11 @@ async def test_adapter_invoke_returns_tool_result_on_success(
 
 
 async def test_adapter_propagates_mcp_error_unwrapped(
-    mcp_server: MockMCPServer,
+    controllable_server: ControllableServer,
 ) -> None:
-    # No handler registered -> dispatcher returns -32602.
-    mcp_server.set_tool_catalog([_tool_def("missing")])
-    client = _make_client(mcp_server.handle)
+    # No handler registered -> isError result -> MCPError with tool_name.
+    controllable_server.set_tool_catalog([_tool_def("missing")])
+    client = make_controllable_client(controllable_server)
     provider = MCPProvider(client)
     registry = Registry()
     await provider.attach(registry)
@@ -149,11 +142,11 @@ async def test_adapter_propagates_mcp_error_unwrapped(
 
 
 async def test_registry_invoke_propagates_mcp_error(
-    mcp_server: MockMCPServer,
+    controllable_server: ControllableServer,
 ) -> None:
     """Registry.invoke() re-raises AgentSdkError subclasses untouched."""
-    mcp_server.set_tool_catalog([_tool_def("missing")])
-    client = _make_client(mcp_server.handle)
+    controllable_server.set_tool_catalog([_tool_def("missing")])
+    client = make_controllable_client(controllable_server)
     provider = MCPProvider(client)
     registry = Registry()
     await provider.attach(registry)
@@ -167,17 +160,17 @@ async def test_registry_invoke_propagates_mcp_error(
 
 
 async def test_refresh_adds_new_tools_without_removing_existing(
-    mcp_server: MockMCPServer,
+    controllable_server: ControllableServer,
 ) -> None:
-    mcp_server.set_tool_catalog([_tool_def("A"), _tool_def("B")])
-    client = _make_client(mcp_server.handle)
+    controllable_server.set_tool_catalog([_tool_def("A"), _tool_def("B")])
+    client = make_controllable_client(controllable_server)
     provider = MCPProvider(client)
     registry = Registry()
     await provider.attach(registry)
     assert sorted(t.name for t in registry.list()) == ["A", "B"]
 
     # Catalog mutates: A disappears, C arrives.
-    mcp_server.set_tool_catalog([_tool_def("B"), _tool_def("C")])
+    controllable_server.set_tool_catalog([_tool_def("B"), _tool_def("C")])
     summary = await provider.refresh()
 
     names = sorted(t.name for t in registry.list())
@@ -188,10 +181,10 @@ async def test_refresh_adds_new_tools_without_removing_existing(
 
 
 async def test_refresh_updates_existing_tool_definition(
-    mcp_server: MockMCPServer,
+    controllable_server: ControllableServer,
 ) -> None:
     """Last-write-wins: schema changes propagate to the registry."""
-    mcp_server.set_tool_catalog(
+    controllable_server.set_tool_catalog(
         [
             _tool_def(
                 "A",
@@ -203,13 +196,13 @@ async def test_refresh_updates_existing_tool_definition(
             )
         ]
     )
-    client = _make_client(mcp_server.handle)
+    client = make_controllable_client(controllable_server)
     provider = MCPProvider(client)
     registry = Registry()
     await provider.attach(registry)
     assert "v1" in registry.get("A").schema.properties
 
-    mcp_server.set_tool_catalog(
+    controllable_server.set_tool_catalog(
         [
             _tool_def(
                 "A",
@@ -227,8 +220,10 @@ async def test_refresh_updates_existing_tool_definition(
     assert "v1" not in refreshed.schema.properties
 
 
-async def test_refresh_without_attach_raises_runtime_error() -> None:
-    client = _make_client(lambda req: httpx.Response(200, json={}))
+async def test_refresh_without_attach_raises_runtime_error(
+    controllable_server: ControllableServer,
+) -> None:
+    client = make_controllable_client(controllable_server)
     provider = MCPProvider(client)
     with pytest.raises(RuntimeError, match="prior attach"):
         await provider.refresh()
@@ -240,30 +235,28 @@ async def test_refresh_without_attach_raises_runtime_error() -> None:
 
 
 async def test_periodic_refresh_runs_and_can_be_cancelled(
-    mcp_server: MockMCPServer,
+    controllable_server: ControllableServer,
 ) -> None:
-    mcp_server.set_tool_catalog([_tool_def("A")])
-    client = _make_client(mcp_server.handle)
+    controllable_server.set_tool_catalog([_tool_def("A")])
+    client = make_controllable_client(controllable_server)
     provider = MCPProvider(client)
     registry = Registry()
     await provider.attach(registry)
-    initial_calls = len([e for e in mcp_server.observed_envelopes if e["method"] == "tools/list"])
-    assert initial_calls == 1
+    assert controllable_server.list_calls == 1
 
     await provider.start_periodic_refresh(interval_seconds=0.02)
     await asyncio.sleep(0.07)
     await provider.aclose()
 
-    discovers = [e for e in mcp_server.observed_envelopes if e["method"] == "tools/list"]
     # At least one periodic refresh fired (in addition to the attach one).
-    assert len(discovers) >= 2
+    assert controllable_server.list_calls >= 2
 
 
 async def test_periodic_refresh_double_start_raises(
-    mcp_server: MockMCPServer,
+    controllable_server: ControllableServer,
 ) -> None:
-    mcp_server.set_tool_catalog([])
-    client = _make_client(mcp_server.handle)
+    controllable_server.set_tool_catalog([])
+    client = make_controllable_client(controllable_server)
     provider = MCPProvider(client)
     registry = Registry()
     await provider.attach(registry)
@@ -276,38 +269,44 @@ async def test_periodic_refresh_double_start_raises(
 
 
 async def test_periodic_refresh_non_positive_interval_raises(
-    mcp_server: MockMCPServer,
+    controllable_server: ControllableServer,
 ) -> None:
-    client = _make_client(mcp_server.handle)
+    client = make_controllable_client(controllable_server)
     provider = MCPProvider(client)
     registry = Registry()
-    mcp_server.set_tool_catalog([])
+    controllable_server.set_tool_catalog([])
     await provider.attach(registry)
     with pytest.raises(ValueError, match="must be > 0"):
         await provider.start_periodic_refresh(interval_seconds=0)
 
 
-async def test_periodic_refresh_requires_prior_attach() -> None:
-    client = _make_client(lambda req: httpx.Response(200, json={}))
+async def test_periodic_refresh_requires_prior_attach(
+    controllable_server: ControllableServer,
+) -> None:
+    client = make_controllable_client(controllable_server)
     provider = MCPProvider(client)
     with pytest.raises(RuntimeError, match="prior attach"):
         await provider.start_periodic_refresh(interval_seconds=1.0)
 
 
 async def test_periodic_refresh_survives_transient_failure(
-    mcp_server: MockMCPServer,
+    controllable_server: ControllableServer,
 ) -> None:
     """A discover() failure inside the periodic loop must NOT terminate it."""
-    mcp_server.set_tool_catalog([_tool_def("A")])
+    controllable_server.set_tool_catalog([_tool_def("A")])
     state = {"fail_next": False}
 
-    def handler(request: httpx.Request) -> httpx.Response:
+    real_list = controllable_server.list_tools_result
+
+    def flaky_list() -> Any:
         if state["fail_next"]:
             state["fail_next"] = False
-            return httpx.Response(503)
-        return mcp_server.handle(request)
+            raise MCPError("transient", context={"server_url": "x"})
+        return real_list()
 
-    client = _make_client(handler)
+    controllable_server.list_tools_result = flaky_list  # type: ignore[method-assign]
+
+    client = make_controllable_client(controllable_server)
     provider = MCPProvider(client)
     registry = Registry()
     await provider.attach(registry)
@@ -334,23 +333,22 @@ def test_refresh_is_async() -> None:
 
 
 async def test_aclose_does_not_close_underlying_client(
-    mcp_server: MockMCPServer,
+    controllable_server: ControllableServer,
 ) -> None:
-    mcp_server.set_tool_catalog([])
-    http_client = httpx.AsyncClient(transport=httpx.MockTransport(mcp_server.handle))
-    client = MCPClient(_config(), client=http_client)
+    controllable_server.set_tool_catalog([])
+    client = make_controllable_client(controllable_server)
     provider = MCPProvider(client)
     registry = Registry()
     await provider.attach(registry)
     await provider.aclose()
-    # The MCPClient (and the underlying http_client) remain usable.
+    # The MCPClient remains usable (provider.aclose does not close it).
     await client.discover()
 
 
 async def test_aclose_is_idempotent_when_no_task_running(
-    mcp_server: MockMCPServer,
+    controllable_server: ControllableServer,
 ) -> None:
-    client = _make_client(mcp_server.handle)
+    client = make_controllable_client(controllable_server)
     provider = MCPProvider(client)
     await provider.aclose()  # no-op
     await provider.aclose()  # still safe
@@ -362,7 +360,7 @@ async def test_aclose_is_idempotent_when_no_task_running(
 
 
 async def test_attach_warns_on_name_collision(
-    mcp_server: MockMCPServer,
+    controllable_server: ControllableServer,
 ) -> None:
     """Pre-register a tool with the same name; provider must log a warning."""
 
@@ -377,8 +375,8 @@ async def test_attach_warns_on_name_collision(
     registry = Registry()
     registry.register(_LocalTool())  # type: ignore[arg-type]
 
-    mcp_server.set_tool_catalog([_tool_def("search")])
-    client = _make_client(mcp_server.handle)
+    controllable_server.set_tool_catalog([_tool_def("search")])
+    client = make_controllable_client(controllable_server)
     provider = MCPProvider(client)
     with structlog.testing.capture_logs() as logs:
         await provider.attach(registry)
@@ -393,11 +391,11 @@ async def test_attach_warns_on_name_collision(
 
 
 async def test_refresh_does_not_warn_for_first_time_tools(
-    mcp_server: MockMCPServer,
+    controllable_server: ControllableServer,
 ) -> None:
     """The collision warning fires ONLY for names already in the registry."""
-    mcp_server.set_tool_catalog([_tool_def("new")])
-    client = _make_client(mcp_server.handle)
+    controllable_server.set_tool_catalog([_tool_def("new")])
+    client = make_controllable_client(controllable_server)
     provider = MCPProvider(client)
     registry = Registry()
     with structlog.testing.capture_logs() as logs:

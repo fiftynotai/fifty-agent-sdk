@@ -1,66 +1,88 @@
-"""Protocol-only MCP client over JSON-RPC 2.0 / HTTP.
+"""MCP client wrapping the official :mod:`mcp` Python SDK.
 
-:class:`MCPClient` is a hand-rolled JSON-RPC 2.0 client implementing the
-``tools/list`` and ``tools/call`` methods from the Model Context Protocol
-specification. It depends only on :mod:`httpx` (already a hard dep of
-:mod:`agent_sdk`) — no ``mcp`` SDK, no ``fastmcp``.
+:class:`MCPClient` is a thin wrapper around the official ``mcp`` SDK's
+:class:`mcp.ClientSession` over Streamable HTTP. The JSON-RPC wire, envelope
+correlation, session-id handling, and protocol handshake are owned by
+``mcp`` (pinned ``mcp>=1.27.0,<2.0.0``); this module is responsible only for
+the agent-sdk-facing contract: typed :class:`MCPToolDef`s out of
+``tools/list``, the unwrapped tool payload out of ``tools/call``, the uniform
+:class:`agent_sdk.errors.MCPError` translation, and auth-header redaction.
+
+Transport
+    The protocol/transport machinery lives behind a
+    :class:`agent_sdk.mcp.transport.Transport`. The default
+    :class:`agent_sdk.mcp.transport.StreamableHttpTransport` establishes the
+    Streamable HTTP stream pair and yields an already-``initialize()``d
+    session. A future stdio transport implements the same seam without any
+    change to :class:`MCPClient` or its consumers.
+
+Session lifecycle — session-per-call
+    Each :meth:`discover`/:meth:`invoke` opens a fresh session
+    (``initialize`` → call → close). This preserves the original "no
+    persistent connection" mental model, keeps :meth:`aclose` trivial, and
+    lets callable ``auth`` resolve fresh per call (token rotation). A
+    lazy-persistent single-session optimization is a deferred follow-up.
 
 Authentication
     The constructor accepts an ``auth`` argument that is either a static
     ``Mapping[str, str]`` (e.g. ``{"Authorization": "Bearer ..."}``) or an
     async callable returning the same shape on each invocation. Callables
-    enable token rotation without re-creating the client. Auth header values
-    are NEVER logged and NEVER appear in :class:`agent_sdk.errors.MCPError`
-    context — header names registered through ``auth`` are tracked and
-    redacted via :func:`_redact_headers` before any header dict is captured
-    into an error.
+    enable token rotation without re-creating the client. In ``mcp 1.27.0``
+    the supported auth/header seam is the injected :class:`httpx.AsyncClient`
+    (transport-level ``headers=/auth=`` are deprecated and ignored), so
+    resolved auth headers are merged onto the httpx client inside the
+    transport. Auth header values are NEVER logged and NEVER appear in
+    :class:`agent_sdk.errors.MCPError` context — header names registered
+    through ``auth`` are tracked and redacted via :func:`_redact_headers`
+    before any header dict is ever captured.
 
 Retry policy
-    The client uses ``httpx``'s transport-level retry (connection retries
-    only) via ``httpx.AsyncHTTPTransport(retries=cfg.connect_retries)``.
-    Application-level retry on 5xx is out of scope; those responses become
-    :class:`MCPError` and the consumer decides how to react.
+    ``connect_retries`` is forwarded to the owned httpx transport
+    (``httpx.AsyncHTTPTransport(retries=...)``) as a connect-level retry.
+    When an external ``client`` is injected this is a documented no-op (the
+    injected client's transport governs). Application-level 5xx retry is out
+    of scope — those surface as :class:`MCPError`.
 
 Timeouts
-    ``connect_timeout_seconds`` and ``read_timeout_seconds`` map to
-    ``httpx.Timeout``'s ``connect``/``read``/``write``/``pool`` slots. A
-    timeout surfaces as :class:`MCPError` with
-    ``context["wrapped"] == "ReadTimeout"`` (or similar).
+    ``connect_timeout_seconds`` and ``read_timeout_seconds`` map to the owned
+    httpx :class:`httpx.Timeout` and the session ``read_timeout_seconds``. A
+    timeout surfaces as :class:`MCPError` with ``context["wrapped"]`` set to
+    the httpx timeout class name.
 
 Error contract
     Every public method either returns successfully or raises
-    :class:`MCPError`. No ``httpx`` exceptions leak; no envelope parsing
-    error leaks. The :class:`agent_sdk.tools.mcp_provider._MCPToolAdapter`
-    deliberately does NOT catch :class:`MCPError` so the
+    :class:`MCPError`. No ``mcp`` SDK exceptions (``McpError``) and no
+    ``httpx`` exceptions leak — they are unwrapped from anyio
+    ``ExceptionGroup``s and translated into :class:`MCPError`. The
+    :class:`agent_sdk.tools.mcp_provider._MCPToolAdapter` deliberately does
+    NOT catch :class:`MCPError` so the
     :class:`agent_sdk.tools.registry.Registry`'s ``AgentSdkError`` branch
     re-raises it untouched.
-
-Concurrency / id correlation
-    v1 issues one JSON-RPC request per ``httpx`` call and reads the response
-    synchronously; ids are scoped to that single round-trip. No pipelining,
-    no batching. A future concurrent-invoke layer would need an id→Future
-    map; the parse helper carries a TODO marker for that work.
 """
 
 from __future__ import annotations
 
-import uuid
 from collections.abc import Awaitable, Callable, Mapping
 from typing import Any, Final
 
 import httpx
 import structlog
+from mcp.shared.exceptions import McpError
+from mcp.types import CallToolResult, Tool
 from pydantic import BaseModel, ConfigDict, Field
 
 from agent_sdk.errors import MCPError
+from agent_sdk.mcp.transport import StreamableHttpTransport, Transport
 
 _log: Final = structlog.get_logger(__name__)
 """Module-level structured logger.
 
-DEBUG-level log lines include ``method``, request ``id``, and a duration in
+DEBUG-level log lines include ``method``, ``server_url``, and a duration in
 milliseconds. Headers are NEVER logged — the redaction contract is enforced
 by funnelling all header dicts through :func:`_redact_headers` before any
-log or :class:`MCPError` context capture.
+log or :class:`MCPError` context capture. The underlying ``mcp`` transport
+may log a session id at INFO; a session id is not a secret, but no auth
+material ever reaches those lines because auth lives on the httpx client.
 """
 
 _REDACTION_SENTINEL: Final[str] = "<redacted>"
@@ -116,21 +138,26 @@ class MCPClientConfig(BaseModel):
     """Connection configuration for :class:`MCPClient`.
 
     Attributes:
-        base_url: Full URL of the MCP server's JSON-RPC HTTP endpoint
+        base_url: Full URL of the MCP server's Streamable HTTP endpoint
             (e.g. ``"https://mcp.example.com/mcp"``). Used verbatim; the
             client does NOT append paths.
         connect_timeout_seconds: TCP connect timeout passed to
             :class:`httpx.Timeout`.
         read_timeout_seconds: Per-call read/write/pool timeout passed to
-            :class:`httpx.Timeout`. The ``Registry``'s ``tool_timeout``
-            wraps the whole adapter call (loop safety budget); this
-            httpx-level timeout is the inner budget and SHOULD be smaller
-            than the outer one.
-        connect_retries: Number of TCP connect retries (passed to
-            :class:`httpx.AsyncHTTPTransport`). Application-level 5xx
-            retry is out of scope — those responses surface as
+            :class:`httpx.Timeout` and the :class:`mcp.ClientSession`
+            read timeout. The ``Registry``'s ``tool_timeout`` wraps the whole
+            adapter call (loop safety budget); this httpx-level timeout is the
+            inner budget and SHOULD be smaller than the outer one.
+        connect_retries: Number of TCP connect retries for the owned
+            :class:`httpx.AsyncHTTPTransport`. A documented no-op when an
+            external ``client`` is injected (config-shape stability for
+            vendored construction sites — kept, not dropped). Application-level
+            5xx retry is out of scope; those responses surface as
             :class:`MCPError`.
-        user_agent: Value of the ``User-Agent`` request header.
+        user_agent: Value of the ``User-Agent`` request header set on the
+            owned httpx client. A documented no-op when an external ``client``
+            is injected (that client's headers win). Kept for config-shape
+            stability.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -143,114 +170,8 @@ class MCPClientConfig(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Internal envelope helpers
+# Internal redaction helper
 # ---------------------------------------------------------------------------
-
-
-def _make_request(method: str, params: dict[str, Any] | None) -> dict[str, Any]:
-    """Construct a JSON-RPC 2.0 request envelope with a fresh hex id.
-
-    ``params`` is omitted from the envelope when ``None`` (per spec).
-    """
-    envelope: dict[str, Any] = {
-        "jsonrpc": "2.0",
-        "id": uuid.uuid4().hex,
-        "method": method,
-    }
-    if params is not None:
-        envelope["params"] = params
-    return envelope
-
-
-def _parse_response(
-    envelope: dict[str, Any],
-    *,
-    expected_id: str,
-    method: str,
-    server_url: str,
-    tool_name: str | None = None,
-) -> Any:
-    """Validate a JSON-RPC 2.0 response envelope and return ``result``.
-
-    Args:
-        envelope: The decoded JSON body returned by the server.
-        expected_id: The id of the request we issued. The response id must
-            match.
-        method: The JSON-RPC method that was sent (echoed into MCPError
-            context on failure).
-        server_url: For MCPError context.
-        tool_name: Set on ``tools/call`` so MCPError context carries the
-            offending tool name.
-
-    Returns:
-        The unwrapped ``result`` value when the envelope is well-formed.
-
-    Raises:
-        MCPError: When the envelope is malformed (missing ``jsonrpc``,
-            wrong version, missing/mismatched ``id``, both ``result`` and
-            ``error`` present, neither present), or when the server
-            returned a JSON-RPC ``error`` object.
-
-    TODO(TD-MCP-NOTIFY): when push refresh is wired, an envelope without
-    ``id`` is a notification rather than an error — branch here on
-    ``"method" in envelope and "id" not in envelope``.
-    """
-    base_context: dict[str, Any] = {
-        "server_url": server_url,
-        "method": method,
-    }
-    if tool_name is not None:
-        base_context["tool_name"] = tool_name
-
-    if envelope.get("jsonrpc") != "2.0":
-        raise MCPError(
-            "MCP server returned non-2.0 jsonrpc envelope",
-            context={**base_context, "envelope_jsonrpc": envelope.get("jsonrpc")},
-        )
-    if "id" not in envelope:
-        raise MCPError(
-            "MCP response envelope missing 'id'",
-            context=base_context,
-        )
-    if envelope["id"] != expected_id:
-        raise MCPError(
-            "MCP response id does not match request id",
-            context={
-                **base_context,
-                "expected_id": expected_id,
-                "received_id": envelope["id"],
-            },
-        )
-    has_result = "result" in envelope
-    has_error = "error" in envelope
-    if has_result == has_error:
-        # Both present or neither — both invalid per spec.
-        raise MCPError(
-            "MCP response envelope must contain exactly one of 'result' or 'error'",
-            context={
-                **base_context,
-                "has_result": has_result,
-                "has_error": has_error,
-            },
-        )
-    if has_error:
-        err = envelope["error"]
-        if not isinstance(err, dict):
-            raise MCPError(
-                "MCP error payload is not an object",
-                context=base_context,
-            )
-        code = err.get("code")
-        message = err.get("message") or "MCP server returned an error"
-        raise MCPError(
-            str(message),
-            context={
-                **base_context,
-                "error_code": code,
-                "error_data": err.get("data"),
-            },
-        )
-    return envelope["result"]
 
 
 def _redact_headers(
@@ -266,10 +187,30 @@ def _redact_headers(
 
     The returned dict is suitable for inclusion in :class:`MCPError`
     context or log lines. The sentinel value :data:`_REDACTION_SENTINEL`
-    replaces every redacted value verbatim.
+    replaces every redacted value verbatim. No public method captures a
+    header dict today — every :class:`MCPError` context is built from the
+    fixed allow-list documented on :class:`MCPClient` — but any future path
+    that surfaces headers MUST funnel through this helper first.
     """
     sensitive = _BUILTIN_SENSITIVE_HEADERS | extra_sensitive_keys
     return {k: (_REDACTION_SENTINEL if k.lower() in sensitive else v) for k, v in headers.items()}
+
+
+def _iter_leaf_exceptions(exc: BaseException) -> list[BaseException]:
+    """Flatten an anyio :class:`ExceptionGroup` into its leaf exceptions.
+
+    The ``mcp`` transport runs the stream pair inside an anyio task group, so
+    a transport/protocol failure surfaces as an ``ExceptionGroup`` wrapping
+    the real cause (``httpx.ConnectError``, ``httpx.ReadTimeout``,
+    ``httpx.HTTPStatusError``, or :class:`mcp.shared.exceptions.McpError`).
+    A non-group exception returns as a single-element list.
+    """
+    if isinstance(exc, BaseExceptionGroup):
+        leaves: list[BaseException] = []
+        for sub in exc.exceptions:
+            leaves.extend(_iter_leaf_exceptions(sub))
+        return leaves
+    return [exc]
 
 
 # ---------------------------------------------------------------------------
@@ -283,25 +224,22 @@ AuthSpec = AuthHeaders | AuthCallable | None
 
 
 class MCPClient:
-    """JSON-RPC 2.0 client for an MCP server over HTTP.
+    """MCP client for a server over Streamable HTTP, wrapping the ``mcp`` SDK.
 
-    See module docstring for design notes. Construction never performs
-    network I/O; the first call to :meth:`discover` or :meth:`invoke`
-    establishes the connection.
+    See the module docstring for design notes. Construction never performs
+    network I/O; the first call to :meth:`discover` or :meth:`invoke` opens a
+    session.
 
     Invariant — auth headers MUST NEVER appear in MCPError.context.
         Every :class:`MCPError` raised by this client builds its
         ``context`` dict from the small allow-list ``{server_url, method,
-        tool_name, wrapped, status_code, error_code, error_data,
-        expected_id, received_id, has_result, has_error,
-        envelope_jsonrpc, content, operation}`` — no header dict is ever
-        captured. ``_resolve_auth`` still tracks declared header names
-        for any future code path that *does* need to surface headers
-        (e.g. a debug-mode dump): that path MUST funnel through
-        :func:`_redact_headers` first. The next person tempted to widen
-        the context shape: do not put headers in. Use
-        :func:`_redact_headers` and prove a test exercises the
-        redaction.
+        tool_name, wrapped, status_code, error_code, error_data, content,
+        operation}`` — no header dict is ever captured. ``_resolve_auth``
+        still tracks declared header names for any future code path that
+        *does* need to surface headers (e.g. a debug-mode dump): that path
+        MUST funnel through :func:`_redact_headers` first. The next person
+        tempted to widen the context shape: do not put headers in. Use
+        :func:`_redact_headers` and prove a test exercises the redaction.
 
     Args:
         config: Connection configuration.
@@ -332,20 +270,8 @@ class MCPClient:
         self._declared_auth_keys: frozenset[str] = (
             frozenset(k.lower() for k in auth) if isinstance(auth, Mapping) else frozenset()
         )
-        if client is not None:
-            self._client = client
-            self._owns_client = False
-        else:
-            self._client = httpx.AsyncClient(
-                timeout=httpx.Timeout(
-                    connect=config.connect_timeout_seconds,
-                    read=config.read_timeout_seconds,
-                    write=config.read_timeout_seconds,
-                    pool=config.read_timeout_seconds,
-                ),
-                transport=httpx.AsyncHTTPTransport(retries=config.connect_retries),
-            )
-            self._owns_client = True
+        self._client = client
+        self._owns_client = client is None
         self._closed: bool = False
 
     # ------------------------------------------------------------------
@@ -353,18 +279,19 @@ class MCPClient:
     # ------------------------------------------------------------------
 
     async def discover(self) -> list[MCPToolDef]:
-        """Fetch the remote tool catalog via the ``tools/list`` JSON-RPC method.
+        """Fetch the remote tool catalog via the ``tools/list`` MCP method.
+
+        Opens a session (``initialize`` → ``list_tools`` → close) and maps each
+        :class:`mcp.types.Tool` into a :class:`MCPToolDef`.
 
         Returns:
-            A list of :class:`MCPToolDef` parsed from the server's
-            ``result.tools`` payload.
+            A list of :class:`MCPToolDef`.
 
         Raises:
-            MCPError: For any transport failure, malformed JSON-RPC
-                envelope, server-returned error object, or unexpected
-                ``result`` shape (e.g. ``tools`` not a list). Also
-                raised with ``message == "MCP client is closed"`` when
-                invoked after :meth:`aclose`.
+            MCPError: For any transport failure, protocol/handshake failure,
+                or server-returned JSON-RPC error. Also raised with
+                ``message == "MCP client is closed"`` when invoked after
+                :meth:`aclose`.
         """
         if self._closed:
             raise MCPError(
@@ -374,47 +301,103 @@ class MCPClient:
                     "server_url": self._config.base_url,
                 },
             ) from None
-        result = await self._call("tools/list", params=None)
-        return self._parse_tool_catalog(result)
+        base_context: dict[str, Any] = {
+            "operation": "discover",
+            "server_url": self._config.base_url,
+            "method": "tools/list",
+        }
+        log = _log.bind(method="tools/list", server_url=self._config.base_url)
+        # Resolve auth ONCE per call (callable providers invoked exactly once).
+        headers, _ = await self._resolve_auth()
+        try:
+            transport = self._build_transport(headers)
+            async with transport.connect() as session:
+                result = await session.list_tools()
+        except McpError as exc:
+            raise self._mcp_error_from_protocol(exc, base_context) from exc
+        except RuntimeError as exc:
+            raise self._mcp_error_from_runtime(exc, base_context) from exc
+        except (httpx.HTTPError, BaseExceptionGroup) as exc:
+            raise self._mcp_error_from_transport(exc, base_context) from exc
+        log.debug("mcp.call_ok")
+        return [self._map_tool(tool) for tool in result.tools]
 
     async def invoke(self, name: str, args: dict[str, Any]) -> Any:
-        """Invoke a remote tool via the ``tools/call`` JSON-RPC method.
+        """Invoke a remote tool via the ``tools/call`` MCP method.
+
+        Opens a session (``initialize`` → ``call_tool`` → close) and unwraps
+        the typed :class:`mcp.types.CallToolResult`.
 
         Args:
             name: Name of the remote tool (matches a
                 :attr:`MCPToolDef.name`).
-            args: Argument object passed verbatim as
-                ``params.arguments``.
+            args: Argument object passed verbatim as the ``arguments``.
 
         Returns:
-            The unwrapped ``result.content`` payload — or, when the
-            server omits the ``content`` wrapper, the raw ``result``.
-            Falls through to whatever the remote tool produced.
+            The unwrapped tool payload. When the server populates
+            ``structuredContent`` (a JSON object — e.g. a typed/object return),
+            that dict is returned verbatim. Otherwise the content blocks are
+            returned as a list of plain JSON dicts
+            (``[c.model_dump(mode="json") for c in result.content]``). No
+            single-block flattening is performed: a single ``TextContent`` is
+            still returned as a one-element list of ``{"type": "text",
+            "text": ...}`` dicts. This is the one observable-output shape that
+            differs from the BR-008 hand-rolled client; consumers reading
+            ``ToolResult.output`` should expect ``dict`` (structured) or
+            ``list[dict]`` (content blocks).
 
         Raises:
-            MCPError: For transport failure, malformed envelope,
-                JSON-RPC ``error`` response, or a ``result`` carrying
-                ``isError=True``.
+            MCPError: For transport failure, protocol/handshake failure,
+                server-returned JSON-RPC error, or a result carrying
+                ``isError=True``. Also raised with
+                ``message == "MCP client is closed"`` after :meth:`aclose`.
         """
-        result = await self._call(
-            "tools/call",
-            params={"name": name, "arguments": args},
-            tool_name=name,
-        )
+        if self._closed:
+            raise MCPError(
+                "MCP client is closed",
+                context={
+                    "operation": "invoke",
+                    "server_url": self._config.base_url,
+                },
+            ) from None
+        base_context: dict[str, Any] = {
+            "operation": "invoke",
+            "server_url": self._config.base_url,
+            "method": "tools/call",
+            "tool_name": name,
+        }
+        log = _log.bind(method="tools/call", server_url=self._config.base_url)
+        # Resolve auth ONCE per call: this both fails fast on a misbehaved
+        # callable (before any session work) AND is the single invocation of a
+        # side-effecting/one-time token provider (no double-spend).
+        headers, _ = await self._resolve_auth()
+        try:
+            transport = self._build_transport(headers)
+            async with transport.connect() as session:
+                result = await session.call_tool(name, arguments=args)
+        except McpError as exc:
+            raise self._mcp_error_from_protocol(exc, base_context) from exc
+        except RuntimeError as exc:
+            raise self._mcp_error_from_runtime(exc, base_context) from exc
+        except (httpx.HTTPError, BaseExceptionGroup) as exc:
+            raise self._mcp_error_from_transport(exc, base_context) from exc
+        log.debug("mcp.call_ok")
         return self._unwrap_invoke_result(result, tool_name=name)
 
     async def aclose(self) -> None:
         """Close the owned :class:`httpx.AsyncClient`, if any.
 
-        Externally-provided clients are NOT closed — their lifecycle
-        belongs to the caller. Idempotent: a second ``aclose()`` is a
-        no-op and does NOT raise. After ``aclose()`` returns, calls to
-        :meth:`discover` and :meth:`invoke` raise :class:`MCPError`
-        with ``message == "MCP client is closed"``.
+        Under the session-per-call lifecycle there is no persistent session to
+        unwind — each call already opened and closed its own. Externally-
+        provided clients are NOT closed; their lifecycle belongs to the
+        caller. Idempotent: a second ``aclose()`` is a no-op and does NOT
+        raise. After ``aclose()`` returns, calls to :meth:`discover` and
+        :meth:`invoke` raise :class:`MCPError` with
+        ``message == "MCP client is closed"``.
         """
         if self._closed:
             return
-        if self._owns_client:
+        if self._owns_client and self._client is not None:
             await self._client.aclose()
         self._closed = True
 
@@ -422,112 +405,24 @@ class MCPClient:
     # Internals
     # ------------------------------------------------------------------
 
-    async def _call(
-        self,
-        method: str,
-        *,
-        params: dict[str, Any] | None,
-        tool_name: str | None = None,
-    ) -> Any:
-        """Execute one JSON-RPC round-trip and return the validated result.
+    def _build_transport(self, headers: Mapping[str, str]) -> Transport:
+        """Build the per-call transport from already-resolved auth headers.
 
-        Wraps :class:`httpx.HTTPError` and parse failures into
-        :class:`MCPError`. Auth headers are resolved fresh per call (so
-        callable auth supports token rotation) and never appear in the
-        error context.
+        ``headers`` is the auth mapping resolved ONCE per call by
+        :meth:`discover`/:meth:`invoke` (so a side-effecting callable provider
+        is invoked exactly once — no double-spend). The transport sets the
+        headers on the httpx client (the supported auth seam in ``mcp
+        1.27.0``).
         """
-        if self._closed:
-            raise MCPError(
-                "MCP client is closed",
-                context={
-                    "operation": method,
-                    "server_url": self._config.base_url,
-                },
-            ) from None
-        envelope = _make_request(method, params)
-        request_id: str = envelope["id"]
-
-        resolved_auth, _ = await self._resolve_auth()
-        headers: dict[str, str] = {
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "User-Agent": self._config.user_agent,
-        }
-        for k, v in resolved_auth.items():
-            headers[k] = v
-
-        log = _log.bind(
-            method=method,
-            request_id=request_id,
-            server_url=self._config.base_url,
+        return StreamableHttpTransport(
+            base_url=self._config.base_url,
+            read_timeout_seconds=self._config.read_timeout_seconds,
+            connect_timeout_seconds=self._config.connect_timeout_seconds,
+            user_agent=self._config.user_agent,
+            connect_retries=self._config.connect_retries,
+            headers=headers,
+            http_client=self._client,
         )
-
-        base_context: dict[str, Any] = {
-            "server_url": self._config.base_url,
-            "method": method,
-        }
-        if tool_name is not None:
-            base_context["tool_name"] = tool_name
-
-        try:
-            response = await self._client.post(
-                self._config.base_url,
-                json=envelope,
-                headers=headers,
-            )
-        except httpx.HTTPError as exc:
-            # ConnectError, ReadTimeout, etc. — never include headers.
-            log.debug("mcp.transport_error", wrapped=type(exc).__name__)
-            raise MCPError(
-                f"MCP transport error: {type(exc).__name__}",
-                context={**base_context, "wrapped": type(exc).__name__},
-            ) from exc
-
-        if response.status_code >= 400:
-            log.debug(
-                "mcp.http_error",
-                status_code=response.status_code,
-            )
-            raise MCPError(
-                f"MCP server returned HTTP {response.status_code}",
-                context={
-                    **base_context,
-                    "status_code": response.status_code,
-                    "wrapped": "HTTPStatusError",
-                },
-            )
-
-        try:
-            decoded = response.json()
-        except ValueError as exc:
-            log.debug("mcp.decode_error", wrapped=type(exc).__name__)
-            raise MCPError(
-                "MCP response body is not valid JSON",
-                context={
-                    **base_context,
-                    "wrapped": type(exc).__name__,
-                },
-            ) from exc
-
-        if not isinstance(decoded, dict):
-            raise MCPError(
-                "MCP response body is not a JSON object",
-                context={
-                    **base_context,
-                    "wrapped": type(decoded).__name__,
-                },
-            )
-
-        # _parse_response raises MCPError on any envelope/protocol issue.
-        result = _parse_response(
-            decoded,
-            expected_id=request_id,
-            method=method,
-            server_url=self._config.base_url,
-            tool_name=tool_name,
-        )
-        log.debug("mcp.call_ok")
-        return result
 
     async def _resolve_auth(self) -> tuple[Mapping[str, str], frozenset[str]]:
         """Resolve the auth header mapping and the set of declared keys.
@@ -537,6 +432,9 @@ class MCPClient:
             is the mapping to merge into the outbound request;
             ``declared_keys_lowercase`` lists the header names treated as
             sensitive (used to extend redaction).
+
+        Raises:
+            MCPError: When a callable provider returns a non-Mapping value.
         """
         auth = self._auth
         if auth is None:
@@ -555,111 +453,166 @@ class MCPClient:
             )
         return resolved, frozenset(k.lower() for k in resolved)
 
-    def _parse_tool_catalog(self, result: Any) -> list[MCPToolDef]:
-        """Translate the ``tools/list`` ``result`` payload into typed defs.
+    def _map_tool(self, tool: Tool) -> MCPToolDef:
+        """Translate one :class:`mcp.types.Tool` into a typed :class:`MCPToolDef`.
 
-        Per MCP spec the result is ``{"tools": [<def>, ...]}``. Each def is
-        ``{"name": str, "description": str, "inputSchema": {...}}``.
+        ``mcp.types.Tool`` guarantees a present (camelCase) ``inputSchema`` and
+        a nullable ``description`` (coerced to ``""``).
         """
-        if not isinstance(result, dict):
-            raise MCPError(
-                "MCP tools/list result is not an object",
-                context={
-                    "server_url": self._config.base_url,
-                    "method": "tools/list",
-                    "wrapped": type(result).__name__,
-                },
-            )
-        tools = result.get("tools")
-        if not isinstance(tools, list):
-            raise MCPError(
-                "MCP tools/list result missing 'tools' array",
-                context={
-                    "server_url": self._config.base_url,
-                    "method": "tools/list",
-                },
-            )
-        out: list[MCPToolDef] = []
-        for raw in tools:
-            if not isinstance(raw, dict):
-                raise MCPError(
-                    "MCP tool definition is not an object",
-                    context={
-                        "server_url": self._config.base_url,
-                        "method": "tools/list",
-                        "wrapped": type(raw).__name__,
-                    },
-                )
-            name = raw.get("name")
-            if not isinstance(name, str) or not name:
-                raise MCPError(
-                    "MCP tool definition missing 'name'",
-                    context={
-                        "server_url": self._config.base_url,
-                        "method": "tools/list",
-                    },
-                )
-            description = raw.get("description") or ""
-            input_schema = raw.get("inputSchema") or raw.get("input_schema") or {}
-            if not isinstance(input_schema, dict):
-                raise MCPError(
-                    "MCP tool 'inputSchema' is not an object",
-                    context={
-                        "server_url": self._config.base_url,
-                        "method": "tools/list",
-                        "tool_name": name,
-                    },
-                )
-            out.append(
-                MCPToolDef(
-                    name=name,
-                    description=str(description),
-                    input_schema=dict(input_schema),
-                )
-            )
-        return out
+        return MCPToolDef(
+            name=tool.name,
+            description=tool.description or "",
+            input_schema=dict(tool.inputSchema),
+        )
 
-    def _unwrap_invoke_result(self, result: Any, *, tool_name: str) -> Any:
-        """Unwrap the ``tools/call`` result payload.
+    def _mcp_error_from_protocol(self, exc: McpError, base_context: dict[str, Any]) -> MCPError:
+        """Translate a :class:`mcp.shared.exceptions.McpError` into :class:`MCPError`.
 
-        Per MCP spec the success shape is::
-
-            {"content": [...], "isError": false}
-
-        Security note — error-content capture:
-            When ``isError`` is True, ``result["content"]`` is captured
-            verbatim into ``MCPError.context["content"]``. The SDK has no
-            way to know what an MCP server places in that field — a
-            non-conformant or poorly-implemented server MAY echo request
-            arguments, credentials, or other sensitive material into the
-            error content, in which case that material surfaces in our
-            error logs. We intentionally preserve the value as-is rather
-            than redact it: the SDK does not own the schema, redaction
-            would mask real debug info, and the threat model here is a
-            misbehaving downstream (which we cannot fix from the client
-            side). Consumers running against untrusted MCP servers SHOULD
-            scrub ``MCPError.context["content"]`` before logging.
-
-        If ``isError`` is True, raise :class:`MCPError`. If ``content`` is
-        present, return it verbatim; otherwise return the raw ``result`` —
-        servers vary, and the SDK is intentionally permissive here.
+        Maps the JSON-RPC ``error.code``/``error.data`` into the context
+        allow-list. Never carries headers.
         """
-        if not isinstance(result, dict):
-            # Some servers may return scalar results; pass them through.
-            return result
-        if result.get("isError") is True:
+        _log.debug(
+            "mcp.protocol_error",
+            method=base_context.get("method"),
+            server_url=self._config.base_url,
+            error_code=exc.error.code,
+        )
+        return MCPError(
+            str(exc.error.message) or "MCP server returned an error",
+            context={
+                **base_context,
+                "error_code": exc.error.code,
+                "error_data": exc.error.data,
+            },
+        )
+
+    def _mcp_error_from_runtime(self, exc: RuntimeError, base_context: dict[str, Any]) -> MCPError:
+        """Translate a session/handshake :class:`RuntimeError` into :class:`MCPError`.
+
+        :meth:`mcp.ClientSession.initialize` raises a bare ``RuntimeError`` on
+        an unsupported protocol version, and the session raises one on invalid
+        structured content. Either can surface (bare or nested in the
+        transport's anyio task group) from ``discover``/``invoke``; this keeps
+        the uniform-MCPError contract (no ``mcp``/``RuntimeError`` leaks).
+        Never carries headers — context is the redaction-safe allow-list plus
+        ``wrapped`` = ``"RuntimeError"``.
+        """
+        wrapped = type(exc).__name__
+        _log.debug(
+            "mcp.session_error",
+            method=base_context.get("method"),
+            server_url=self._config.base_url,
+            wrapped=wrapped,
+        )
+        return MCPError(
+            f"MCP session error: {wrapped}",
+            context={**base_context, "wrapped": wrapped},
+        )
+
+    def _mcp_error_from_transport(
+        self, exc: BaseException, base_context: dict[str, Any]
+    ) -> MCPError:
+        """Translate a transport-layer failure into :class:`MCPError`.
+
+        Unwraps anyio ``ExceptionGroup``s, then classifies the first relevant
+        leaf: an :class:`httpx.HTTPStatusError` carries ``status_code``; any
+        other ``httpx`` error carries its class name in ``wrapped``; a
+        :class:`mcp.shared.exceptions.McpError` nested inside the group is
+        routed through the protocol mapping; a nested ``RuntimeError``
+        (e.g. an ``initialize`` protocol-version failure raised inside the
+        task group) is routed through the session mapping. Never carries
+        headers.
+        """
+        leaves = _iter_leaf_exceptions(exc)
+        # Prefer a nested protocol error (a 4xx/handshake failure can surface
+        # as an McpError inside the transport task group).
+        for leaf in leaves:
+            if isinstance(leaf, McpError):
+                return self._mcp_error_from_protocol(leaf, base_context)
+        for leaf in leaves:
+            if isinstance(leaf, httpx.HTTPStatusError):
+                status = leaf.response.status_code
+                _log.debug(
+                    "mcp.http_error",
+                    method=base_context.get("method"),
+                    server_url=self._config.base_url,
+                    status_code=status,
+                )
+                return MCPError(
+                    f"MCP server returned HTTP {status}",
+                    context={
+                        **base_context,
+                        "status_code": status,
+                        "wrapped": "HTTPStatusError",
+                    },
+                )
+        for leaf in leaves:
+            if isinstance(leaf, httpx.HTTPError):
+                wrapped = type(leaf).__name__
+                _log.debug(
+                    "mcp.transport_error",
+                    method=base_context.get("method"),
+                    server_url=self._config.base_url,
+                    wrapped=wrapped,
+                )
+                return MCPError(
+                    f"MCP transport error: {wrapped}",
+                    context={**base_context, "wrapped": wrapped},
+                )
+        # A nested RuntimeError (e.g. an initialize protocol-version failure
+        # raised inside the transport task group) routes through the session
+        # mapping for a consistent message + context.
+        for leaf in leaves:
+            if isinstance(leaf, RuntimeError):
+                return self._mcp_error_from_runtime(leaf, base_context)
+        # No recognised leaf — surface the group's first leaf class name.
+        wrapped = type(leaves[0]).__name__ if leaves else type(exc).__name__
+        _log.debug(
+            "mcp.transport_error",
+            method=base_context.get("method"),
+            server_url=self._config.base_url,
+            wrapped=wrapped,
+        )
+        return MCPError(
+            f"MCP transport error: {wrapped}",
+            context={**base_context, "wrapped": wrapped},
+        )
+
+    def _unwrap_invoke_result(self, result: CallToolResult, *, tool_name: str) -> Any:
+        """Unwrap the typed ``tools/call`` :class:`mcp.types.CallToolResult`.
+
+        Security note — error-content capture (TD-007 item 3):
+            When ``isError`` is True, ``result.content`` is serialised
+            verbatim into ``MCPError.context["content"]``. The SDK has no way
+            to know what an MCP server places in that field — a non-conformant
+            or poorly-implemented server MAY echo request arguments,
+            credentials, or other sensitive material into the error content,
+            in which case that material surfaces in our error logs. We
+            intentionally preserve the value as-is rather than redact it: the
+            SDK does not own the schema, redaction would mask real debug info,
+            and the threat model here is a misbehaving downstream (which we
+            cannot fix from the client side). Consumers running against
+            untrusted MCP servers SHOULD scrub ``MCPError.context["content"]``
+            before logging.
+
+        Success shape:
+            Returns ``result.structuredContent`` when the server provides it
+            (a JSON object), else the content blocks serialised to plain JSON
+            dicts: ``[c.model_dump(mode="json") for c in result.content]``.
+        """
+        if result.isError:
             raise MCPError(
                 f"MCP tool '{tool_name}' returned isError=True",
                 context={
                     "server_url": self._config.base_url,
                     "method": "tools/call",
                     "tool_name": tool_name,
-                    "content": result.get("content"),
+                    "content": [c.model_dump(mode="json") for c in result.content],
                 },
             )
-        if "content" in result:
-            return result["content"]
-        return result
+        if result.structuredContent is not None:
+            return result.structuredContent
+        return [c.model_dump(mode="json") for c in result.content]
 
 
 __all__ = [
