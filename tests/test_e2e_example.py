@@ -16,6 +16,7 @@ deterministic — no network, no flakiness.
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 import agent_sdk
@@ -46,10 +47,14 @@ async def test_e2e_define_tool_wire_registry_run_stream() -> None:
     conversation history. Every assertion below pins one observable property
     of the run so this test doubles as a regression fence for the public API.
     """
-    # ── Step 0: the SDK version is the freshly bumped 0.1.0 ───────────────
-    # This run is the BR-002 epic closeout; the version bump and this test
-    # land together, so pinning the version here keeps the two coupled.
-    assert agent_sdk.__version__ == "0.1.0"
+    # ── Step 0: the SDK exposes a well-formed version string ──────────────
+    # Assert __version__ exists and is PEP 440-shaped rather than pinning a
+    # frozen literal: the old `== "0.1.0"` silently rotted across the
+    # 0.1.0 -> 1.0.0 release bump (TD-026). importlib.metadata.version is
+    # deliberately NOT used as the oracle here — the editable install's dist
+    # metadata is stale (reports 0.0.1), so it would diverge from __version__.
+    assert isinstance(agent_sdk.__version__, str) and agent_sdk.__version__
+    assert re.fullmatch(r"\d+\.\d+\.\d+.*", agent_sdk.__version__)
 
     # ── Step 1: define a real tool with the @tool decorator ───────────────
     # @tool derives the JSON Schema for `city` from the type annotation and
