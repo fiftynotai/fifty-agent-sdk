@@ -94,7 +94,7 @@ if TYPE_CHECKING:
     from agent_sdk.state.redis import RedisStateStore
     from agent_sdk.state.sql import SqlStateStore, sql_metadata
 
-__version__ = "0.1.0"
+__version__ = "1.0.0"
 
 __all__ = [
     "JSON_MODE_OUTPUT_FORMAT",
