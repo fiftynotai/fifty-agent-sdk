@@ -1,10 +1,23 @@
 # fifty-agent-sdk
 
-Production-grade reusable agent loop SDK. Provides a custom ReACT loop that
-runs against any OpenAI-compatible Chat Completions endpoint (OpenAI itself,
-Google Distributed Cloud, local OSS servers, etc.), with pluggable tool
-sources (in-process registration + MCP discovery), pluggable conversation
-state storage, and a full-fidelity event stream.
+[![PyPI](https://img.shields.io/pypi/v/fifty-agent-sdk)](https://pypi.org/project/fifty-agent-sdk/)
+[![Python](https://img.shields.io/pypi/pyversions/fifty-agent-sdk)](https://pypi.org/project/fifty-agent-sdk/)
+[![CI](https://github.com/fiftynotai/fifty-agent-sdk/actions/workflows/ci.yml/badge.svg)](https://github.com/fiftynotai/fifty-agent-sdk/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
+an embeddable ReACT agent loop you drop into your own service. it talks to
+any OpenAI-compatible Chat Completions endpoint — OpenAI, Google Distributed
+Cloud, a local OSS server — by changing one `base_url`. transport-free,
+infra-free by default, and pluggable behind protocols the whole way down.
+
+## At a glance
+
+- endpoint-agnostic — one `base_url` points the loop at OpenAI, GDC, or a local OSS server; the loop doesn't care which.
+- pluggable tools — `@tool` derives a JSON Schema from type hints; MCP discovery adds remote tools to the same registry.
+- pluggable state — conversation state lives behind a `StateStore` protocol: in-memory, SQL, or Redis.
+- typed event stream — every ReACT step emits exactly one `AgentEvent`; every run ends with exactly one `FinalEvent`.
+- safety caps — iteration ceiling, per-tool timeouts, and a fallback answer on error or cap.
+- zero-infra default — memory backends ship in core; run an agent with no extra dependency.
 
 ## Installation
 
@@ -151,6 +164,13 @@ never aborts a live run.
   graceful fallbacks, full-fidelity event stream.
 - **Standalone usable.** Memory backends ship by default so you can run an
   agent without any infrastructure dependency.
+
+## Links
+
+- package — https://pypi.org/project/fifty-agent-sdk/
+- source & issues — https://github.com/fiftynotai/fifty-agent-sdk
+- changelog — [CHANGELOG.md](CHANGELOG.md)
+- contributing — issues and PRs welcome.
 
 ## License
 
