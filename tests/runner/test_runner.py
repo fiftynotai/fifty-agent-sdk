@@ -533,6 +533,11 @@ class _FailingAppendStore:
     async def switch_branch(self, session_id: str, branch_id: str) -> None:
         raise NotImplementedError
 
+    async def truncate_after(
+        self, session_id: str, sequence: int, *, branch_id: str | None = None
+    ) -> None:
+        raise NotImplementedError
+
 
 class _FailingGetStore:
     """Test double whose ``get_messages`` raises ``StateStoreError``."""
@@ -558,6 +563,11 @@ class _FailingGetStore:
         raise NotImplementedError
 
     async def switch_branch(self, session_id: str, branch_id: str) -> None:
+        raise NotImplementedError
+
+    async def truncate_after(
+        self, session_id: str, sequence: int, *, branch_id: str | None = None
+    ) -> None:
         raise NotImplementedError
 
 
@@ -628,6 +638,11 @@ class _FailingNthAppendStore:
 
     async def switch_branch(self, session_id: str, branch_id: str) -> None:
         await self._inner.switch_branch(session_id, branch_id)
+
+    async def truncate_after(
+        self, session_id: str, sequence: int, *, branch_id: str | None = None
+    ) -> None:
+        await self._inner.truncate_after(session_id, sequence, branch_id=branch_id)
 
 
 async def test_state_store_error_on_assistant_append_propagates_after_final_event() -> None:

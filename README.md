@@ -141,6 +141,11 @@ turn forks a new branch and the old line stays reachable — while `append`
 always writes to the active branch. Branching is data-additive: existing
 single-line sessions read as the `trunk` branch with no migration.
 
+For redaction, retention, or rollback, `truncate_after(session_id, sequence,
+branch_id=...)` hard-deletes a branch's tail (messages beyond `sequence`) — the
+destructive sibling of branching. It only removes the target branch's own
+messages, so a fork's shared/inherited prefix is never affected.
+
 ### The event stream
 
 Every step of the ReACT cycle emits exactly one event from the `AgentEvent`

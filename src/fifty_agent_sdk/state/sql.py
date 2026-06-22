@@ -133,6 +133,7 @@ try:
         Text,
         UniqueConstraint,
         and_,
+        delete,
         func,
         or_,
         select,
@@ -1046,6 +1047,50 @@ class SqlStateStore:
         except SQLAlchemyError as exc:
             raise _wrap_state_store_error(
                 exc, session_id=session_id, operation="switch_branch"
+            ) from exc
+
+    async def truncate_after(
+        self, session_id: str, sequence: int, *, branch_id: str | None = None
+    ) -> None:
+        """Destructively delete the target branch's own messages with
+        ``sequence > N`` under a ``SELECT ... FOR UPDATE`` lock.
+
+        The ``branch_id`` filter means only rows physically on the target
+        branch are removed — a fork's inherited prefix (rows owned by ancestor
+        branches) is never touched. Idempotent; a no-op on an unknown session
+        or branch (the DELETE simply matches no rows).
+        """
+        lock = await self._get_session_lock(session_id)
+        try:
+            async with lock, self._session_factory() as session, session.begin():
+                parent = await session.scalar(
+                    select(AgentSession)
+                    .where(AgentSession.session_id == session_id)
+                    .with_for_update()
+                )
+                if parent is None:
+                    return
+                target = (
+                    branch_id
+                    if branch_id is not None
+                    else (parent.active_branch_id or TRUNK_BRANCH_ID)
+                )
+                await session.execute(
+                    delete(AgentMessage).where(
+                        AgentMessage.session_id == session_id,
+                        AgentMessage.branch_id == target,
+                        AgentMessage.sequence > sequence,
+                    )
+                )
+            _log.debug(
+                "sql_state_store.truncate_after",
+                session_id=session_id,
+                branch_id=target,
+                sequence=sequence,
+            )
+        except SQLAlchemyError as exc:
+            raise _wrap_state_store_error(
+                exc, session_id=session_id, operation="truncate_after"
             ) from exc
 
 

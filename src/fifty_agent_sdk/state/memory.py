@@ -257,5 +257,30 @@ class MemoryStateStore:
                 )
             session.active_branch_id = branch_id
 
+    async def truncate_after(
+        self, session_id: str, sequence: int, *, branch_id: str | None = None
+    ) -> None:
+        """Destructively drop the target branch's own messages with
+        ``sequence > N``.
+
+        Only the branch's own messages are removed — a fork's inherited prefix
+        is never touched. Idempotent; a no-op on an unknown session or branch.
+        """
+        lock = await self._get_lock(session_id)
+        async with lock:
+            session = self._sessions.get(session_id)
+            if session is None:
+                return
+            target = branch_id if branch_id is not None else session.active_branch_id
+            branch = session.branches.get(target)
+            if branch is None:
+                return
+            anchor = branch.forked_from_sequence or 0
+            # Own message at index i has materialized sequence anchor + 1 + i;
+            # keep those with sequence <= N (the first ``N - anchor``), drop the
+            # rest. Slicing clamps naturally for out-of-range N.
+            keep = sequence - anchor
+            del branch.messages[max(keep, 0) :]
+
 
 __all__ = ["MemoryStateStore"]

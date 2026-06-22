@@ -16,6 +16,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   **data-additive and zero-migration** — existing sessions read as the `trunk`
   branch. **Breaking for custom `StateStore` implementations**: they must add
   the new methods. (BR-004)
+- `StateStore.truncate_after(session_id, sequence, *, branch_id=None)` — a
+  destructive hard-delete of a branch's tail (messages with `sequence > N`),
+  for redaction, retention, and rollback. Only the target branch's own messages
+  are removed — a fork's inherited prefix is never touched — and it is
+  idempotent / a no-op on an unknown session or branch. (BR-003)
 
 ### Fixed
 - `Registry.invoke` now enforces timeouts via `asyncio.timeout` instead of
