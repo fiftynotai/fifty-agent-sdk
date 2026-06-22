@@ -205,12 +205,39 @@ async def test_legacy_single_list_reads_as_trunk(store: RedisStateStore) -> None
     ]
 
 
-async def test_trunk_only_session_uses_bare_key(store: RedisStateStore) -> None:
-    """A trunk-only session must not create extra keys (back-compat with the
-    original single-list layout)."""
-    await _seed(store, "s1", "a")
-    keys = sorted(await store._client.keys("*"))
-    assert keys == [store._key("s1")]
+async def test_trunk_only_session_keeps_messages_in_bare_key(store: RedisStateStore) -> None:
+    """The trunk's MESSAGES live in the bare session key (zero-migration with
+    pre-BR-004 single-list data). A lightweight ``:branches`` registry marks the
+    session as durably existing so truncating the trunk to empty doesn't make
+    the session vanish (BR-003 fix); no per-fork list keys exist until a fork."""
+    await _seed(store, "s1", "a", "b")
+    keys = set(await store._client.keys("*"))
+    raw = await store._client.lrange(store._key("s1"), 0, -1)
+    assert _contents([ChatMessage.model_validate_json(x) for x in raw]) == ["a", "b"]
+    # The only auxiliary key is the existence/registry marker — no fork lists.
+    assert keys == {store._key("s1"), store._branches_key("s1")}
+
+
+async def test_truncate_trunk_only_session_to_empty_keeps_it_existing(
+    store: RedisStateStore,
+) -> None:
+    """Regression (BR-003): truncating a trunk-only session's only branch to
+    empty must NOT make the session disappear — list_branches still reports the
+    (empty) trunk and reads return [] rather than raising."""
+    await _seed(store, "s1", "a", "b")
+    await store.truncate_after("s1", 0)
+    assert await store.get_messages("s1") == []
+    branches = await store.list_branches("s1")
+    assert len(branches) == 1 and branches[0].branch_id == TRUNK_BRANCH_ID
+    assert _contents(await store.get_messages("s1", branch_id=TRUNK_BRANCH_ID)) == []
+
+
+async def test_reserved_key_infix_session_id_rejected(store: RedisStateStore) -> None:
+    """Session ids containing a reserved key infix are rejected (avoids
+    cross-session key collisions in the Redis layout)."""
+    for bad in ("x:branches", "x:branch:y", "x:active"):
+        with pytest.raises(ValueError, match="reserved"):
+            await store.append(bad, ChatMessage(role="user", content="z"))
 
 
 # ---------------------------------------------------------------------------
