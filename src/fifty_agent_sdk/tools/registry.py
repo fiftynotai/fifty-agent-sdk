@@ -5,8 +5,8 @@ in-proc, MCP, RPC, dynamic stubs are all the same to it. Its responsibilities
 are exactly three:
 
 1. Name lookup (:meth:`Registry.get`).
-2. Timeout enforcement (:meth:`Registry.invoke` wraps the call in
-   :func:`asyncio.wait_for`).
+2. Timeout enforcement (:meth:`Registry.invoke` runs the call under
+   :func:`asyncio.timeout`).
 3. Exception classification: not-found and timeout escape as exceptions;
    ordinary tool exceptions become :class:`ToolResult` with ``is_error=True``;
    :class:`BaseException` and :class:`AgentSdkError` propagate untouched.
@@ -141,10 +141,19 @@ class Registry:
         try:
             if timeout is None:
                 return await coro
-            return await asyncio.wait_for(coro, timeout=timeout)
+            # asyncio.timeout() runs `coro` inline in the *current* task,
+            # unlike asyncio.wait_for() which drives it in a child task. The
+            # distinction is load-bearing for process-fatal BaseExceptions:
+            # on Python <=3.11 a KeyboardInterrupt/SystemExit raised inside a
+            # child task is re-raised straight out of the event loop
+            # (Task.__step -> Handle._run), bypassing this frame's `except`
+            # and any caller's handler, so it cannot be classified here.
+            # Running inline keeps propagation identical across 3.11-3.13. (BR-002)
+            async with asyncio.timeout(timeout):
+                return await coro
         except TimeoutError as e:
-            # asyncio.TimeoutError is aliased to builtins.TimeoutError in
-            # Python 3.11+; catch the canonical name.
+            # asyncio.timeout raises builtins.TimeoutError on expiry
+            # (asyncio.TimeoutError is aliased to it in Python 3.11+).
             raise ToolTimeout(
                 f"Tool '{name}' exceeded timeout of {timeout}s",
                 context={"name": name, "timeout": timeout},
