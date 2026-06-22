@@ -6,6 +6,17 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- First-class conversation **branching** on `StateStore`: `fork`,
+  `list_branches`, `switch_branch`, branch-scoped
+  `get_messages(..., branch_id=...)`, plus the `BranchInfo` and
+  `TRUNK_BRANCH_ID` exports. A session is now a tree of branches with an active
+  head; `append` writes to the active branch (the "edit a message / regenerate"
+  model). Implemented across all backends (memory, SQL, Redis). The change is
+  **data-additive and zero-migration** — existing sessions read as the `trunk`
+  branch. **Breaking for custom `StateStore` implementations**: they must add
+  the new methods. (BR-004)
+
 ### Fixed
 - `Registry.invoke` now enforces timeouts via `asyncio.timeout` instead of
   `asyncio.wait_for`, running the tool coroutine inline in the caller's task.
