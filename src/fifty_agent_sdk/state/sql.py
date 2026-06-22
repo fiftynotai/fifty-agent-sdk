@@ -55,19 +55,35 @@ Dialect parity
     SQLite engine must enable the pragma themselves.
 
 Sequence semantics
-    :meth:`append` allocates a per-session monotonically-increasing
-    ``sequence`` value (starting at ``1``) inside a transaction that
-    acquires a ``SELECT ... FOR UPDATE`` lock on the parent
-    ``agent_sessions`` row. On Postgres this serialises concurrent
-    appenders for the same session; on SQLite ``with_for_update`` is a
-    documented no-op and the database's global writer serialisation
-    provides the same guarantee. A
-    ``UniqueConstraint(session_id, sequence)`` is the schema-level
-    safety net — a hypothetical race that reached the INSERT step
-    would surface as :class:`sqlalchemy.exc.IntegrityError`, wrapped
-    into :class:`fifty_agent_sdk.errors.StateStoreError` with
-    ``context["wrapped"] == "IntegrityError"`` for deterministic
-    caller-side handling.
+    :meth:`append` allocates a per-(session, branch) ``sequence`` value
+    (``COALESCE(MAX(sequence), anchor) + 1`` for the active branch) inside a
+    transaction that acquires a ``SELECT ... FOR UPDATE`` lock on the parent
+    ``agent_sessions`` row. On Postgres this serialises concurrent appenders
+    for the same session; on SQLite ``with_for_update`` is a documented no-op
+    and the database's global writer serialisation provides the same
+    guarantee. A ``UniqueConstraint(session_id, branch_id, sequence)`` is the
+    schema-level safety net — a hypothetical race that reached the INSERT step
+    would surface as :class:`sqlalchemy.exc.IntegrityError`, wrapped into
+    :class:`fifty_agent_sdk.errors.StateStoreError` with
+    ``context["wrapped"] == "IntegrityError"`` for deterministic caller-side
+    handling.
+
+Branching (BR-004) & migration
+    Branching adds the ``agent_branches`` table, ``agent_messages.branch_id``
+    (``server_default 'trunk'``), and ``agent_sessions.active_branch_id``
+    (``server_default 'trunk'``). A message's ``sequence`` is its position in
+    the OWNING branch's *materialized* history; :meth:`get_messages` walks the
+    lineage and reads it as a union of disjoint, increasing sequence ranges
+    (one ``ORDER BY sequence`` yields append order). The schema is **additive
+    and zero-loss**: when consumers run ``alembic revision --autogenerate``
+    against :data:`sql_metadata`, existing ``agent_messages`` rows take
+    ``branch_id = 'trunk'`` and sessions take ``active_branch_id = 'trunk'``
+    via the server defaults. The autogenerate diff will NOT backfill the
+    ``agent_branches`` table for pre-existing sessions — but no backfill is
+    required: the store synthesizes an implicit trunk on read for any session
+    that has no branch row, and materializes the trunk row lazily on the next
+    :meth:`append` / :meth:`fork`. Review the generated revision before
+    applying.
 
 Error wrapping contract
     Every public method wraps :class:`sqlalchemy.exc.SQLAlchemyError`
@@ -101,6 +117,7 @@ Engine ownership
 from __future__ import annotations
 
 import asyncio
+import uuid
 from typing import Any, Final
 
 import structlog
@@ -115,7 +132,9 @@ try:
         String,
         Text,
         UniqueConstraint,
+        and_,
         func,
+        or_,
         select,
     )
     from sqlalchemy.dialects.postgresql import JSONB
@@ -211,6 +230,18 @@ class AgentSession(Base):
     avoid shadowing :attr:`DeclarativeBase.metadata`.
     """
 
+    active_branch_id: Mapped[str] = mapped_column(
+        String(255),
+        nullable=False,
+        server_default=TRUNK_BRANCH_ID,
+    )
+    """The session's active head branch (BR-004).
+
+    :meth:`SqlStateStore.append` writes to this branch and a default
+    :meth:`SqlStateStore.get_messages` reads it. Existing rows migrated from
+    before BR-004 take the trunk via the server default — zero data loss.
+    """
+
     messages: Mapped[list[AgentMessage]] = relationship(
         "AgentMessage",
         back_populates="session",
@@ -228,6 +259,14 @@ class AgentSession(Base):
     each child row from Python, which is correct on every dialect.
     """
 
+    branches: Mapped[list[AgentBranch]] = relationship(
+        "AgentBranch",
+        back_populates="session",
+        cascade="all, delete-orphan",
+        passive_deletes=False,
+    )
+    """Per-session branch rows (BR-004); cascade-deleted with the session."""
+
 
 class AgentMessage(Base):
     """One persisted :class:`ChatMessage` row.
@@ -243,12 +282,14 @@ class AgentMessage(Base):
     __table_args__ = (
         UniqueConstraint(
             "session_id",
+            "branch_id",
             "sequence",
-            name="uq_agent_messages_session_sequence",
+            name="uq_agent_messages_session_branch_sequence",
         ),
         Index(
-            "ix_agent_messages_session_sequence",
+            "ix_agent_messages_session_branch_sequence",
             "session_id",
+            "branch_id",
             "sequence",
         ),
     )
@@ -267,11 +308,27 @@ class AgentMessage(Base):
     )
     """Foreign key to :attr:`AgentSession.session_id`."""
 
-    sequence: Mapped[int] = mapped_column(Integer, nullable=False)
-    """Per-session monotonic order key (``>= 1``).
+    branch_id: Mapped[str] = mapped_column(
+        String(255),
+        nullable=False,
+        server_default=TRUNK_BRANCH_ID,
+    )
+    """Which branch this message belongs to (BR-004).
 
-    Allocated inside :meth:`SqlStateStore.append` as ``MAX(sequence)+1``
-    under a ``SELECT ... FOR UPDATE`` lock on the parent row.
+    Existing rows migrated from before BR-004 take the trunk via the server
+    default. The ``(session_id, branch_id, sequence)`` unique constraint is
+    the database-level ordering safety net.
+    """
+
+    sequence: Mapped[int] = mapped_column(Integer, nullable=False)
+    """Per-(session, branch) materialized order key (``>= 1``).
+
+    A message's ``sequence`` is its position in the OWNING branch's
+    materialized history: a branch forked at sequence ``N`` allocates its own
+    messages starting at ``N + 1``. Allocated inside
+    :meth:`SqlStateStore.append` as ``COALESCE(MAX(sequence), anchor) + 1``
+    for the active branch under a ``SELECT ... FOR UPDATE`` lock on the
+    parent session row.
     """
 
     role: Mapped[str] = mapped_column(String(32), nullable=False)
@@ -299,6 +356,51 @@ class AgentMessage(Base):
         back_populates="messages",
     )
     """Parent session (the inverse side of :attr:`AgentSession.messages`)."""
+
+
+class AgentBranch(Base):
+    """One branch of a session's conversation tree (BR-004).
+
+    The trunk branch (``branch_id == "trunk"``) is created idempotently on a
+    session's first :meth:`SqlStateStore.append`; :meth:`SqlStateStore.fork`
+    adds a row recording its parent and the sequence it diverged at. Reads of
+    a branch walk this lineage to materialize the full history.
+
+    Pre-BR-004 sessions have no branch rows; the store synthesizes an implicit
+    trunk on read, so the feature is additive with zero data loss.
+    """
+
+    __tablename__ = "agent_branches"
+
+    session_id: Mapped[str] = mapped_column(
+        String(255),
+        ForeignKey("agent_sessions.session_id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    """Foreign key to :attr:`AgentSession.session_id` (half of the PK)."""
+
+    branch_id: Mapped[str] = mapped_column(String(255), primary_key=True)
+    """Branch identifier (``"trunk"`` for the root; an opaque id for forks)."""
+
+    parent_branch_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    """The branch this one forked from, or ``NULL`` for the trunk."""
+
+    forked_from_sequence: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    """The parent's materialized sequence this branch diverged at, ``NULL``
+    for the trunk."""
+
+    created_at: Mapped[Any] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+    """Branch creation timestamp (server-side default; timezone-aware)."""
+
+    session: Mapped[AgentSession] = relationship(
+        "AgentSession",
+        back_populates="branches",
+    )
+    """Parent session (inverse of :attr:`AgentSession.branches`)."""
 
 
 sql_metadata = Base.metadata
@@ -532,15 +634,38 @@ class SqlStateStore:
                 fails. ``context["wrapped"]`` carries the underlying
                 SQLAlchemy exception class name.
         """
-        # TODO(BR-004 M3): full branch-scoped reads. Until then SQL has only
-        # the trunk; a non-trunk branch request is not yet serviceable.
-        if branch_id is not None and branch_id != TRUNK_BRANCH_ID:
-            raise NotImplementedError("SqlStateStore branch-scoped reads land in BR-004 M3")
         try:
             async with self._session_factory() as session:
+                branch_map, active = await self._load_branch_map(session, session_id)
+                if not branch_map:
+                    # Unknown session: an explicit branch request is a
+                    # programmer error; the default read is an empty result.
+                    if branch_id is not None:
+                        raise ValueError(
+                            f"branch_id={branch_id!r} does not exist for "
+                            f"unknown session {session_id!r}"
+                        )
+                    return []
+                target = branch_id if branch_id is not None else active
+                if target not in branch_map:
+                    raise ValueError(
+                        f"branch_id={target!r} does not exist for session {session_id!r}"
+                    )
+                # Materialize the branch as a union of disjoint, increasing
+                # sequence ranges over the lineage; ORDER BY sequence then
+                # yields append order with no post-processing.
+                segments = self._materialized_segments(branch_map, target)
+                conds = [
+                    and_(
+                        AgentMessage.branch_id == bid,
+                        AgentMessage.sequence >= low,
+                        *([AgentMessage.sequence <= high] if high is not None else []),
+                    )
+                    for bid, low, high in segments
+                ]
                 rows = await session.scalars(
                     select(AgentMessage)
-                    .where(AgentMessage.session_id == session_id)
+                    .where(AgentMessage.session_id == session_id, or_(*conds))
                     .order_by(AgentMessage.sequence.asc())
                 )
                 messages = [
@@ -555,6 +680,7 @@ class SqlStateStore:
                 _log.debug(
                     "sql_state_store.get_messages",
                     session_id=session_id,
+                    branch_id=target,
                     count=len(messages),
                 )
                 return messages
@@ -564,15 +690,16 @@ class SqlStateStore:
             ) from exc
 
     async def append(self, session_id: str, message: ChatMessage) -> None:
-        """Append ``message`` to the session's ordered message log.
+        """Append ``message`` to the session's **active** branch.
 
-        Allocates a per-session ``sequence`` value transactionally:
-        opens a transaction, takes a ``SELECT ... FOR UPDATE`` lock on
-        the parent :class:`AgentSession` row (creating it if absent),
-        computes ``MAX(sequence) + 1`` for this session under the held
+        Allocates a per-branch ``sequence`` value transactionally: opens a
+        transaction, takes a ``SELECT ... FOR UPDATE`` lock on the parent
+        :class:`AgentSession` row (creating it if absent), ensures the trunk
+        branch row exists, resolves the active branch, computes
+        ``COALESCE(MAX(sequence), anchor) + 1`` for that branch under the held
         lock, and inserts the new :class:`AgentMessage` row. The
-        ``UniqueConstraint(session_id, sequence)`` is the database-level
-        safety net.
+        ``(session_id, branch_id, sequence)`` unique constraint is the
+        database-level safety net.
 
         Args:
             session_id: Opaque session identifier.
@@ -588,48 +715,52 @@ class SqlStateStore:
         lock = await self._get_session_lock(session_id)
         try:
             async with lock, self._session_factory() as session, session.begin():
-                # 1. Idempotently ensure the parent row exists. Two concurrent
-                #    appenders on a never-seen session_id would both see a
-                #    NULL parent and race to create it; ON CONFLICT DO NOTHING
-                #    makes that race correct on both dialects (SQLite >= 3.24
-                #    and Postgres). The asyncio lock acquired above already
-                #    serialises in-process appenders for this session, but
-                #    the upsert is still required for cross-process safety.
+                # 1. Idempotently ensure the parent row exists (ON CONFLICT DO
+                #    NOTHING) so the cold-start race on a never-seen session_id
+                #    cannot raise a primary-key violation.
                 await self._upsert_parent(session, session_id)
 
-                # 2. Acquire a row lock on the parent. `with_for_update()` is
-                #    a no-op on SQLite (writers are serialised globally) and
-                #    SELECT ... FOR UPDATE on Postgres — serialising all
-                #    appenders for this session_id.
+                # 2. Lock the parent row. with_for_update() is a no-op on
+                #    SQLite (writers serialised globally) and SELECT ... FOR
+                #    UPDATE on Postgres — serialising appenders for this id.
                 parent = await session.scalar(
                     select(AgentSession)
                     .where(AgentSession.session_id == session_id)
                     .with_for_update()
                 )
-                # The upsert above guarantees this row exists.
-                assert parent is not None
-                # Touch the parent so `onupdate=func.now()` fires and
-                # `last_active_at` is bumped on this append.
+                assert parent is not None  # guaranteed by the upsert above
                 parent.last_active_at = func.now()
 
-                # 3. Compute the next sequence under the held lock.
-                # COALESCE(MAX(sequence), 0) + 1 is always a non-null integer,
-                # so we can rely on scalar_one() here. If this SELECT is ever
-                # changed in a way that could yield no row (e.g., dropping
-                # COALESCE), the call below will raise NoResultFound -- that
-                # surfaces as a SQLAlchemyError and gets wrapped uniformly by
-                # the surrounding except block.
+                # 3. Resolve the active branch and ensure its row exists. The
+                #    trunk is created lazily here on first append; forks have
+                #    already created theirs in fork().
+                active: str = parent.active_branch_id or TRUNK_BRANCH_ID
+                await self._ensure_branch_row(session, session_id, active)
+
+                # 4. Compute the next sequence for THIS branch under the held
+                #    lock. COALESCE(MAX(sequence), anchor) + 1 starts a freshly
+                #    forked branch (no own messages) at anchor + 1, continuing
+                #    the parent's materialized numbering.
+                anchor = await session.scalar(
+                    select(AgentBranch.forked_from_sequence).where(
+                        AgentBranch.session_id == session_id,
+                        AgentBranch.branch_id == active,
+                    )
+                )
+                anchor_val = anchor or 0
                 result = await session.execute(
-                    select(func.coalesce(func.max(AgentMessage.sequence), 0) + 1).where(
-                        AgentMessage.session_id == session_id
+                    select(func.coalesce(func.max(AgentMessage.sequence), anchor_val) + 1).where(
+                        AgentMessage.session_id == session_id,
+                        AgentMessage.branch_id == active,
                     )
                 )
                 next_seq: int = int(result.scalar_one())
 
-                # 4. Insert the message.
+                # 5. Insert the message on the active branch.
                 session.add(
                     AgentMessage(
                         session_id=session_id,
+                        branch_id=active,
                         sequence=next_seq,
                         role=message.role,
                         content=message.content,
@@ -641,6 +772,7 @@ class SqlStateStore:
             _log.debug(
                 "sql_state_store.append",
                 session_id=session_id,
+                branch_id=active,
                 sequence=next_seq,
             )
         except SQLAlchemyError as exc:
@@ -689,24 +821,236 @@ class SqlStateStore:
             raise _wrap_state_store_error(exc, session_id=session_id, operation="delete") from exc
 
     # --- Branching (BR-004) -------------------------------------------------
-    # Real implementations land in M3 (schema + lineage queries). These stubs
-    # keep SqlStateStore structurally conformant to the expanded StateStore
-    # protocol while the feature is built branch-by-branch.
+
+    @staticmethod
+    def _materialized_segments(
+        branch_map: dict[str, tuple[str | None, int | None]],
+        branch_id: str,
+    ) -> list[tuple[str, int, int | None]]:
+        """Return ``[(branch_id, low, high)]`` sequence ranges (1-based,
+        ``high`` inclusive or ``None`` for unbounded) whose ordered union is
+        the materialized history of ``branch_id``.
+
+        The SQL mirror of :meth:`MemoryStateStore._materialize`'s recursion:
+        a branch's history is its parent's, truncated at the fork point, plus
+        its own messages. Ranges are disjoint and increasing, so a single
+        ``ORDER BY sequence`` over their union yields append order.
+        """
+        parent, anchor = branch_map[branch_id]
+        if parent is None:
+            return [(branch_id, 1, None)]
+        fork = anchor or 0
+        capped: list[tuple[str, int, int | None]] = []
+        for bid, low, high in SqlStateStore._materialized_segments(branch_map, parent):
+            if low > fork:
+                break
+            new_high = fork if (high is None or high > fork) else high
+            capped.append((bid, low, new_high))
+        capped.append((branch_id, fork + 1, None))
+        return capped
+
+    async def _load_branch_map(
+        self, session: AsyncSession, session_id: str
+    ) -> tuple[dict[str, tuple[str | None, int | None]], str]:
+        """Load the branch lineage map and active head for ``session_id``.
+
+        Returns ``({}, TRUNK_BRANCH_ID)`` for an unknown session. A pre-BR-004
+        session (message rows but no branch records) synthesizes an implicit
+        trunk so reads stay correct with zero migration.
+        """
+        parent = await session.get(AgentSession, session_id)
+        if parent is None:
+            return {}, TRUNK_BRANCH_ID
+        rows = await session.scalars(
+            select(AgentBranch).where(AgentBranch.session_id == session_id)
+        )
+        branch_map: dict[str, tuple[str | None, int | None]] = {
+            row.branch_id: (row.parent_branch_id, row.forked_from_sequence) for row in rows
+        }
+        if not branch_map:
+            branch_map = {TRUNK_BRANCH_ID: (None, None)}
+        active: str = parent.active_branch_id or TRUNK_BRANCH_ID
+        return branch_map, active
+
+    async def _ensure_branch_row(
+        self, session: AsyncSession, session_id: str, branch_id: str
+    ) -> None:
+        """Idempotently create the TRUNK branch row (lazy, on first write).
+
+        Forks create their own rows in :meth:`fork`; only the trunk is
+        materialized lazily. ``ON CONFLICT DO NOTHING`` keeps it race-safe on
+        both dialects. A non-trunk ``branch_id`` is a no-op — its row already
+        exists.
+        """
+        if branch_id != TRUNK_BRANCH_ID:
+            return
+        dialect = session.bind.dialect.name if session.bind is not None else ""
+        values = {
+            "session_id": session_id,
+            "branch_id": TRUNK_BRANCH_ID,
+            "parent_branch_id": None,
+            "forked_from_sequence": None,
+        }
+        stmt: Any
+        if dialect == "postgresql":
+            stmt = pg_insert(AgentBranch).values(**values)
+        else:
+            stmt = sqlite_insert(AgentBranch).values(**values)
+        stmt = stmt.on_conflict_do_nothing(index_elements=["session_id", "branch_id"])
+        await session.execute(stmt)
 
     async def fork(self, session_id: str, from_sequence: int) -> str:
-        """Fork the active branch (BR-004). Not yet implemented for SQL."""
-        raise NotImplementedError("SqlStateStore.fork lands in BR-004 M3")
+        """Fork the active branch at ``from_sequence`` into a new branch.
+
+        Records a new :class:`AgentBranch` row whose parent is the active
+        branch; subsequent appends to it continue the materialized sequence
+        from ``from_sequence``. Does NOT change the active head.
+
+        Raises:
+            ValueError: If the session is unknown, or ``from_sequence`` is
+                outside ``0..head`` of the active branch.
+            fifty_agent_sdk.errors.StateStoreError: On backend failure.
+        """
+        lock = await self._get_session_lock(session_id)
+        try:
+            async with lock, self._session_factory() as session, session.begin():
+                parent = await session.scalar(
+                    select(AgentSession)
+                    .where(AgentSession.session_id == session_id)
+                    .with_for_update()
+                )
+                if parent is None:
+                    raise ValueError(f"cannot fork unknown session {session_id!r}")
+                # Materialize the trunk row so the new branch's lineage is
+                # always resolvable, even for a pre-BR-004 session.
+                await self._ensure_branch_row(session, session_id, TRUNK_BRANCH_ID)
+                branch_map, active = await self._load_branch_map(session, session_id)
+                anchor_active = branch_map[active][1] or 0
+                head_raw = await session.scalar(
+                    select(func.coalesce(func.max(AgentMessage.sequence), anchor_active)).where(
+                        AgentMessage.session_id == session_id,
+                        AgentMessage.branch_id == active,
+                    )
+                )
+                head = int(head_raw) if head_raw is not None else anchor_active
+                if not 0 <= from_sequence <= head:
+                    raise ValueError(
+                        f"from_sequence={from_sequence} out of range 0..{head} "
+                        f"for active branch {active!r} of session {session_id!r}"
+                    )
+                new_id = uuid.uuid4().hex
+                session.add(
+                    AgentBranch(
+                        session_id=session_id,
+                        branch_id=new_id,
+                        parent_branch_id=active,
+                        forked_from_sequence=from_sequence,
+                    )
+                )
+            _log.debug("sql_state_store.fork", session_id=session_id, branch_id=new_id)
+            return new_id
+        except SQLAlchemyError as exc:
+            raise _wrap_state_store_error(exc, session_id=session_id, operation="fork") from exc
 
     async def list_branches(self, session_id: str) -> list[BranchInfo]:
-        """Enumerate branches (BR-004). Not yet implemented for SQL."""
-        raise NotImplementedError("SqlStateStore.list_branches lands in BR-004 M3")
+        """Enumerate all branches of ``session_id`` (trunk first, then by age).
+
+        An unknown session yields ``[]``. A pre-BR-004 session reports a single
+        synthesized trunk.
+
+        Raises:
+            fifty_agent_sdk.errors.StateStoreError: On backend failure.
+        """
+        try:
+            async with self._session_factory() as session:
+                parent = await session.get(AgentSession, session_id)
+                if parent is None:
+                    return []
+                active = parent.active_branch_id or TRUNK_BRANCH_ID
+                rows = list(
+                    await session.scalars(
+                        select(AgentBranch).where(AgentBranch.session_id == session_id)
+                    )
+                )
+                head_result = await session.execute(
+                    select(AgentMessage.branch_id, func.max(AgentMessage.sequence))
+                    .where(AgentMessage.session_id == session_id)
+                    .group_by(AgentMessage.branch_id)
+                )
+                head_map: dict[str, int] = {}
+                for head_row in head_result.all():
+                    if head_row[1] is not None:
+                        head_map[head_row[0]] = int(head_row[1])
+                if not rows:
+                    # Pre-BR-004 session: synthesize the implicit trunk.
+                    return [
+                        BranchInfo(
+                            branch_id=TRUNK_BRANCH_ID,
+                            parent_branch_id=None,
+                            forked_from_sequence=None,
+                            head_sequence=head_map.get(TRUNK_BRANCH_ID, 0),
+                            created_at=parent.created_at,
+                            is_active=(active == TRUNK_BRANCH_ID),
+                        )
+                    ]
+                infos = [
+                    BranchInfo(
+                        branch_id=row.branch_id,
+                        parent_branch_id=row.parent_branch_id,
+                        forked_from_sequence=row.forked_from_sequence,
+                        head_sequence=head_map.get(row.branch_id, row.forked_from_sequence or 0),
+                        created_at=row.created_at,
+                        is_active=(row.branch_id == active),
+                    )
+                    for row in rows
+                ]
+                infos.sort(
+                    key=lambda b: (
+                        0 if b.branch_id == TRUNK_BRANCH_ID else 1,
+                        b.created_at,
+                        b.branch_id,
+                    )
+                )
+                return infos
+        except SQLAlchemyError as exc:
+            raise _wrap_state_store_error(
+                exc, session_id=session_id, operation="list_branches"
+            ) from exc
 
     async def switch_branch(self, session_id: str, branch_id: str) -> None:
-        """Switch the active head (BR-004). Not yet implemented for SQL."""
-        raise NotImplementedError("SqlStateStore.switch_branch lands in BR-004 M3")
+        """Set the session's active head to ``branch_id``.
+
+        Raises:
+            ValueError: If ``branch_id`` does not exist for this session.
+            fifty_agent_sdk.errors.StateStoreError: On backend failure.
+        """
+        lock = await self._get_session_lock(session_id)
+        try:
+            async with lock, self._session_factory() as session, session.begin():
+                parent = await session.scalar(
+                    select(AgentSession)
+                    .where(AgentSession.session_id == session_id)
+                    .with_for_update()
+                )
+                if parent is None:
+                    raise ValueError(
+                        f"branch_id={branch_id!r} does not exist for session {session_id!r}"
+                    )
+                branch_map, _active = await self._load_branch_map(session, session_id)
+                if branch_id not in branch_map:
+                    raise ValueError(
+                        f"branch_id={branch_id!r} does not exist for session {session_id!r}"
+                    )
+                parent.active_branch_id = branch_id
+            _log.debug("sql_state_store.switch_branch", session_id=session_id, branch_id=branch_id)
+        except SQLAlchemyError as exc:
+            raise _wrap_state_store_error(
+                exc, session_id=session_id, operation="switch_branch"
+            ) from exc
 
 
 __all__ = [
+    "AgentBranch",
     "AgentMessage",
     "AgentSession",
     "SqlStateStore",
