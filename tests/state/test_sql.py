@@ -638,31 +638,42 @@ async def test_consumer_owned_engine_is_not_disposed_on_aclose(
 
 
 def test_metadata_exposes_both_tables() -> None:
-    """``sql_metadata`` lists both SDK tables for Alembic autogenerate."""
+    """``sql_metadata`` lists the SDK tables for Alembic autogenerate."""
     tables = set(sql_metadata.tables.keys())
     assert "agent_sessions" in tables
     assert "agent_messages" in tables
+    assert "agent_branches" in tables  # BR-004
 
 
 def test_metadata_columns_match_schema() -> None:
-    """Column names align with the brief's documented schema."""
+    """Column names align with the documented schema (incl. BR-004 branching)."""
     sessions = sql_metadata.tables["agent_sessions"]
     messages = sql_metadata.tables["agent_messages"]
+    branches = sql_metadata.tables["agent_branches"]
 
     assert {c.name for c in sessions.columns} == {
         "session_id",
         "created_at",
         "last_active_at",
         "metadata",  # SQL column name even though Python attribute is `meta`
+        "active_branch_id",  # BR-004
     }
     assert {c.name for c in messages.columns} == {
         "id",
         "session_id",
+        "branch_id",  # BR-004
         "sequence",
         "role",
         "content",
         "name",
         "tool_call_id",
+        "created_at",
+    }
+    assert {c.name for c in branches.columns} == {
+        "session_id",
+        "branch_id",
+        "parent_branch_id",
+        "forked_from_sequence",
         "created_at",
     }
 
@@ -677,14 +688,15 @@ async def test_metadata_create_all_is_idempotent(engine: AsyncEngine) -> None:
     assert len(await store.get_messages("s1")) == 1
 
 
-def test_metadata_unique_constraint_on_session_sequence() -> None:
-    """The unique constraint on (session_id, sequence) is declared in the schema."""
+def test_metadata_unique_constraint_on_session_branch_sequence() -> None:
+    """The unique constraint on (session_id, branch_id, sequence) is declared (BR-004)."""
     messages = sql_metadata.tables["agent_messages"]
     uq_constraints: list[Any] = [
         c for c in messages.constraints if type(c).__name__ == "UniqueConstraint"
     ]
     assert any(
-        {col.name for col in c.columns} == {"session_id", "sequence"} for c in uq_constraints
+        {col.name for col in c.columns} == {"session_id", "branch_id", "sequence"}
+        for c in uq_constraints
     )
 
 

@@ -226,7 +226,13 @@ async def test_llm_error_run_emits_session_start_then_error() -> None:
 
 async def test_state_store_error_on_assistant_persist_is_audited() -> None:
     """A persist_assistant durability failure emits an error audit event."""
-    from fifty_agent_sdk import ChatMessage, MemoryStateStore, StateStore, StateStoreError
+    from fifty_agent_sdk import (
+        BranchInfo,
+        ChatMessage,
+        MemoryStateStore,
+        StateStore,
+        StateStoreError,
+    )
 
     class _FailingAssistantStore:
         """Delegates to memory, but fails the 2nd append (assistant persist)."""
@@ -235,8 +241,10 @@ async def test_state_store_error_on_assistant_persist_is_audited() -> None:
             self._inner = MemoryStateStore()
             self.append_calls = 0
 
-        async def get_messages(self, session_id: str) -> list[ChatMessage]:
-            return await self._inner.get_messages(session_id)
+        async def get_messages(
+            self, session_id: str, *, branch_id: str | None = None
+        ) -> list[ChatMessage]:
+            return await self._inner.get_messages(session_id, branch_id=branch_id)
 
         async def append(self, session_id: str, message: ChatMessage) -> None:
             self.append_calls += 1
@@ -249,6 +257,15 @@ async def test_state_store_error_on_assistant_persist_is_audited() -> None:
 
         async def delete(self, session_id: str) -> None:
             await self._inner.delete(session_id)
+
+        async def fork(self, session_id: str, from_sequence: int) -> str:
+            return await self._inner.fork(session_id, from_sequence)
+
+        async def list_branches(self, session_id: str) -> list[BranchInfo]:
+            return await self._inner.list_branches(session_id)
+
+        async def switch_branch(self, session_id: str, branch_id: str) -> None:
+            await self._inner.switch_branch(session_id, branch_id)
 
     failing: StateStore = _FailingAssistantStore()
     llm = FakeLLMClient(replies=[make_response(final_json("answer"))])

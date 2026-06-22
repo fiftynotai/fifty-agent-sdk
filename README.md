@@ -134,6 +134,13 @@ provider differences are absorbed entirely by that one argument.
 infrastructure. `SqlStateStore` and `RedisStateStore` are durable backends
 behind the `sql` and `redis` extras respectively.
 
+Every session is a **tree of branches** with an active head. `fork`,
+`switch_branch`, `list_branches`, and branch-scoped `get_messages(...,
+branch_id=...)` give you the "edit a message / regenerate" model — the edited
+turn forks a new branch and the old line stays reachable — while `append`
+always writes to the active branch. Branching is data-additive: existing
+single-line sessions read as the `trunk` branch with no migration.
+
 ### The event stream
 
 Every step of the ReACT cycle emits exactly one event from the `AgentEvent`

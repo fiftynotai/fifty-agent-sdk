@@ -19,13 +19,15 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 from fifty_agent_sdk.state.memory import MemoryStateStore
-from fifty_agent_sdk.state.protocol import StateStore
+from fifty_agent_sdk.state.protocol import TRUNK_BRANCH_ID, BranchInfo, StateStore
 
 if TYPE_CHECKING:
     from fifty_agent_sdk.state.redis import RedisStateStore
     from fifty_agent_sdk.state.sql import SqlStateStore, sql_metadata
 
 __all__ = [
+    "TRUNK_BRANCH_ID",
+    "BranchInfo",
     "MemoryStateStore",
     "RedisStateStore",
     "SqlStateStore",

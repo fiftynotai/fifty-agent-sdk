@@ -95,7 +95,7 @@ async def test_delete_evicts_per_session_lock() -> None:
     assert "s1" in store._locks
     await store.delete("s1")
     assert "s1" not in store._locks
-    assert "s1" not in store._messages
+    assert "s1" not in store._sessions
 
 
 # ---------------------------------------------------------------------------
