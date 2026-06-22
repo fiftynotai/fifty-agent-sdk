@@ -207,7 +207,10 @@ async def test_default_key_prefix_is_applied(store: RedisStateStore) -> None:
     """With no override, keys are namespaced under ``fifty_agent_sdk:state:``."""
     await store.append("s1", ChatMessage(role="user", content="a"))
     keys = await store._client.keys("*")
-    assert keys == ["fifty_agent_sdk:state:s1"]
+    # The trunk's messages live in the bare key; a :branches existence marker
+    # also exists (BR-003). Both must carry the configured prefix.
+    assert "fifty_agent_sdk:state:s1" in keys
+    assert all(k.startswith("fifty_agent_sdk:state:") for k in keys)
 
 
 async def test_custom_key_prefix_is_applied() -> None:
@@ -217,7 +220,8 @@ async def test_custom_key_prefix_is_applied() -> None:
     try:
         await s.append("s1", ChatMessage(role="user", content="a"))
         keys = await s._client.keys("*")
-        assert keys == ["custom:ns:s1"]
+        assert "custom:ns:s1" in keys
+        assert all(k.startswith("custom:ns:") for k in keys)
     finally:
         await s.aclose()
 

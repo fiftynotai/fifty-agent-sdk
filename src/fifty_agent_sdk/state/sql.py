@@ -132,10 +132,8 @@ try:
         String,
         Text,
         UniqueConstraint,
-        and_,
         delete,
         func,
-        or_,
         select,
     )
     from sqlalchemy.dialects.postgresql import JSONB
@@ -652,32 +650,28 @@ class SqlStateStore:
                     raise ValueError(
                         f"branch_id={target!r} does not exist for session {session_id!r}"
                     )
-                # Materialize the branch as a union of disjoint, increasing
-                # sequence ranges over the lineage; ORDER BY sequence then
-                # yields append order with no post-processing.
-                segments = self._materialized_segments(branch_map, target)
-                conds = [
-                    and_(
-                        AgentMessage.branch_id == bid,
-                        AgentMessage.sequence >= low,
-                        *([AgentMessage.sequence <= high] if high is not None else []),
-                    )
-                    for bid, low, high in segments
-                ]
+                # Assemble the branch's history BY POSITION (mirrors
+                # MemoryStateStore): materialize(parent)[:fork_point] + own.
+                # Position-based, NOT sequence-based: truncate_after frees
+                # sequence numbers that later appends reuse, so a fork point is
+                # a COUNT of inherited messages, not a sequence value. One query
+                # fetches all of the session's rows; assembly happens in Python.
                 rows = await session.scalars(
                     select(AgentMessage)
-                    .where(AgentMessage.session_id == session_id, or_(*conds))
-                    .order_by(AgentMessage.sequence.asc())
+                    .where(AgentMessage.session_id == session_id)
+                    .order_by(AgentMessage.branch_id.asc(), AgentMessage.sequence.asc())
                 )
-                messages = [
-                    ChatMessage(
-                        role=row.role,  # type: ignore[arg-type]
-                        content=row.content,
-                        name=row.name,
-                        tool_call_id=row.tool_call_id,
+                by_branch: dict[str, list[ChatMessage]] = {}
+                for row in rows:
+                    by_branch.setdefault(row.branch_id, []).append(
+                        ChatMessage(
+                            role=row.role,  # type: ignore[arg-type]
+                            content=row.content,
+                            name=row.name,
+                            tool_call_id=row.tool_call_id,
+                        )
                     )
-                    for row in rows
-                ]
+                messages = self._materialize_positional(branch_map, by_branch, target)
                 _log.debug(
                     "sql_state_store.get_messages",
                     session_id=session_id,
@@ -824,31 +818,55 @@ class SqlStateStore:
     # --- Branching (BR-004) -------------------------------------------------
 
     @staticmethod
-    def _materialized_segments(
+    def _materialize_positional(
         branch_map: dict[str, tuple[str | None, int | None]],
+        by_branch: dict[str, list[ChatMessage]],
         branch_id: str,
-    ) -> list[tuple[str, int, int | None]]:
-        """Return ``[(branch_id, low, high)]`` sequence ranges (1-based,
-        ``high`` inclusive or ``None`` for unbounded) whose ordered union is
-        the materialized history of ``branch_id``.
+    ) -> list[ChatMessage]:
+        """Assemble a branch's materialized history by POSITION.
 
-        The SQL mirror of :meth:`MemoryStateStore._materialize`'s recursion:
-        a branch's history is its parent's, truncated at the fork point, plus
-        its own messages. Ranges are disjoint and increasing, so a single
-        ``ORDER BY sequence`` over their union yields append order.
+        The SQL mirror of :meth:`MemoryStateStore._materialize`: a branch's
+        history is its parent's history truncated at the fork point (a count of
+        inherited messages), followed by its own messages. ``by_branch`` maps
+        each branch id to its own messages in append order.
         """
         parent, anchor = branch_map[branch_id]
+        own = by_branch.get(branch_id, [])
         if parent is None:
-            return [(branch_id, 1, None)]
-        fork = anchor or 0
-        capped: list[tuple[str, int, int | None]] = []
-        for bid, low, high in SqlStateStore._materialized_segments(branch_map, parent):
-            if low > fork:
-                break
-            new_high = fork if (high is None or high > fork) else high
-            capped.append((bid, low, new_high))
-        capped.append((branch_id, fork + 1, None))
-        return capped
+            return list(own)
+        parent_hist = SqlStateStore._materialize_positional(branch_map, by_branch, parent)
+        return parent_hist[: anchor or 0] + list(own)
+
+    @staticmethod
+    def _materialized_len(
+        branch_map: dict[str, tuple[str | None, int | None]],
+        own_counts: dict[str, int],
+        branch_id: str,
+    ) -> int:
+        """Return the length of ``branch_id``'s materialized history.
+
+        ``min(anchor, len(parent_history)) + own_count`` — the length analogue
+        of :meth:`_materialize_positional`. ``min`` is load-bearing: if an
+        ancestor was truncated below this branch's fork point, the inherited
+        portion is bounded by the ancestor's (shortened) length, matching the
+        Memory reference. This is the head used for ``fork`` bounds and
+        :class:`BranchInfo.head_sequence`.
+        """
+        parent, anchor = branch_map[branch_id]
+        own = own_counts.get(branch_id, 0)
+        if parent is None:
+            return own
+        parent_len = SqlStateStore._materialized_len(branch_map, own_counts, parent)
+        return min(anchor or 0, parent_len) + own
+
+    async def _own_counts(self, session: AsyncSession, session_id: str) -> dict[str, int]:
+        """Return ``{branch_id: own_message_count}`` for the session (one query)."""
+        result = await session.execute(
+            select(AgentMessage.branch_id, func.count())
+            .where(AgentMessage.session_id == session_id)
+            .group_by(AgentMessage.branch_id)
+        )
+        return {row[0]: int(row[1]) for row in result.all()}
 
     async def _load_branch_map(
         self, session: AsyncSession, session_id: str
@@ -926,14 +944,8 @@ class SqlStateStore:
                 # always resolvable, even for a pre-BR-004 session.
                 await self._ensure_branch_row(session, session_id, TRUNK_BRANCH_ID)
                 branch_map, active = await self._load_branch_map(session, session_id)
-                anchor_active = branch_map[active][1] or 0
-                head_raw = await session.scalar(
-                    select(func.coalesce(func.max(AgentMessage.sequence), anchor_active)).where(
-                        AgentMessage.session_id == session_id,
-                        AgentMessage.branch_id == active,
-                    )
-                )
-                head = int(head_raw) if head_raw is not None else anchor_active
+                own_counts = await self._own_counts(session, session_id)
+                head = self._materialized_len(branch_map, own_counts, active)
                 if not 0 <= from_sequence <= head:
                     raise ValueError(
                         f"from_sequence={from_sequence} out of range 0..{head} "
@@ -973,15 +985,12 @@ class SqlStateStore:
                         select(AgentBranch).where(AgentBranch.session_id == session_id)
                     )
                 )
-                head_result = await session.execute(
-                    select(AgentMessage.branch_id, func.max(AgentMessage.sequence))
-                    .where(AgentMessage.session_id == session_id)
-                    .group_by(AgentMessage.branch_id)
-                )
-                head_map: dict[str, int] = {}
-                for head_row in head_result.all():
-                    if head_row[1] is not None:
-                        head_map[head_row[0]] = int(head_row[1])
+                branch_map: dict[str, tuple[str | None, int | None]] = {
+                    row.branch_id: (row.parent_branch_id, row.forked_from_sequence) for row in rows
+                }
+                if not branch_map:
+                    branch_map = {TRUNK_BRANCH_ID: (None, None)}
+                own_counts = await self._own_counts(session, session_id)
                 if not rows:
                     # Pre-BR-004 session: synthesize the implicit trunk.
                     return [
@@ -989,7 +998,9 @@ class SqlStateStore:
                             branch_id=TRUNK_BRANCH_ID,
                             parent_branch_id=None,
                             forked_from_sequence=None,
-                            head_sequence=head_map.get(TRUNK_BRANCH_ID, 0),
+                            head_sequence=self._materialized_len(
+                                branch_map, own_counts, TRUNK_BRANCH_ID
+                            ),
                             created_at=parent.created_at,
                             is_active=(active == TRUNK_BRANCH_ID),
                         )
@@ -999,7 +1010,7 @@ class SqlStateStore:
                         branch_id=row.branch_id,
                         parent_branch_id=row.parent_branch_id,
                         forked_from_sequence=row.forked_from_sequence,
-                        head_sequence=head_map.get(row.branch_id, row.forked_from_sequence or 0),
+                        head_sequence=self._materialized_len(branch_map, own_counts, row.branch_id),
                         created_at=row.created_at,
                         is_active=(row.branch_id == active),
                     )

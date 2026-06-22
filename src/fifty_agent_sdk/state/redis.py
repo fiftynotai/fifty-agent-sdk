@@ -117,6 +117,16 @@ SDK's keys grouped under one namespace so they are easy to spot, scope, or
 flush without disturbing co-tenant data in a shared Redis instance.
 """
 
+_RESERVED_KEY_INFIXES: Final = (":branch:", ":branches", ":active")
+"""Substrings the Redis backend reserves for its per-branch key layout (BR-004).
+
+A ``session_id`` containing one of these would collide with another session's
+auxiliary keys (registry hash / active pointer / fork lists), so the Redis
+backend rejects it with :class:`ValueError`. SDK-generated UUID session ids
+never contain them; hierarchical / tenant-derived ids must avoid them. Memory
+and SQL have no such constraint — they do not derive structured keys.
+"""
+
 
 def _now() -> datetime:
     """Current timezone-aware UTC time (branch creation stamp)."""
@@ -253,16 +263,27 @@ class RedisStateStore:
     def _key(self, session_id: str) -> str:
         """Return the Redis key for ``session_id``.
 
-        The ``session_id`` is opaque (the SDK does no validation, per the
-        :class:`StateStore` contract); it is simply concatenated onto the
-        configured prefix.
+        The ``session_id`` is concatenated onto the configured prefix. It must
+        not contain one of :data:`_RESERVED_KEY_INFIXES` (which would collide
+        with another session's auxiliary keys); such ids are rejected with
+        :class:`ValueError` — the only validation the Redis backend imposes on
+        the otherwise-opaque id.
 
         Args:
             session_id: Opaque session identifier.
 
         Returns:
             The fully-qualified Redis key (``<key_prefix><session_id>``).
+
+        Raises:
+            ValueError: If ``session_id`` contains a reserved key infix.
         """
+        for infix in _RESERVED_KEY_INFIXES:
+            if infix in session_id:
+                raise ValueError(
+                    f"session_id {session_id!r} contains reserved Redis key infix "
+                    f"{infix!r} (reserved: {_RESERVED_KEY_INFIXES})"
+                )
         return f"{self._key_prefix}{session_id}"
 
     async def aclose(self) -> None:
@@ -350,6 +371,26 @@ class RedisStateStore:
             return own
         parent_hist = await self._materialize(session_id, parent, branch_map)
         return parent_hist[: anchor or 0] + own
+
+    async def _materialized_len(
+        self,
+        session_id: str,
+        branch_id: str,
+        branch_map: dict[str, tuple[str | None, int | None]],
+    ) -> int:
+        """Length of ``branch_id``'s materialized history.
+
+        ``min(anchor, len(parent_history)) + own_len`` — the length analogue of
+        :meth:`_materialize`. ``min`` is load-bearing when an ancestor was
+        truncated below this branch's fork point. Used for ``fork`` bounds and
+        :class:`BranchInfo.head_sequence`.
+        """
+        parent, anchor = branch_map[branch_id]
+        own = int(await cast("Any", self._client.llen(self._msgs_key(session_id, branch_id))))
+        if parent is None:
+            return own
+        parent_len = await self._materialized_len(session_id, parent, branch_map)
+        return min(anchor or 0, parent_len) + own
 
     async def _session_keys(self, session_id: str) -> list[str]:
         """Every Redis key backing a session (for TTL refresh and delete)."""
@@ -455,6 +496,10 @@ class RedisStateStore:
         payload = message.model_dump_json()
         try:
             active = await self._get_active(session_id)
+            # Record the trunk in the registry on first write so the session
+            # durably "exists" even after its trunk list is truncated to empty
+            # (an empty Redis list auto-deletes its key).
+            await self._ensure_trunk(session_id)
             key = self._msgs_key(session_id, active)
             ttl = self._ttl_seconds
             ttl_keys: list[str] = []
@@ -529,9 +574,7 @@ class RedisStateStore:
             active = await self._get_active(session_id)
             if active not in branch_map:
                 active = TRUNK_BRANCH_ID
-            anchor_active = branch_map[active][1] or 0
-            own_len = int(await cast("Any", self._client.llen(self._msgs_key(session_id, active))))
-            head = anchor_active + own_len
+            head = await self._materialized_len(session_id, active, branch_map)
             if not 0 <= from_sequence <= head:
                 raise ValueError(
                     f"from_sequence={from_sequence} out of range 0..{head} "
@@ -565,11 +608,10 @@ class RedisStateStore:
             if not await self._session_exists(session_id):
                 return []
             registry = await self._load_registry(session_id)
+            branch_map = self._branch_map(registry)
             active = await self._get_active(session_id)
             infos: list[BranchInfo] = []
             for bid, meta in registry.items():
-                anchor = meta["forked_from_sequence"] or 0
-                own_len = int(await cast("Any", self._client.llen(self._msgs_key(session_id, bid))))
                 created_raw = meta.get("created_at")
                 created = datetime.fromisoformat(created_raw) if created_raw else _now()
                 infos.append(
@@ -577,7 +619,7 @@ class RedisStateStore:
                         branch_id=bid,
                         parent_branch_id=meta["parent_branch_id"],
                         forked_from_sequence=meta["forked_from_sequence"],
-                        head_sequence=anchor + own_len,
+                        head_sequence=await self._materialized_len(session_id, bid, branch_map),
                         created_at=created,
                         is_active=(bid == active),
                     )
