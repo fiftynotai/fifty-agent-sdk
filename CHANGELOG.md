@@ -4,6 +4,13 @@ All notable changes to `fifty-agent-sdk` are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.1] - 2026-06-22
+
+### Fixed
+- `fifty_agent_sdk.__version__` now reports the correct release version. It was
+  pinned at `1.0.0` and missed the 1.1.0 bump; all version sources
+  (`pyproject.toml` and `__init__.py`) are now in agreement.
+
 ## [1.1.0] - 2026-06-22
 
 First public open-source release as a standalone package (`fifty-agent-sdk`),
