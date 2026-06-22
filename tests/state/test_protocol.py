@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-from fifty_agent_sdk import ChatMessage, MemoryStateStore, StateStore
+from fifty_agent_sdk import BranchInfo, ChatMessage, MemoryStateStore, StateStore
 
 
 def test_memory_store_satisfies_protocol() -> None:
@@ -19,13 +19,24 @@ def test_duck_typed_fake_satisfies_protocol() -> None:
     """A structurally-correct fake (no inheritance) passes ``isinstance``."""
 
     class DuckStore:
-        async def get_messages(self, session_id: str) -> list[ChatMessage]:
+        async def get_messages(
+            self, session_id: str, *, branch_id: str | None = None
+        ) -> list[ChatMessage]:
             return []
 
         async def append(self, session_id: str, message: ChatMessage) -> None:
             return None
 
         async def delete(self, session_id: str) -> None:
+            return None
+
+        async def fork(self, session_id: str, from_sequence: int) -> str:
+            return ""
+
+        async def list_branches(self, session_id: str) -> list[BranchInfo]:
+            return []
+
+        async def switch_branch(self, session_id: str, branch_id: str) -> None:
             return None
 
     duck = DuckStore()

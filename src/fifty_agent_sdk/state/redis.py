@@ -89,6 +89,7 @@ except ImportError as exc:  # pragma: no cover - exercised via importlib in test
 
 from fifty_agent_sdk.errors import StateStoreError
 from fifty_agent_sdk.llm.types import ChatMessage
+from fifty_agent_sdk.state.protocol import TRUNK_BRANCH_ID, BranchInfo
 
 _log: Final = structlog.get_logger(__name__)
 """Module-level structured logger.
@@ -254,7 +255,9 @@ class RedisStateStore:
         """
         await self._client.aclose()
 
-    async def get_messages(self, session_id: str) -> list[ChatMessage]:
+    async def get_messages(
+        self, session_id: str, *, branch_id: str | None = None
+    ) -> list[ChatMessage]:
         """Return the persisted messages for ``session_id``.
 
         Returns a freshly-constructed list of :class:`ChatMessage`
@@ -265,6 +268,8 @@ class RedisStateStore:
 
         Args:
             session_id: Opaque session identifier.
+            branch_id: Which branch to read (BR-004). ``None`` reads the
+                active branch; pre-M4 only the trunk exists.
 
         Returns:
             A list of :class:`ChatMessage` values in append order,
@@ -275,6 +280,10 @@ class RedisStateStore:
                 fails. ``context["wrapped"]`` carries the underlying
                 redis-py exception class name.
         """
+        # TODO(BR-004 M4): full branch-scoped reads via the per-branch key
+        # redesign. Until then Redis has only the trunk single-list.
+        if branch_id is not None and branch_id != TRUNK_BRANCH_ID:
+            raise NotImplementedError("RedisStateStore branch-scoped reads land in BR-004 M4")
         try:
             # redis-py types command methods as ``Awaitable[Any] | Any``
             # (sync and async clients share method bodies); ``cast`` pins
@@ -366,6 +375,23 @@ class RedisStateStore:
             )
         except RedisError as exc:
             raise _wrap_state_store_error(exc, session_id=session_id, operation="delete") from exc
+
+    # --- Branching (BR-004) -------------------------------------------------
+    # Real implementations land in M4 (per-branch key redesign). These stubs
+    # keep RedisStateStore structurally conformant to the expanded StateStore
+    # protocol while the feature is built branch-by-branch.
+
+    async def fork(self, session_id: str, from_sequence: int) -> str:
+        """Fork the active branch (BR-004). Not yet implemented for Redis."""
+        raise NotImplementedError("RedisStateStore.fork lands in BR-004 M4")
+
+    async def list_branches(self, session_id: str) -> list[BranchInfo]:
+        """Enumerate branches (BR-004). Not yet implemented for Redis."""
+        raise NotImplementedError("RedisStateStore.list_branches lands in BR-004 M4")
+
+    async def switch_branch(self, session_id: str, branch_id: str) -> None:
+        """Switch the active head (BR-004). Not yet implemented for Redis."""
+        raise NotImplementedError("RedisStateStore.switch_branch lands in BR-004 M4")
 
 
 __all__ = ["RedisStateStore"]

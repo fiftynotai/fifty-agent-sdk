@@ -142,6 +142,7 @@ except ImportError as exc:  # pragma: no cover - exercised via importlib in test
 
 from fifty_agent_sdk.errors import StateStoreError
 from fifty_agent_sdk.llm.types import ChatMessage
+from fifty_agent_sdk.state.protocol import TRUNK_BRANCH_ID, BranchInfo
 
 _log: Final = structlog.get_logger(__name__)
 """Module-level structured logger.
@@ -509,7 +510,9 @@ class SqlStateStore:
             stmt = stmt.on_conflict_do_nothing(index_elements=["session_id"])
         await session.execute(stmt)
 
-    async def get_messages(self, session_id: str) -> list[ChatMessage]:
+    async def get_messages(
+        self, session_id: str, *, branch_id: str | None = None
+    ) -> list[ChatMessage]:
         """Return the persisted messages for ``session_id``.
 
         Returns a freshly-constructed list of :class:`ChatMessage`
@@ -518,6 +521,8 @@ class SqlStateStore:
 
         Args:
             session_id: Opaque session identifier.
+            branch_id: Which branch to read (BR-004). ``None`` reads the
+                active branch; pre-M3 only the trunk exists.
 
         Returns:
             A list of :class:`ChatMessage` values in append order.
@@ -527,6 +532,10 @@ class SqlStateStore:
                 fails. ``context["wrapped"]`` carries the underlying
                 SQLAlchemy exception class name.
         """
+        # TODO(BR-004 M3): full branch-scoped reads. Until then SQL has only
+        # the trunk; a non-trunk branch request is not yet serviceable.
+        if branch_id is not None and branch_id != TRUNK_BRANCH_ID:
+            raise NotImplementedError("SqlStateStore branch-scoped reads land in BR-004 M3")
         try:
             async with self._session_factory() as session:
                 rows = await session.scalars(
@@ -678,6 +687,23 @@ class SqlStateStore:
             )
         except SQLAlchemyError as exc:
             raise _wrap_state_store_error(exc, session_id=session_id, operation="delete") from exc
+
+    # --- Branching (BR-004) -------------------------------------------------
+    # Real implementations land in M3 (schema + lineage queries). These stubs
+    # keep SqlStateStore structurally conformant to the expanded StateStore
+    # protocol while the feature is built branch-by-branch.
+
+    async def fork(self, session_id: str, from_sequence: int) -> str:
+        """Fork the active branch (BR-004). Not yet implemented for SQL."""
+        raise NotImplementedError("SqlStateStore.fork lands in BR-004 M3")
+
+    async def list_branches(self, session_id: str) -> list[BranchInfo]:
+        """Enumerate branches (BR-004). Not yet implemented for SQL."""
+        raise NotImplementedError("SqlStateStore.list_branches lands in BR-004 M3")
+
+    async def switch_branch(self, session_id: str, branch_id: str) -> None:
+        """Switch the active head (BR-004). Not yet implemented for SQL."""
+        raise NotImplementedError("SqlStateStore.switch_branch lands in BR-004 M3")
 
 
 __all__ = [

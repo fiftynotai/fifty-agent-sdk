@@ -23,6 +23,7 @@ from fifty_agent_sdk import (
     AgentEvent,
     AgentLoop,
     AgentRunner,
+    BranchInfo,
     ChatMessage,
     ErrorEvent,
     FinalEvent,
@@ -508,7 +509,9 @@ class _FailingAppendStore:
     def __init__(self) -> None:
         self.get_calls = 0
 
-    async def get_messages(self, session_id: str) -> list[ChatMessage]:
+    async def get_messages(
+        self, session_id: str, *, branch_id: str | None = None
+    ) -> list[ChatMessage]:
         self.get_calls += 1
         return []
 
@@ -521,11 +524,22 @@ class _FailingAppendStore:
     async def delete(self, session_id: str) -> None:
         return None
 
+    async def fork(self, session_id: str, from_sequence: int) -> str:
+        raise NotImplementedError
+
+    async def list_branches(self, session_id: str) -> list[BranchInfo]:
+        raise NotImplementedError
+
+    async def switch_branch(self, session_id: str, branch_id: str) -> None:
+        raise NotImplementedError
+
 
 class _FailingGetStore:
     """Test double whose ``get_messages`` raises ``StateStoreError``."""
 
-    async def get_messages(self, session_id: str) -> list[ChatMessage]:
+    async def get_messages(
+        self, session_id: str, *, branch_id: str | None = None
+    ) -> list[ChatMessage]:
         raise StateStoreError(
             "backend down on read",
             context={"session_id": session_id},
@@ -536,6 +550,15 @@ class _FailingGetStore:
 
     async def delete(self, session_id: str) -> None:
         return None
+
+    async def fork(self, session_id: str, from_sequence: int) -> str:
+        raise NotImplementedError
+
+    async def list_branches(self, session_id: str) -> list[BranchInfo]:
+        raise NotImplementedError
+
+    async def switch_branch(self, session_id: str, branch_id: str) -> None:
+        raise NotImplementedError
 
 
 async def test_state_store_error_on_load_propagates_before_any_event() -> None:
@@ -577,8 +600,10 @@ class _FailingNthAppendStore:
         self._fail_on_call = fail_on_call
         self.append_calls = 0
 
-    async def get_messages(self, session_id: str) -> list[ChatMessage]:
-        return await self._inner.get_messages(session_id)
+    async def get_messages(
+        self, session_id: str, *, branch_id: str | None = None
+    ) -> list[ChatMessage]:
+        return await self._inner.get_messages(session_id, branch_id=branch_id)
 
     async def append(self, session_id: str, message: ChatMessage) -> None:
         self.append_calls += 1
@@ -594,6 +619,15 @@ class _FailingNthAppendStore:
 
     async def delete(self, session_id: str) -> None:
         await self._inner.delete(session_id)
+
+    async def fork(self, session_id: str, from_sequence: int) -> str:
+        return await self._inner.fork(session_id, from_sequence)
+
+    async def list_branches(self, session_id: str) -> list[BranchInfo]:
+        return await self._inner.list_branches(session_id)
+
+    async def switch_branch(self, session_id: str, branch_id: str) -> None:
+        await self._inner.switch_branch(session_id, branch_id)
 
 
 async def test_state_store_error_on_assistant_append_propagates_after_final_event() -> None:

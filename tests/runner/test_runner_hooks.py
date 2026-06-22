@@ -26,6 +26,7 @@ import pytest
 import structlog
 
 from fifty_agent_sdk import (
+    BranchInfo,
     ChatMessage,
     FinalEvent,
     Hooks,
@@ -273,8 +274,10 @@ class _FailingAssistantStore:
         self._inner = MemoryStateStore()
         self.append_calls = 0
 
-    async def get_messages(self, session_id: str) -> list[ChatMessage]:
-        return await self._inner.get_messages(session_id)
+    async def get_messages(
+        self, session_id: str, *, branch_id: str | None = None
+    ) -> list[ChatMessage]:
+        return await self._inner.get_messages(session_id, branch_id=branch_id)
 
     async def append(self, session_id: str, message: ChatMessage) -> None:
         self.append_calls += 1
@@ -287,6 +290,15 @@ class _FailingAssistantStore:
 
     async def delete(self, session_id: str) -> None:
         await self._inner.delete(session_id)
+
+    async def fork(self, session_id: str, from_sequence: int) -> str:
+        return await self._inner.fork(session_id, from_sequence)
+
+    async def list_branches(self, session_id: str) -> list[BranchInfo]:
+        return await self._inner.list_branches(session_id)
+
+    async def switch_branch(self, session_id: str, branch_id: str) -> None:
+        await self._inner.switch_branch(session_id, branch_id)
 
 
 async def test_on_error_fires_on_state_store_failure() -> None:
