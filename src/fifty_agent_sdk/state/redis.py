@@ -17,26 +17,32 @@ Extras requirement
     this module's import, and a missing dependency surfaces as a clear
     :class:`ImportError` referencing the extras line above.
 
-Key layout
-    Each session maps to a single Redis key::
+Key layout (BR-004 branching)
+    The trunk branch reuses the bare session key, so pre-BR-004 single-list
+    data IS the trunk with zero migration::
 
-        <key_prefix><session_id>
+        <key_prefix><session_id>              # trunk's own message list
+        <key_prefix><session_id>:branch:<id>  # a fork's own message list
+        <key_prefix><session_id>:branches     # hash: branch_id -> metadata JSON
+        <key_prefix><session_id>:active       # string: the active head branch id
 
-    where ``key_prefix`` defaults to ``"fifty_agent_sdk:state:"``. The value is a
-    Redis list whose members are JSON-encoded :class:`ChatMessage` payloads
-    (one ``model_dump_json()`` string per element). ``RPUSH`` appends to the
-    tail, ``LRANGE 0 -1`` reads the whole list in append order — Redis list
-    ordering is exactly the contract's append ordering, with no separate
-    sequence column needed.
+    where ``key_prefix`` defaults to ``"fifty_agent_sdk:state:"``. Each message
+    list holds JSON-encoded :class:`ChatMessage` payloads (``RPUSH`` to append,
+    ``LRANGE 0 -1`` to read in append order). A branch's materialized history
+    is ``parent_history[:fork_point] + own`` (see
+    :meth:`RedisStateStore._materialize`); a message's materialized sequence is
+    ``anchor + index``, so no sequence column is stored. Existing single-list
+    sessions read as the trunk and gain the extra keys only when first forked.
 
 TTL semantics
-    When ``ttl_seconds`` is a positive integer, every :meth:`append` issues
-    an ``EXPIRE`` alongside the ``RPUSH`` so the session's expiry window
-    slides forward on each write — a "hot session stays alive" cache. A
-    session that goes quiet for longer than ``ttl_seconds`` is evicted by
-    Redis. When ``ttl_seconds`` is ``None`` no ``EXPIRE`` is ever issued and
-    the list is durable until :meth:`delete`. :meth:`get_messages` NEVER
-    sets or refreshes a TTL — reading a session does not keep it alive.
+    When ``ttl_seconds`` is a positive integer, every :meth:`append` re-issues
+    ``EXPIRE`` across ALL of the session's keys (trunk, every fork list, the
+    registry, and the active pointer) so the whole session's expiry window
+    slides forward together — a "hot session stays alive" cache, and a fork's
+    parent line never expires out from under it. When ``ttl_seconds`` is
+    ``None`` no ``EXPIRE`` is ever issued and the session is durable until
+    :meth:`delete`. :meth:`get_messages` NEVER sets or refreshes a TTL —
+    reading a session does not keep it alive.
 
 Atomicity
     :meth:`append` issues ``RPUSH`` and (when applicable) ``EXPIRE`` inside a
@@ -75,6 +81,9 @@ Connection ownership
 
 from __future__ import annotations
 
+import json
+import uuid
+from datetime import UTC, datetime
 from typing import Any, Final, cast
 
 import structlog
@@ -107,6 +116,16 @@ Prepended to each ``session_id`` to form the Redis key. A prefix keeps the
 SDK's keys grouped under one namespace so they are easy to spot, scope, or
 flush without disturbing co-tenant data in a shared Redis instance.
 """
+
+
+def _now() -> datetime:
+    """Current timezone-aware UTC time (branch creation stamp)."""
+    return datetime.now(UTC)
+
+
+def _now_iso() -> str:
+    """Current UTC time as an ISO-8601 string (stored in the branch registry)."""
+    return _now().isoformat()
 
 
 def _wrap_state_store_error(
@@ -255,6 +274,104 @@ class RedisStateStore:
         """
         await self._client.aclose()
 
+    # --- Branching key layout & helpers (BR-004) ----------------------------
+
+    def _msgs_key(self, session_id: str, branch_id: str) -> str:
+        """Redis key for a branch's OWN (non-inherited) message list.
+
+        The trunk reuses the bare session key (``<prefix><session_id>``) so
+        pre-BR-004 single-list data IS the trunk with zero migration; forks
+        get a ``:branch:<branch_id>`` suffix.
+        """
+        if branch_id == TRUNK_BRANCH_ID:
+            return self._key(session_id)
+        return f"{self._key(session_id)}:branch:{branch_id}"
+
+    def _branches_key(self, session_id: str) -> str:
+        """Redis key for the branch-registry hash (``branch_id`` -> metadata JSON)."""
+        return f"{self._key(session_id)}:branches"
+
+    def _active_key(self, session_id: str) -> str:
+        """Redis key for the active-head pointer (a string holding a branch id)."""
+        return f"{self._key(session_id)}:active"
+
+    async def _get_active(self, session_id: str) -> str:
+        """Return the active branch id, defaulting to the trunk."""
+        active = await cast("Any", self._client.get(self._active_key(session_id)))
+        return str(active) if active is not None else TRUNK_BRANCH_ID
+
+    async def _session_exists(self, session_id: str) -> bool:
+        """True if any key backs this session (trunk list, registry, or active)."""
+        async with self._client.pipeline(transaction=False) as pipe:
+            pipe.exists(self._msgs_key(session_id, TRUNK_BRANCH_ID))
+            pipe.exists(self._branches_key(session_id))
+            pipe.exists(self._active_key(session_id))
+            results = await pipe.execute()
+        return any(int(r) for r in results)
+
+    async def _load_registry(self, session_id: str) -> dict[str, dict[str, Any]]:
+        """Load the branch-registry hash, always including a (possibly
+        synthesized) trunk entry so the lineage is resolvable."""
+        raw = await cast("Any", self._client.hgetall(self._branches_key(session_id)))
+        registry: dict[str, dict[str, Any]] = {bid: json.loads(meta) for bid, meta in raw.items()}
+        if TRUNK_BRANCH_ID not in registry:
+            registry[TRUNK_BRANCH_ID] = {
+                "parent_branch_id": None,
+                "forked_from_sequence": None,
+                "created_at": None,
+            }
+        return registry
+
+    @staticmethod
+    def _branch_map(
+        registry: dict[str, dict[str, Any]],
+    ) -> dict[str, tuple[str | None, int | None]]:
+        """Project the registry to a ``branch_id -> (parent, anchor)`` map."""
+        return {
+            bid: (meta["parent_branch_id"], meta["forked_from_sequence"])
+            for bid, meta in registry.items()
+        }
+
+    async def _materialize(
+        self,
+        session_id: str,
+        branch_id: str,
+        branch_map: dict[str, tuple[str | None, int | None]],
+    ) -> list[ChatMessage]:
+        """Materialize a branch's full history: ``parent_history[:fork] + own``.
+
+        Mirrors :meth:`MemoryStateStore._materialize`; each branch's own list
+        is one ``LRANGE`` and the recursion walks the lineage to the trunk.
+        """
+        parent, anchor = branch_map[branch_id]
+        raw = await cast("Any", self._client.lrange(self._msgs_key(session_id, branch_id), 0, -1))
+        own = [ChatMessage.model_validate_json(item) for item in raw]
+        if parent is None:
+            return own
+        parent_hist = await self._materialize(session_id, parent, branch_map)
+        return parent_hist[: anchor or 0] + own
+
+    async def _session_keys(self, session_id: str) -> list[str]:
+        """Every Redis key backing a session (for TTL refresh and delete)."""
+        fork_ids = await cast("Any", self._client.hkeys(self._branches_key(session_id)))
+        keys = [
+            self._msgs_key(session_id, TRUNK_BRANCH_ID),
+            self._branches_key(session_id),
+            self._active_key(session_id),
+        ]
+        keys.extend(self._msgs_key(session_id, fid) for fid in fork_ids if fid != TRUNK_BRANCH_ID)
+        return keys
+
+    async def _ensure_trunk(self, session_id: str) -> None:
+        """Idempotently record the trunk in the registry with a creation stamp
+        (lazy, on first fork) via ``HSETNX``."""
+        meta = json.dumps(
+            {"parent_branch_id": None, "forked_from_sequence": None, "created_at": _now_iso()}
+        )
+        await cast(
+            "Any", self._client.hsetnx(self._branches_key(session_id), TRUNK_BRANCH_ID, meta)
+        )
+
     async def get_messages(
         self, session_id: str, *, branch_id: str | None = None
     ) -> list[ChatMessage]:
@@ -280,26 +397,33 @@ class RedisStateStore:
                 fails. ``context["wrapped"]`` carries the underlying
                 redis-py exception class name.
         """
-        # TODO(BR-004 M4): full branch-scoped reads via the per-branch key
-        # redesign. Until then Redis has only the trunk single-list.
-        if branch_id is not None and branch_id != TRUNK_BRANCH_ID:
-            raise NotImplementedError("RedisStateStore branch-scoped reads land in BR-004 M4")
         try:
-            # redis-py types command methods as ``Awaitable[Any] | Any``
-            # (sync and async clients share method bodies); ``cast`` pins
-            # the awaitable arm so ``await`` is unambiguous under mypy
-            # --strict. ``decode_responses=True`` guarantees ``str``
-            # members; LRANGE on a missing key returns an empty list.
-            raw: list[str] = await cast("Any", self._client.lrange(self._key(session_id), 0, -1))
-            # A fresh list per call satisfies the defensive-copy invariant
-            # automatically — callers mutating it cannot affect the store.
-            # ValidationError from a corrupt member is intentionally NOT
-            # caught here: a malformed payload is a corruption signal, not
-            # a backend failure.
-            messages = [ChatMessage.model_validate_json(item) for item in raw]
+            registry = await self._load_registry(session_id)
+            branch_map = self._branch_map(registry)
+            if branch_id is not None:
+                # An explicit branch request on an unknown session, or for a
+                # non-existent branch, is a programmer error.
+                if not await self._session_exists(session_id):
+                    raise ValueError(
+                        f"branch_id={branch_id!r} does not exist for unknown session {session_id!r}"
+                    )
+                if branch_id not in branch_map:
+                    raise ValueError(
+                        f"branch_id={branch_id!r} does not exist for session {session_id!r}"
+                    )
+                target = branch_id
+            else:
+                target = await self._get_active(session_id)
+                if target not in branch_map:
+                    target = TRUNK_BRANCH_ID
+            # A fresh list per call satisfies the defensive-copy invariant.
+            # ValidationError from a corrupt member is intentionally NOT caught:
+            # a malformed payload is a corruption signal, not a backend failure.
+            messages = await self._materialize(session_id, target, branch_map)
             _log.debug(
                 "redis_state_store.get_messages",
                 session_id=session_id,
+                branch_id=target,
                 count=len(messages),
             )
             return messages
@@ -309,14 +433,15 @@ class RedisStateStore:
             ) from exc
 
     async def append(self, session_id: str, message: ChatMessage) -> None:
-        """Append ``message`` to the session's ordered message log.
+        """Append ``message`` to the session's **active** branch.
 
-        Issues ``RPUSH`` (and, when ``ttl_seconds`` is set, ``EXPIRE``)
-        inside a single ``MULTI``/``EXEC`` transaction so the write is
-        atomic with respect to concurrent reads on the same session — a
-        reader sees either the pre- or post-append list, never a partial
-        one. When ``ttl_seconds`` is set the ``EXPIRE`` slides the
-        session's expiry window forward on every append.
+        Issues ``RPUSH`` to the active branch's list inside a ``MULTI``/``EXEC``
+        transaction so the write is atomic with respect to concurrent reads on
+        that list. When ``ttl_seconds`` is set, the same transaction re-issues
+        ``EXPIRE`` across ALL of the session's keys (trunk, every fork list,
+        the registry, and the active pointer) so the whole session's expiry
+        window slides forward together — a fork's parent line never expires out
+        from under it.
 
         Args:
             session_id: Opaque session identifier.
@@ -328,20 +453,26 @@ class RedisStateStore:
                 redis-py exception class name.
         """
         payload = message.model_dump_json()
-        key = self._key(session_id)
         try:
-            # transaction=True wraps RPUSH + EXPIRE in a MULTI/EXEC block:
-            # the two commands apply as one atomic unit, giving the
-            # append-vs-read atomicity the StateStore contract requires.
+            active = await self._get_active(session_id)
+            key = self._msgs_key(session_id, active)
+            ttl = self._ttl_seconds
+            ttl_keys: list[str] = []
+            if ttl is not None:
+                ttl_keys = await self._session_keys(session_id)
+                if key not in ttl_keys:
+                    ttl_keys.append(key)
             async with self._client.pipeline(transaction=True) as pipe:
                 pipe.rpush(key, payload)
-                if self._ttl_seconds is not None:
-                    pipe.expire(key, self._ttl_seconds)
+                if ttl is not None:
+                    for k in ttl_keys:
+                        pipe.expire(k, ttl)
                 await pipe.execute()
             _log.debug(
                 "redis_state_store.append",
                 session_id=session_id,
-                ttl=self._ttl_seconds,
+                branch_id=active,
+                ttl=ttl,
             )
         except RedisError as exc:
             raise _wrap_state_store_error(exc, session_id=session_id, operation="append") from exc
@@ -362,12 +493,12 @@ class RedisStateStore:
                 redis-py exception class name.
         """
         try:
-            # redis-py types command methods as ``Awaitable[Any] | Any``
-            # because the sync and async clients share the same method
-            # bodies; ``cast`` pins the awaitable arm so ``await`` is
-            # unambiguous under mypy --strict. The DEL reply is an int
-            # count of keys removed.
-            removed = int(await cast("Any", self._client.delete(self._key(session_id))))
+            # Delete every key backing the session (trunk list, all fork
+            # lists, the registry, and the active pointer). DEL ignores
+            # missing keys, so this stays an idempotent no-op on an unknown
+            # session. ``cast`` pins the awaitable arm for mypy --strict.
+            keys = await self._session_keys(session_id)
+            removed = int(await cast("Any", self._client.delete(*keys)))
             _log.debug(
                 "redis_state_store.delete",
                 session_id=session_id,
@@ -376,22 +507,119 @@ class RedisStateStore:
         except RedisError as exc:
             raise _wrap_state_store_error(exc, session_id=session_id, operation="delete") from exc
 
-    # --- Branching (BR-004) -------------------------------------------------
-    # Real implementations land in M4 (per-branch key redesign). These stubs
-    # keep RedisStateStore structurally conformant to the expanded StateStore
-    # protocol while the feature is built branch-by-branch.
-
     async def fork(self, session_id: str, from_sequence: int) -> str:
-        """Fork the active branch (BR-004). Not yet implemented for Redis."""
-        raise NotImplementedError("RedisStateStore.fork lands in BR-004 M4")
+        """Fork the active branch at ``from_sequence`` into a new branch.
+
+        Records a new entry in the branch-registry hash whose parent is the
+        active branch. The new branch's own list is created lazily on its
+        first :meth:`append`. Does NOT change the active head.
+
+        Raises:
+            ValueError: If the session is unknown, or ``from_sequence`` is
+                outside ``0..head`` of the active branch.
+            fifty_agent_sdk.errors.StateStoreError: On backend failure.
+        """
+        try:
+            if not await self._session_exists(session_id):
+                raise ValueError(f"cannot fork unknown session {session_id!r}")
+            # Stamp the trunk's creation time so list_branches is stable.
+            await self._ensure_trunk(session_id)
+            registry = await self._load_registry(session_id)
+            branch_map = self._branch_map(registry)
+            active = await self._get_active(session_id)
+            if active not in branch_map:
+                active = TRUNK_BRANCH_ID
+            anchor_active = branch_map[active][1] or 0
+            own_len = int(await cast("Any", self._client.llen(self._msgs_key(session_id, active))))
+            head = anchor_active + own_len
+            if not 0 <= from_sequence <= head:
+                raise ValueError(
+                    f"from_sequence={from_sequence} out of range 0..{head} "
+                    f"for active branch {active!r} of session {session_id!r}"
+                )
+            new_id = uuid.uuid4().hex
+            meta = json.dumps(
+                {
+                    "parent_branch_id": active,
+                    "forked_from_sequence": from_sequence,
+                    "created_at": _now_iso(),
+                }
+            )
+            await cast("Any", self._client.hset(self._branches_key(session_id), new_id, meta))
+            _log.debug("redis_state_store.fork", session_id=session_id, branch_id=new_id)
+            return new_id
+        except RedisError as exc:
+            raise _wrap_state_store_error(exc, session_id=session_id, operation="fork") from exc
 
     async def list_branches(self, session_id: str) -> list[BranchInfo]:
-        """Enumerate branches (BR-004). Not yet implemented for Redis."""
-        raise NotImplementedError("RedisStateStore.list_branches lands in BR-004 M4")
+        """Enumerate all branches of ``session_id`` (trunk first, then by age).
+
+        An unknown session yields ``[]``. A pre-BR-004 session reports a single
+        synthesized trunk (its ``created_at`` is approximated as "now", since
+        Redis stores no per-key creation time).
+
+        Raises:
+            fifty_agent_sdk.errors.StateStoreError: On backend failure.
+        """
+        try:
+            if not await self._session_exists(session_id):
+                return []
+            registry = await self._load_registry(session_id)
+            active = await self._get_active(session_id)
+            infos: list[BranchInfo] = []
+            for bid, meta in registry.items():
+                anchor = meta["forked_from_sequence"] or 0
+                own_len = int(await cast("Any", self._client.llen(self._msgs_key(session_id, bid))))
+                created_raw = meta.get("created_at")
+                created = datetime.fromisoformat(created_raw) if created_raw else _now()
+                infos.append(
+                    BranchInfo(
+                        branch_id=bid,
+                        parent_branch_id=meta["parent_branch_id"],
+                        forked_from_sequence=meta["forked_from_sequence"],
+                        head_sequence=anchor + own_len,
+                        created_at=created,
+                        is_active=(bid == active),
+                    )
+                )
+            infos.sort(
+                key=lambda b: (
+                    0 if b.branch_id == TRUNK_BRANCH_ID else 1,
+                    b.created_at,
+                    b.branch_id,
+                )
+            )
+            return infos
+        except RedisError as exc:
+            raise _wrap_state_store_error(
+                exc, session_id=session_id, operation="list_branches"
+            ) from exc
 
     async def switch_branch(self, session_id: str, branch_id: str) -> None:
-        """Switch the active head (BR-004). Not yet implemented for Redis."""
-        raise NotImplementedError("RedisStateStore.switch_branch lands in BR-004 M4")
+        """Set the session's active head to ``branch_id``.
+
+        Raises:
+            ValueError: If ``branch_id`` does not exist for this session.
+            fifty_agent_sdk.errors.StateStoreError: On backend failure.
+        """
+        try:
+            if not await self._session_exists(session_id):
+                raise ValueError(
+                    f"branch_id={branch_id!r} does not exist for session {session_id!r}"
+                )
+            registry = await self._load_registry(session_id)
+            if branch_id not in registry:
+                raise ValueError(
+                    f"branch_id={branch_id!r} does not exist for session {session_id!r}"
+                )
+            await cast("Any", self._client.set(self._active_key(session_id), branch_id))
+            _log.debug(
+                "redis_state_store.switch_branch", session_id=session_id, branch_id=branch_id
+            )
+        except RedisError as exc:
+            raise _wrap_state_store_error(
+                exc, session_id=session_id, operation="switch_branch"
+            ) from exc
 
 
 __all__ = ["RedisStateStore"]
