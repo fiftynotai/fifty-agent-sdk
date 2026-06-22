@@ -18,6 +18,12 @@ Optional extra surface
 
 from __future__ import annotations
 
+from importlib.metadata import (
+    PackageNotFoundError as _PackageNotFoundError,
+)
+from importlib.metadata import (
+    version as _pkg_version,
+)
 from typing import TYPE_CHECKING, Any
 
 from fifty_agent_sdk.audit import AuditEvent, AuditSink, ConsoleAuditSink
@@ -94,7 +100,14 @@ if TYPE_CHECKING:
     from fifty_agent_sdk.state.redis import RedisStateStore
     from fifty_agent_sdk.state.sql import SqlStateStore, sql_metadata
 
-__version__ = "1.1.1"
+try:
+    # Single source of truth: read the version from the installed distribution
+    # metadata (generated from pyproject.toml at build/install time) rather than
+    # hardcoding it here. Prevents the __version__/pyproject drift fixed in
+    # BR-001 from recurring. (TD-001)
+    __version__ = _pkg_version("fifty-agent-sdk")
+except _PackageNotFoundError:  # source/editable checkout with no installed dist-info
+    __version__ = "0.0.0+unknown"
 
 __all__ = [
     "JSON_MODE_OUTPUT_FORMAT",
