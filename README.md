@@ -1,3 +1,7 @@
+<p align="center">
+  <img src=".github/banner.png" alt="fifty-agent-sdk — an embeddable ReACT loop. any endpoint. no infra." width="100%">
+</p>
+
 # fifty-agent-sdk
 
 [![PyPI](https://img.shields.io/pypi/v/fifty-agent-sdk)](https://pypi.org/project/fifty-agent-sdk/)
