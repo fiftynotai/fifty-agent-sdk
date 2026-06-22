@@ -1287,8 +1287,8 @@ async def test_tool_message_role_user_emits_user_role_message() -> None:
     """Happy path: ``tool_message_role="user"`` collapses the synthetic
     post-tool message to ``role="user"`` carrying the tool name inline.
 
-    This is the wire-format the Kalvad GDC proxy at ``gemini.kalvad.cloud``
-    accepts — that provider rejects ``role="tool"`` with HTTP 500.
+    This is the wire-format strict OpenAI-compatible gateways accept —
+    such providers reject ``role="tool"`` with HTTP 500.
     """
     tool = FakeTool("search", result=ToolResult(output={"results": ["a", "b"]}))
     registry = Registry()

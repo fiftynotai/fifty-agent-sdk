@@ -244,8 +244,8 @@ class AgentLoop:
             ``role="tool"`` with ``tool_call_id`` and ``name`` fields. Set
             to ``"user"`` or ``"assistant"`` for providers whose
             chat-message schema only accepts ``system | user | assistant``
-            (e.g. the Kalvad GDC proxy at ``gemini.kalvad.cloud``, which
-            returns HTTP 500 on ``role="tool"``). In non-``"tool"`` mode
+            (e.g. some OpenAI-compatible gateways/proxies, which
+            return HTTP 500 on ``role="tool"``). In non-``"tool"`` mode
             the synthetic message carries the tool name inline in its
             content (so the model retains identity context) and omits
             ``tool_call_id`` / ``name``.
