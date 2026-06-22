@@ -59,12 +59,13 @@ Contract invariants
     * **Opaque session ids.** A ``session_id`` is an opaque string; the
       store performs no validation beyond what its backend requires.
 
-Reserved for BR-003 (not part of this protocol yet)
-    The destructive sibling primitive
-    ``truncate_after(session_id, sequence, *, branch_id=None)`` (hard-delete
-    of ``sequence > N`` on a branch) is intentionally NOT on this protocol
-    yet — it lands in BR-003. Its branch-aware signature is fixed here so the
-    two features compose.
+Destructive truncation (BR-003)
+    :meth:`truncate_after` is the destructive sibling of branching: a hard
+    delete of a branch's tail (``sequence > N``), for redaction, retention,
+    and rollback. It only removes the *target branch's own* messages — never
+    the inherited (ancestor-owned) prefix a fork shares — so it cannot corrupt
+    sibling branches. It is idempotent and a silent no-op on an unknown session
+    or branch.
 """
 
 from __future__ import annotations
@@ -243,6 +244,37 @@ class StateStore(Protocol):
 
         Raises:
             ValueError: If ``branch_id`` does not exist for this session.
+            fifty_agent_sdk.errors.StateStoreError: If the backend operation
+                fails.
+        """
+        ...
+
+    async def truncate_after(
+        self, session_id: str, sequence: int, *, branch_id: str | None = None
+    ) -> None:
+        """Destructively delete a branch's messages with ``sequence > N``.
+
+        The low-level **destructive** primitive — for redaction, retention,
+        and rollback. ``N`` (the message that survives) is a materialized
+        sequence in the same space as :meth:`fork`'s ``from_sequence``.
+
+        Only the target branch's OWN messages are removed; a fork's inherited
+        prefix (physically owned by an ancestor branch and shared with
+        siblings) is never touched. Consequently, truncating *below* a
+        branch's fork point removes all of that branch's own messages but
+        leaves the inherited prefix intact — to shorten shared history,
+        truncate the branch that owns it.
+
+        Idempotent. A no-op on an unknown session or unknown ``branch_id``.
+
+        Args:
+            session_id: Opaque session identifier.
+            sequence: Keep messages with materialized sequence ``<= sequence``;
+                drop the rest of the branch's own messages.
+            branch_id: Which branch to truncate. ``None`` (the default) targets
+                the active branch.
+
+        Raises:
             fifty_agent_sdk.errors.StateStoreError: If the backend operation
                 fails.
         """

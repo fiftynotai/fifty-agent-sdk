@@ -253,3 +253,87 @@ async def test_legacy_session_without_branch_row_reads_as_trunk(
         "old",
         "old2",
     ]
+
+
+# ---------------------------------------------------------------------------
+# truncate_after (BR-003)
+# ---------------------------------------------------------------------------
+
+
+async def test_truncate_after_keeps_le_n_drops_gt_n(store: SqlStateStore) -> None:
+    await _seed(store, "s1", "a", "b", "c", "d")
+    await store.truncate_after("s1", 2)
+    assert _contents(await store.get_messages("s1")) == ["a", "b"]
+
+
+async def test_truncate_after_is_idempotent(store: SqlStateStore) -> None:
+    await _seed(store, "s1", "a", "b", "c")
+    await store.truncate_after("s1", 1)
+    await store.truncate_after("s1", 1)
+    assert _contents(await store.get_messages("s1")) == ["a"]
+
+
+async def test_truncate_after_unknown_session_is_noop(store: SqlStateStore) -> None:
+    await store.truncate_after("never", 0)
+    assert await store.get_messages("never") == []
+
+
+async def test_truncate_after_unknown_branch_is_noop(store: SqlStateStore) -> None:
+    await _seed(store, "s1", "a", "b")
+    await store.truncate_after("s1", 0, branch_id="no-such")
+    assert _contents(await store.get_messages("s1")) == ["a", "b"]
+
+
+async def test_truncate_after_to_zero_empties_branch(store: SqlStateStore) -> None:
+    await _seed(store, "s1", "a", "b")
+    await store.truncate_after("s1", 0)
+    assert await store.get_messages("s1") == []
+
+
+async def test_truncate_after_at_or_beyond_head_is_noop(store: SqlStateStore) -> None:
+    await _seed(store, "s1", "a", "b")
+    await store.truncate_after("s1", 5)
+    assert _contents(await store.get_messages("s1")) == ["a", "b"]
+
+
+async def test_truncate_after_on_fork_leaves_trunk_intact(store: SqlStateStore) -> None:
+    await _seed(store, "s1", "a", "b", "c")
+    branch = await store.fork("s1", from_sequence=2)
+    await store.switch_branch("s1", branch)
+    await store.append("s1", _msg("c2"))
+    await store.append("s1", _msg("d2"))
+    await store.truncate_after("s1", 3, branch_id=branch)
+    assert _contents(await store.get_messages("s1", branch_id=branch)) == ["a", "b", "c2"]
+    assert _contents(await store.get_messages("s1", branch_id=TRUNK_BRANCH_ID)) == ["a", "b", "c"]
+
+
+async def test_truncate_below_fork_point_keeps_inherited(store: SqlStateStore) -> None:
+    await _seed(store, "s1", "a", "b", "c")
+    branch = await store.fork("s1", from_sequence=2)
+    await store.switch_branch("s1", branch)
+    await store.append("s1", _msg("c2"))
+    await store.truncate_after("s1", 1, branch_id=branch)
+    assert _contents(await store.get_messages("s1", branch_id=branch)) == ["a", "b"]
+    assert _contents(await store.get_messages("s1", branch_id=TRUNK_BRANCH_ID)) == ["a", "b", "c"]
+
+
+async def test_truncate_after_targets_active_branch_by_default(store: SqlStateStore) -> None:
+    await _seed(store, "s1", "a", "b")
+    branch = await store.fork("s1", from_sequence=2)
+    await store.switch_branch("s1", branch)
+    await store.append("s1", _msg("c2"))
+    await store.truncate_after("s1", 2)
+    assert _contents(await store.get_messages("s1", branch_id=branch)) == ["a", "b"]
+
+
+async def test_truncate_after_concurrent_with_append_is_safe(store: SqlStateStore) -> None:
+    import asyncio
+
+    await _seed(store, "s1", "a", "b", "c")
+    await asyncio.gather(
+        store.append("s1", _msg("d")),
+        store.truncate_after("s1", 1),
+    )
+    msgs = _contents(await store.get_messages("s1"))
+    assert msgs[0] == "a"
+    assert len(msgs) in (1, 2)

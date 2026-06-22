@@ -621,5 +621,50 @@ class RedisStateStore:
                 exc, session_id=session_id, operation="switch_branch"
             ) from exc
 
+    async def truncate_after(
+        self, session_id: str, sequence: int, *, branch_id: str | None = None
+    ) -> None:
+        """Destructively trim the target branch's own list to messages with
+        ``sequence <= N`` (``LTRIM``).
+
+        Only the target branch's own list is trimmed; a fork's inherited prefix
+        (held under ancestor keys) is never touched. Idempotent; a no-op on an
+        unknown session or branch. With a TTL set, the session's expiry window
+        is refreshed across all of its keys.
+        """
+        try:
+            if not await self._session_exists(session_id):
+                return
+            target = branch_id if branch_id is not None else await self._get_active(session_id)
+            registry = await self._load_registry(session_id)
+            if target not in registry:
+                return
+            anchor = registry[target]["forked_from_sequence"] or 0
+            # Own message at index i has materialized sequence anchor + 1 + i;
+            # keep the first ``N - anchor`` (those with sequence <= N).
+            keep = sequence - anchor
+            key = self._msgs_key(session_id, target)
+            ttl = self._ttl_seconds
+            ttl_keys = await self._session_keys(session_id) if ttl is not None else []
+            async with self._client.pipeline(transaction=True) as pipe:
+                if keep <= 0:
+                    pipe.ltrim(key, 1, 0)  # start > end empties the list
+                else:
+                    pipe.ltrim(key, 0, keep - 1)
+                if ttl is not None:
+                    for k in ttl_keys:
+                        pipe.expire(k, ttl)
+                await pipe.execute()
+            _log.debug(
+                "redis_state_store.truncate_after",
+                session_id=session_id,
+                branch_id=target,
+                sequence=sequence,
+            )
+        except RedisError as exc:
+            raise _wrap_state_store_error(
+                exc, session_id=session_id, operation="truncate_after"
+            ) from exc
+
 
 __all__ = ["RedisStateStore"]

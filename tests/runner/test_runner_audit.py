@@ -267,6 +267,11 @@ async def test_state_store_error_on_assistant_persist_is_audited() -> None:
         async def switch_branch(self, session_id: str, branch_id: str) -> None:
             await self._inner.switch_branch(session_id, branch_id)
 
+        async def truncate_after(
+            self, session_id: str, sequence: int, *, branch_id: str | None = None
+        ) -> None:
+            await self._inner.truncate_after(session_id, sequence, branch_id=branch_id)
+
     failing: StateStore = _FailingAssistantStore()
     llm = FakeLLMClient(replies=[make_response(final_json("answer"))])
     spy = SpyAuditSink()

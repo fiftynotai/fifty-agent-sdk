@@ -39,6 +39,11 @@ def test_duck_typed_fake_satisfies_protocol() -> None:
         async def switch_branch(self, session_id: str, branch_id: str) -> None:
             return None
 
+        async def truncate_after(
+            self, session_id: str, sequence: int, *, branch_id: str | None = None
+        ) -> None:
+            return None
+
     duck = DuckStore()
     assert isinstance(duck, StateStore)
 
