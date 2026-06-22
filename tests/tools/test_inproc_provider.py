@@ -1,4 +1,4 @@
-"""Tests for agent_sdk.tools.inproc_provider — @tool decorator and InProcProvider."""
+"""Tests for fifty_agent_sdk.tools.inproc_provider — @tool decorator and InProcProvider."""
 
 from __future__ import annotations
 
@@ -7,9 +7,9 @@ from typing import Any, Literal
 import pytest
 from pydantic import BaseModel
 
-from agent_sdk.tools.inproc_provider import InProcProvider, tool
-from agent_sdk.tools.protocol import Tool
-from agent_sdk.tools.registry import Registry
+from fifty_agent_sdk.tools.inproc_provider import InProcProvider, tool
+from fifty_agent_sdk.tools.protocol import Tool
+from fifty_agent_sdk.tools.registry import Registry
 
 # ---------------------------------------------------------------------------
 # @tool — schema generation

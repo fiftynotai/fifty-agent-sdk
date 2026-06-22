@@ -3,7 +3,7 @@
 Skipped at collection time unless ``REDIS_TEST_URL`` is set in the
 environment. The URL must point at a Redis instance the test process can
 both read from and write to; the suite scopes its keys under a dedicated
-``agent_sdk:test:`` prefix and deletes every session it touches in
+``fifty_agent_sdk:test:`` prefix and deletes every session it touches in
 fixture teardown so it does not disturb co-tenant data.
 
 These tests pin behaviours that ``fakeredis`` cannot fully validate:
@@ -35,12 +35,12 @@ if not REDIS_TEST_URL:
 # not break collection when the marker is inactive.
 import pytest_asyncio  # noqa: E402
 
-from agent_sdk import ChatMessage  # noqa: E402
-from agent_sdk.state.redis import RedisStateStore  # noqa: E402
+from fifty_agent_sdk import ChatMessage  # noqa: E402
+from fifty_agent_sdk.state.redis import RedisStateStore  # noqa: E402
 
 pytestmark = pytest.mark.redis
 
-_TEST_KEY_PREFIX = "agent_sdk:test:"
+_TEST_KEY_PREFIX = "fifty_agent_sdk:test:"
 
 
 # ---------------------------------------------------------------------------

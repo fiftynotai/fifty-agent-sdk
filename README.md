@@ -1,4 +1,4 @@
-# agent-sdk
+# fifty-agent-sdk
 
 Production-grade reusable agent loop SDK. Provides a custom ReACT loop that
 runs against any OpenAI-compatible Chat Completions endpoint (OpenAI itself,
@@ -9,7 +9,7 @@ state storage, and a full-fidelity event stream.
 ## Installation
 
 ```
-pip install agent-sdk
+pip install fifty-agent-sdk
 ```
 
 The SDK requires Python 3.11 or newer. The core install ships with the
@@ -17,13 +17,13 @@ in-memory backends, so an agent can run with no infrastructure dependency.
 
 Two optional extras add durable backends:
 
-- `pip install 'agent-sdk[sql]'` — pulls SQLAlchemy and enables
+- `pip install 'fifty-agent-sdk[sql]'` — pulls SQLAlchemy and enables
   `SqlStateStore` (durable conversation state) and `SqlAuditSink` (durable
   audit log).
-- `pip install 'agent-sdk[redis]'` — pulls redis-py and enables
+- `pip install 'fifty-agent-sdk[redis]'` — pulls redis-py and enables
   `RedisStateStore` (Redis-backed conversation state).
 
-Importing `agent_sdk` itself pulls neither SQLAlchemy nor redis-py. The
+Importing `fifty_agent_sdk` itself pulls neither SQLAlchemy nor redis-py. The
 extra symbols are re-exported lazily; first access to one without the
 relevant extra installed raises a clear `ImportError`.
 
@@ -36,7 +36,7 @@ tool, wires the loop and runner, and drains the event stream:
 import asyncio
 from typing import Any
 
-from agent_sdk import (
+from fifty_agent_sdk import (
     JSON_MODE_OUTPUT_FORMAT,
     AgentLoop,
     AgentRunner,
@@ -154,4 +154,4 @@ never aborts a live run.
 
 ## License
 
-MIT
+[MIT](LICENSE) © fifty.dev

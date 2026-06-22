@@ -1,12 +1,12 @@
-"""Tests for ``agent_sdk.parser.base``: ParseResult union + Parser Protocol."""
+"""Tests for ``fifty_agent_sdk.parser.base``: ParseResult union + Parser Protocol."""
 
 from __future__ import annotations
 
 import pytest
 from pydantic import TypeAdapter, ValidationError
 
-from agent_sdk.llm.types import ToolCall
-from agent_sdk.parser import FinalAnswer, Parser, ParseResult, ThoughtAction
+from fifty_agent_sdk.llm.types import ToolCall
+from fifty_agent_sdk.parser import FinalAnswer, Parser, ParseResult, ThoughtAction
 
 
 def test_thought_action_constructs_from_tool_call() -> None:

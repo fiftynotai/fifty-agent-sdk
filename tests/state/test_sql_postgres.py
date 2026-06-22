@@ -40,8 +40,8 @@ from sqlalchemy import insert, select, text  # noqa: E402
 from sqlalchemy.exc import IntegrityError  # noqa: E402
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine  # noqa: E402
 
-from agent_sdk import ChatMessage, StateStoreError  # noqa: E402
-from agent_sdk.state.sql import (  # noqa: E402
+from fifty_agent_sdk import ChatMessage, StateStoreError  # noqa: E402
+from fifty_agent_sdk.state.sql import (  # noqa: E402
     AgentMessage,
     SqlStateStore,
     sql_metadata,
@@ -213,7 +213,7 @@ async def test_postgres_integrity_error_wrapping(store: SqlStateStore, engine: A
             from sqlalchemy import select as _select
             from sqlalchemy.exc import SQLAlchemyError as _SA
 
-            from agent_sdk.state.sql import AgentSession as _AS
+            from fifty_agent_sdk.state.sql import AgentSession as _AS
 
             try:
                 async with self._session_factory() as session, session.begin():

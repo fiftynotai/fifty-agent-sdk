@@ -1,8 +1,8 @@
-"""Tests for :class:`agent_sdk.mcp.client.MCPClient` (the ``mcp``-SDK wrapper).
+"""Tests for :class:`fifty_agent_sdk.mcp.client.MCPClient` (the ``mcp``-SDK wrapper).
 
 The protocol wire is owned by ``mcp`` and certified by the in-memory
 official-client oracle in ``test_client_compat.py``. This file covers the
-agent-sdk-facing contract the wrapper still owns:
+fifty-agent-sdk-facing contract the wrapper still owns:
 
 - transport-error → :class:`MCPError` translation (connect / timeout / HTTP
   status), exercised through the REAL ``streamable_http_client`` over an
@@ -24,8 +24,8 @@ import httpx
 import pytest
 from mcp.server.fastmcp import FastMCP
 
-from agent_sdk.errors import MCPError
-from agent_sdk.mcp import MCPClient, MCPClientConfig
+from fifty_agent_sdk.errors import MCPError
+from fifty_agent_sdk.mcp import MCPClient, MCPClientConfig
 
 from .conftest import MCP_URL, make_compat_client, make_strict_http_client
 

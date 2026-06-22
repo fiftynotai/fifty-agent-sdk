@@ -1,1 +1,1 @@
-"""Test package for agent-sdk."""
+"""Test package for fifty-agent-sdk."""

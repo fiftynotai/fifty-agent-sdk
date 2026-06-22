@@ -1,7 +1,7 @@
-"""Unit tests for :class:`agent_sdk.state.sql.SqlStateStore`.
+"""Unit tests for :class:`fifty_agent_sdk.state.sql.SqlStateStore`.
 
 Runs against an in-memory aiosqlite engine. Covers the documented
-contract from :class:`agent_sdk.state.protocol.StateStore` plus the
+contract from :class:`fifty_agent_sdk.state.protocol.StateStore` plus the
 SQL-specific commitments from BR-009:
 
 * Round-trip preservation of all :class:`ChatMessage` fields.
@@ -43,8 +43,8 @@ from sqlalchemy import insert, select, text
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from sqlalchemy.pool import StaticPool
 
-from agent_sdk import ChatMessage, StateStore, StateStoreError
-from agent_sdk.state.sql import (
+from fifty_agent_sdk import ChatMessage, StateStore, StateStoreError
+from fifty_agent_sdk.state.sql import (
     AgentMessage,
     AgentSession,
     SqlStateStore,
@@ -505,8 +505,8 @@ async def test_store_wraps_integrity_error_on_duplicate_sequence(
             from sqlalchemy import select as _select
             from sqlalchemy.exc import SQLAlchemyError as _SA
 
-            from agent_sdk.state.sql import AgentSession as _AS
-            from agent_sdk.state.sql import _wrap_state_store_error
+            from fifty_agent_sdk.state.sql import AgentSession as _AS
+            from fifty_agent_sdk.state.sql import _wrap_state_store_error
 
             try:
                 async with self._session_factory() as session, session.begin():

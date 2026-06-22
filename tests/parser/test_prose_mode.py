@@ -1,11 +1,11 @@
-"""Tests for ``agent_sdk.parser.prose_mode.ProseModeParser``."""
+"""Tests for ``fifty_agent_sdk.parser.prose_mode.ProseModeParser``."""
 
 from __future__ import annotations
 
 import pytest
 
-from agent_sdk.errors import ParserError
-from agent_sdk.parser import FinalAnswer, Parser, ProseModeParser, ThoughtAction
+from fifty_agent_sdk.errors import ParserError
+from fifty_agent_sdk.parser import FinalAnswer, Parser, ProseModeParser, ThoughtAction
 
 
 def _parser() -> ProseModeParser:

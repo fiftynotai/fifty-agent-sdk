@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-from agent_sdk import ChatMessage, MemoryStateStore, StateStore
+from fifty_agent_sdk import ChatMessage, MemoryStateStore, StateStore
 
 
 def test_memory_store_satisfies_protocol() -> None:
@@ -50,6 +50,6 @@ def test_missing_method_fails_protocol_check() -> None:
 
 def test_protocol_is_exported_from_top_level() -> None:
     """``StateStore`` is importable from the package root."""
-    from agent_sdk import StateStore as _StateStore
+    from fifty_agent_sdk import StateStore as _StateStore
 
     assert _StateStore is StateStore

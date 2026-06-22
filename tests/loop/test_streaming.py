@@ -1,4 +1,4 @@
-"""Tests for ``agent_sdk.streaming``: the AgentEvent discriminated union."""
+"""Tests for ``fifty_agent_sdk.streaming``: the AgentEvent discriminated union."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from typing import Any
 import pytest
 from pydantic import TypeAdapter, ValidationError
 
-from agent_sdk.streaming import (
+from fifty_agent_sdk.streaming import (
     ActionEvent,
     AgentEvent,
     ErrorEvent,
@@ -20,7 +20,7 @@ from agent_sdk.streaming import (
     ToolProgressEvent,
     ToolStartedEvent,
 )
-from agent_sdk.tools.protocol import ToolResult
+from fifty_agent_sdk.tools.protocol import ToolResult
 
 
 def _ts() -> datetime:

@@ -16,7 +16,7 @@ import json
 from collections.abc import AsyncIterator
 from typing import Any
 
-from agent_sdk import (
+from fifty_agent_sdk import (
     AgentEvent,
     AgentLoop,
     AgentRunner,
@@ -26,10 +26,10 @@ from agent_sdk import (
     Registry,
     SafetyConfig,
 )
-from agent_sdk.audit.protocol import AuditSink
-from agent_sdk.llm.types import ChatRequest, ChatResponse
-from agent_sdk.observability import Hooks
-from agent_sdk.state.protocol import StateStore
+from fifty_agent_sdk.audit.protocol import AuditSink
+from fifty_agent_sdk.llm.types import ChatRequest, ChatResponse
+from fifty_agent_sdk.observability import Hooks
+from fifty_agent_sdk.state.protocol import StateStore
 from tests.loop.conftest import FakeLLMClient, make_response
 
 
@@ -75,11 +75,11 @@ def make_runner(
     The store is returned alongside the runner so tests can assert on
     persisted history without reaching into private state.
 
-    Pass ``audit`` to wire an :class:`agent_sdk.audit.protocol.AuditSink`
+    Pass ``audit`` to wire an :class:`fifty_agent_sdk.audit.protocol.AuditSink`
     into the runner; left ``None`` (default) the runner emits no audit
     events.
 
-    Pass ``hooks`` to wire an :class:`agent_sdk.observability.Hooks` into the
+    Pass ``hooks`` to wire an :class:`fifty_agent_sdk.observability.Hooks` into the
     stack. The SAME instance is threaded into BOTH the :class:`AgentLoop`
     and the :class:`AgentRunner` — the consumer-shares-one-instance pattern
     — so the two Loop-tier hooks and the five Runner-tier hooks all fire

@@ -1,4 +1,4 @@
-"""Tests for agent_sdk.tools.registry — dispatch, timeout, and exception classification."""
+"""Tests for fifty_agent_sdk.tools.registry — dispatch, timeout, and exception classification."""
 
 from __future__ import annotations
 
@@ -8,9 +8,9 @@ from typing import Any
 import pytest
 import structlog
 
-from agent_sdk.errors import LLMError, ToolNotFound, ToolTimeout
-from agent_sdk.tools.protocol import ToolResult, ToolSchema
-from agent_sdk.tools.registry import Registry
+from fifty_agent_sdk.errors import LLMError, ToolNotFound, ToolTimeout
+from fifty_agent_sdk.tools.protocol import ToolResult, ToolSchema
+from fifty_agent_sdk.tools.registry import Registry
 
 # ---------------------------------------------------------------------------
 # Test doubles

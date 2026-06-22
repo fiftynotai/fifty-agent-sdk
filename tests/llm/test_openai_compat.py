@@ -1,4 +1,4 @@
-"""Tests for agent_sdk.llm.openai_compat.OpenAICompatibleClient.
+"""Tests for fifty_agent_sdk.llm.openai_compat.OpenAICompatibleClient.
 
 Uses ``pytest-httpx`` to intercept the HTTP calls the openai Python SDK
 makes under the hood. No real network is required.
@@ -13,10 +13,10 @@ import httpx
 import pytest
 from pytest_httpx import HTTPXMock
 
-from agent_sdk.errors import LLMError
-from agent_sdk.llm.openai_compat import OpenAICompatibleClient
-from agent_sdk.llm.protocol import LLMClient
-from agent_sdk.llm.types import ChatMessage, ChatRequest
+from fifty_agent_sdk.errors import LLMError
+from fifty_agent_sdk.llm.openai_compat import OpenAICompatibleClient
+from fifty_agent_sdk.llm.protocol import LLMClient
+from fifty_agent_sdk.llm.types import ChatMessage, ChatRequest
 
 # ---------------------------------------------------------------------------
 # Helpers

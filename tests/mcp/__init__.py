@@ -1,1 +1,1 @@
-"""Tests for the agent_sdk.mcp protocol-only client surface."""
+"""Tests for the fifty_agent_sdk.mcp protocol-only client surface."""

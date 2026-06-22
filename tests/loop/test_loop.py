@@ -1,4 +1,4 @@
-"""Integration tests for ``agent_sdk.loop.AgentLoop``.
+"""Integration tests for ``fifty_agent_sdk.loop.AgentLoop``.
 
 Each test wires the loop with :class:`tests.loop.conftest.FakeLLMClient` and
 :class:`tests.loop.conftest.FakeTool` doubles, drives a single ``run()``,
@@ -15,7 +15,7 @@ from typing import Any, Literal
 
 import pytest
 
-from agent_sdk import (
+from fifty_agent_sdk import (
     ActionEvent,
     AgentEvent,
     AgentLoop,
@@ -36,8 +36,8 @@ from agent_sdk import (
     ToolResult,
     ToolStartedEvent,
 )
-from agent_sdk.errors import LLMError
-from agent_sdk.streaming import ToolProgressEvent
+from fifty_agent_sdk.errors import LLMError
+from fifty_agent_sdk.streaming import ToolProgressEvent
 from tests.loop.conftest import (
     DriftsOnceFakeLLM,
     FakeLLMClient,
@@ -670,7 +670,7 @@ async def test_require_tool_greeting_passes_after_one_nudge() -> None:
     ``final`` (model re-confirms it is just a greeting). The loop accepts the
     second final — exactly one nudge, no tool ever runs.
     """
-    greeting = "Hi! I'm the MOCA policy assistant."
+    greeting = "Hi! I'm the demo assistant."
     llm = FakeLLMClient(
         replies=[
             make_response(_final_json(greeting)),
@@ -1196,7 +1196,7 @@ def test_serialize_tool_output_falls_back_to_repr_when_dumps_raises() -> None:
     objects whose ``__str__`` raises (one TypeError, one ValueError) to cover
     both arms of the ``except`` clause.
     """
-    from agent_sdk.loop import _serialize_tool_output
+    from fifty_agent_sdk.loop import _serialize_tool_output
 
     class StrRaisesValueError:
         def __repr__(self) -> str:
@@ -1227,40 +1227,40 @@ def test_serialize_tool_output_falls_back_to_repr_when_dumps_raises() -> None:
 
 
 def test_top_level_exports_loop_surface() -> None:
-    from agent_sdk import (
+    from fifty_agent_sdk import (
         ActionEvent as _ActionEvent,
     )
-    from agent_sdk import (
+    from fifty_agent_sdk import (
         AgentEvent as _AgentEvent,
     )
-    from agent_sdk import (
+    from fifty_agent_sdk import (
         AgentLoop as _AgentLoop,
     )
-    from agent_sdk import (
+    from fifty_agent_sdk import (
         ErrorEvent as _ErrorEvent,
     )
-    from agent_sdk import (
+    from fifty_agent_sdk import (
         FinalEvent as _FinalEvent,
     )
-    from agent_sdk import (
+    from fifty_agent_sdk import (
         ObservationEvent as _ObservationEvent,
     )
-    from agent_sdk import (
+    from fifty_agent_sdk import (
         SafetyConfig as _SafetyConfig,
     )
-    from agent_sdk import (
+    from fifty_agent_sdk import (
         ThoughtEvent as _ThoughtEvent,
     )
-    from agent_sdk import (
+    from fifty_agent_sdk import (
         TokenEvent as _TokenEvent,
     )
-    from agent_sdk import (
+    from fifty_agent_sdk import (
         ToolFailedEvent as _ToolFailedEvent,
     )
-    from agent_sdk import (
+    from fifty_agent_sdk import (
         ToolProgressEvent as _ToolProgressEvent,
     )
-    from agent_sdk import (
+    from fifty_agent_sdk import (
         ToolStartedEvent as _ToolStartedEvent,
     )
 

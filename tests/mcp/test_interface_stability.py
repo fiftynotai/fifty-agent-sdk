@@ -12,16 +12,16 @@ from __future__ import annotations
 
 import inspect
 
-import agent_sdk
-from agent_sdk.mcp import MCPClient, MCPClientConfig, MCPToolDef
-from agent_sdk.tools.mcp_provider import MCPProvider, RefreshSummary
+import fifty_agent_sdk
+from fifty_agent_sdk.mcp import MCPClient, MCPClientConfig, MCPToolDef
+from fifty_agent_sdk.tools.mcp_provider import MCPProvider, RefreshSummary
 
 
 def test_top_level_exports_present() -> None:
-    """``agent_sdk.__all__`` still exports the MCP public surface."""
+    """``fifty_agent_sdk.__all__`` still exports the MCP public surface."""
     for name in ("MCPClient", "MCPClientConfig", "MCPToolDef", "MCPProvider", "RefreshSummary"):
-        assert name in agent_sdk.__all__, f"{name} missing from agent_sdk.__all__"
-        assert getattr(agent_sdk, name) is not None
+        assert name in fifty_agent_sdk.__all__, f"{name} missing from fifty_agent_sdk.__all__"
+        assert getattr(fifty_agent_sdk, name) is not None
 
 
 def test_mcpclient_signatures_stable() -> None:

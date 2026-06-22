@@ -1,11 +1,11 @@
-"""Tests for agent_sdk.llm.types — Pydantic v2 contract surface."""
+"""Tests for fifty_agent_sdk.llm.types — Pydantic v2 contract surface."""
 
 from __future__ import annotations
 
 import pytest
 from pydantic import ValidationError
 
-from agent_sdk.llm.types import (
+from fifty_agent_sdk.llm.types import (
     ChatMessage,
     ChatRequest,
     ChatResponse,

@@ -16,8 +16,8 @@ from __future__ import annotations
 import pytest
 from mcp.server.fastmcp import FastMCP
 
-from agent_sdk.errors import MCPError
-from agent_sdk.mcp import MCPToolDef
+from fifty_agent_sdk.errors import MCPError
+from fifty_agent_sdk.mcp import MCPToolDef
 
 from .conftest import make_compat_client
 

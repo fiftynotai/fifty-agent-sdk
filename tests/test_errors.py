@@ -1,10 +1,10 @@
-"""Tests for the agent_sdk.errors hierarchy."""
+"""Tests for the fifty_agent_sdk.errors hierarchy."""
 
 from __future__ import annotations
 
 import pytest
 
-from agent_sdk.errors import (
+from fifty_agent_sdk.errors import (
     AgentSdkError,
     LLMError,
     MaxIterationsExceeded,

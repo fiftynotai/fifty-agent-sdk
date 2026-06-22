@@ -1,7 +1,7 @@
-"""Unit tests for :class:`agent_sdk.audit.sql.SqlAuditSink`.
+"""Unit tests for :class:`fifty_agent_sdk.audit.sql.SqlAuditSink`.
 
 Runs against an in-memory aiosqlite engine. Covers the
-:class:`agent_sdk.audit.protocol.AuditSink` contract plus the SQL-specific
+:class:`fifty_agent_sdk.audit.protocol.AuditSink` contract plus the SQL-specific
 commitments from BR-011:
 
 * Round-trip preservation of every :class:`AuditEvent` field.
@@ -33,8 +33,8 @@ from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from sqlalchemy.pool import StaticPool
 
-from agent_sdk import AuditEvent, AuditSink, StateStoreError
-from agent_sdk.audit.sql import AgentAuditLog, SqlAuditSink, audit_metadata
+from fifty_agent_sdk import AuditEvent, AuditSink, StateStoreError
+from fifty_agent_sdk.audit.sql import AgentAuditLog, SqlAuditSink, audit_metadata
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -278,7 +278,7 @@ def test_metadata_columns_match_schema() -> None:
 
 def test_audit_metadata_is_separate_from_state_metadata() -> None:
     """The audit schema does NOT share metadata with the state schema."""
-    from agent_sdk import sql_metadata
+    from fifty_agent_sdk import sql_metadata
 
     assert audit_metadata is not sql_metadata
     # The audit table is absent from the state metadata and vice versa.

@@ -1,11 +1,11 @@
-"""Tests for ``agent_sdk.parser.native_tools``."""
+"""Tests for ``fifty_agent_sdk.parser.native_tools``."""
 
 from __future__ import annotations
 
 import pytest
 
-from agent_sdk.llm.types import ChatMessage, ChatResponse, Usage
-from agent_sdk.parser import (
+from fifty_agent_sdk.llm.types import ChatMessage, ChatResponse, Usage
+from fifty_agent_sdk.parser import (
     NativeToolsParser,
     NativeToolsParserStub,
     ParseResult,

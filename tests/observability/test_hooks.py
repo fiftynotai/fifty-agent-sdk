@@ -1,4 +1,4 @@
-"""Unit tests for :mod:`agent_sdk.observability.hooks`.
+"""Unit tests for :mod:`fifty_agent_sdk.observability.hooks`.
 
 Covers BR-012's model + dispatch-helper surface:
 
@@ -23,9 +23,9 @@ import dataclasses
 import pytest
 import structlog
 
-from agent_sdk import Hooks as TopLevelHooks
-from agent_sdk.observability import Hooks
-from agent_sdk.observability.hooks import invoke_hook
+from fifty_agent_sdk import Hooks as TopLevelHooks
+from fifty_agent_sdk.observability import Hooks
+from fifty_agent_sdk.observability.hooks import invoke_hook
 
 # ---------------------------------------------------------------------------
 # The Hooks model

@@ -1,4 +1,4 @@
-"""Test harnesses for :class:`agent_sdk.mcp.client.MCPClient`.
+"""Test harnesses for :class:`fifty_agent_sdk.mcp.client.MCPClient`.
 
 The client now wraps the official ``mcp`` SDK's :class:`mcp.ClientSession`,
 so the protocol wire / JSON-RPC envelope is owned by ``mcp`` and is validated
@@ -34,7 +34,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp.shared.memory import create_connected_server_and_client_session
 from mcp.types import CallToolResult, ListToolsResult, TextContent, Tool
 
-from agent_sdk.mcp import MCPClient, MCPClientConfig
+from fifty_agent_sdk.mcp import MCPClient, MCPClientConfig
 
 MCP_URL = "https://mcp.test.local/mcp"
 """Single canonical URL the thin transport-error mock serves."""
@@ -49,7 +49,7 @@ ToolHandler = Callable[[dict[str, Any]], Any]
 
 
 class InMemorySessionTransport:
-    """A test-only :class:`agent_sdk.mcp.transport.Transport`.
+    """A test-only :class:`fifty_agent_sdk.mcp.transport.Transport`.
 
     Yields a pre-built, already-``initialize()``d official
     :class:`mcp.ClientSession` (the one created by

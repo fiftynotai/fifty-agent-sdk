@@ -1,4 +1,4 @@
-"""Unit tests for :class:`agent_sdk.state.redis.RedisStateStore`.
+"""Unit tests for :class:`fifty_agent_sdk.state.redis.RedisStateStore`.
 
 Runs against an in-process ``fakeredis`` async server — no external
 Redis instance is required, so these tests run in the default
@@ -7,14 +7,14 @@ connection failures) is covered by the env-gated integration suite in
 ``test_redis_integration.py``.
 
 These tests cover the documented contract from
-:class:`agent_sdk.state.protocol.StateStore` plus the Redis-specific
+:class:`fifty_agent_sdk.state.protocol.StateStore` plus the Redis-specific
 commitments from BR-010:
 
 * Round-trip preservation of all :class:`ChatMessage` fields and ordering.
 * Empty / unknown session returns ``[]`` (never raises).
 * Fresh-list-per-call (the defensive-copy invariant).
 * Idempotent delete; delete is scoped to one session.
-* The configured ``key_prefix`` is applied (default ``agent_sdk:state:``).
+* The configured ``key_prefix`` is applied (default ``fifty_agent_sdk:state:``).
 * TTL is *set* on append when ``ttl_seconds`` is configured, refreshed on
   every append, and absent when ``ttl_seconds`` is ``None``.
 * Every backend failure (:class:`redis.exceptions.RedisError`) is wrapped
@@ -40,7 +40,7 @@ import pytest
 import pytest_asyncio
 from redis.exceptions import RedisError
 
-from agent_sdk import ChatMessage, RedisStateStore, StateStore, StateStoreError
+from fifty_agent_sdk import ChatMessage, RedisStateStore, StateStore, StateStoreError
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -204,10 +204,10 @@ async def test_delete_does_not_affect_other_sessions(store: RedisStateStore) -> 
 
 
 async def test_default_key_prefix_is_applied(store: RedisStateStore) -> None:
-    """With no override, keys are namespaced under ``agent_sdk:state:``."""
+    """With no override, keys are namespaced under ``fifty_agent_sdk:state:``."""
     await store.append("s1", ChatMessage(role="user", content="a"))
     keys = await store._client.keys("*")
-    assert keys == ["agent_sdk:state:s1"]
+    assert keys == ["fifty_agent_sdk:state:s1"]
 
 
 async def test_custom_key_prefix_is_applied() -> None:
@@ -229,9 +229,9 @@ def test_key_helper_concatenates_prefix_and_session_id() -> None:
 
 
 def test_default_key_prefix_constant() -> None:
-    """The default prefix is exactly ``agent_sdk:state:`` per the brief."""
+    """The default prefix is exactly ``fifty_agent_sdk:state:`` per the brief."""
     s = RedisStateStore("redis://localhost:6379/0")
-    assert s._key("abc") == "agent_sdk:state:abc"
+    assert s._key("abc") == "fifty_agent_sdk:state:abc"
 
 
 # ---------------------------------------------------------------------------
@@ -244,7 +244,7 @@ async def test_append_sets_ttl_when_configured(
 ) -> None:
     """An append with ``ttl_seconds`` set leaves a positive, bounded TTL."""
     await store_with_ttl.append("s1", ChatMessage(role="user", content="a"))
-    ttl = await store_with_ttl._client.ttl("agent_sdk:state:s1")
+    ttl = await store_with_ttl._client.ttl("fifty_agent_sdk:state:s1")
     assert 0 < ttl <= 3600
 
 
@@ -252,7 +252,7 @@ async def test_ttl_is_refreshed_on_every_append(
     store_with_ttl: RedisStateStore,
 ) -> None:
     """Each append re-issues EXPIRE so the expiry window slides forward."""
-    key = "agent_sdk:state:s1"
+    key = "fifty_agent_sdk:state:s1"
     await store_with_ttl.append("s1", ChatMessage(role="user", content="a"))
     await store_with_ttl.append("s1", ChatMessage(role="user", content="b"))
     # After the second append the TTL is still set and bounded by the
@@ -265,7 +265,7 @@ async def test_no_ttl_when_ttl_seconds_is_none(store: RedisStateStore) -> None:
     """With ``ttl_seconds=None`` the key exists with no expiry (TTL == -1)."""
     await store.append("s1", ChatMessage(role="user", content="a"))
     # Redis returns -1 for a key that exists but has no associated expiry.
-    ttl = await store._client.ttl("agent_sdk:state:s1")
+    ttl = await store._client.ttl("fifty_agent_sdk:state:s1")
     assert ttl == -1
 
 

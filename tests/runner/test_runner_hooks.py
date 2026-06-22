@@ -1,4 +1,4 @@
-"""Integration tests for :class:`agent_sdk.runner.AgentRunner` hook dispatch.
+"""Integration tests for :class:`fifty_agent_sdk.runner.AgentRunner` hook dispatch.
 
 Covers BR-012's Runner-integration surface — the five Runner-tier hooks:
 
@@ -25,7 +25,7 @@ from typing import Any
 import pytest
 import structlog
 
-from agent_sdk import (
+from fifty_agent_sdk import (
     ChatMessage,
     FinalEvent,
     Hooks,
@@ -36,7 +36,7 @@ from agent_sdk import (
     StateStoreError,
     ToolResult,
 )
-from agent_sdk.errors import LLMError
+from fifty_agent_sdk.errors import LLMError
 from tests.loop.conftest import FakeLLMClient, FakeTool, make_response
 from tests.runner.conftest import collect, final_json, make_runner, tool_json
 

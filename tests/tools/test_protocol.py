@@ -1,4 +1,4 @@
-"""Tests for agent_sdk.tools.protocol — Tool/ToolSchema/ToolResult contracts."""
+"""Tests for fifty_agent_sdk.tools.protocol — Tool/ToolSchema/ToolResult contracts."""
 
 from __future__ import annotations
 
@@ -7,9 +7,9 @@ from typing import Any
 import pytest
 from pydantic import ValidationError
 
-from agent_sdk.tools import ToolCall as ToolsToolCall
-from agent_sdk.tools.protocol import Tool, ToolResult, ToolSchema
-from agent_sdk.tools.protocol import ToolCall as ProtocolToolCall
+from fifty_agent_sdk.tools import ToolCall as ToolsToolCall
+from fifty_agent_sdk.tools.protocol import Tool, ToolResult, ToolSchema
+from fifty_agent_sdk.tools.protocol import ToolCall as ProtocolToolCall
 
 # ---------------------------------------------------------------------------
 # ToolSchema
@@ -116,7 +116,7 @@ def test_runtime_checkable_rejects_plain_object() -> None:
 
 def test_tool_call_reexport_is_same_object() -> None:
     """Guard against accidentally defining a duplicate ToolCall class."""
-    from agent_sdk.llm.types import ToolCall as LlmToolCall
+    from fifty_agent_sdk.llm.types import ToolCall as LlmToolCall
 
     assert ProtocolToolCall is LlmToolCall
     assert ToolsToolCall is LlmToolCall

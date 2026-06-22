@@ -1,4 +1,4 @@
-"""Integration tests for :class:`agent_sdk.runner.AgentRunner`.
+"""Integration tests for :class:`fifty_agent_sdk.runner.AgentRunner`.
 
 Covers the full surface from the brief:
 
@@ -18,7 +18,7 @@ from collections.abc import AsyncIterator
 
 import pytest
 
-from agent_sdk import (
+from fifty_agent_sdk import (
     ActionEvent,
     AgentEvent,
     AgentLoop,
@@ -132,8 +132,8 @@ async def test_multi_turn_persists_raw_envelope_so_parser_succeeds() -> None:
     Locks the live-reproduced GDC Gemini failure: if the runner persisted
     only the parsed ``final_text`` ("hi back"), the provider's
     format-detector would drift on turn 2 and return prose, and
-    :class:`agent_sdk.parser.json_mode.JsonModeParser` would raise a
-    :class:`agent_sdk.errors.ParserError`. The fix persists the raw JSON
+    :class:`fifty_agent_sdk.parser.json_mode.JsonModeParser` would raise a
+    :class:`fifty_agent_sdk.errors.ParserError`. The fix persists the raw JSON
     envelope so the provider stays in format and turn 2 parses cleanly.
     """
     llm = FormatAwareFakeLLM(
@@ -301,7 +301,7 @@ async def test_runner_does_not_inject_extra_events() -> None:
 
 async def test_llm_error_does_not_persist_assistant() -> None:
     """LLM failure inside the loop: user message persists; assistant does not."""
-    from agent_sdk.errors import LLMError
+    from fifty_agent_sdk.errors import LLMError
 
     llm = FakeLLMClient(replies=[LLMError("provider down")])
     runner, store = make_runner(llm=llm)
@@ -360,7 +360,7 @@ async def test_iteration_cap_does_not_persist_assistant() -> None:
 
 async def test_system_prompt_persists_even_on_error_path() -> None:
     """First-turn ``system_prompt`` lands BEFORE the user msg; survives loop failure."""
-    from agent_sdk.errors import LLMError
+    from fifty_agent_sdk.errors import LLMError
 
     llm = FakeLLMClient(replies=[LLMError("down")])
     runner, store = make_runner(llm=llm, system_prompt="ROLE: pirate")
@@ -641,9 +641,9 @@ async def test_state_store_error_on_assistant_append_propagates_after_final_even
 
 def test_top_level_exports_runner_surface() -> None:
     """Public re-exports for the runner trio."""
-    from agent_sdk import AgentRunner as _AgentRunner
-    from agent_sdk import MemoryStateStore as _MemoryStateStore
-    from agent_sdk import StateStore as _StateStore
+    from fifty_agent_sdk import AgentRunner as _AgentRunner
+    from fifty_agent_sdk import MemoryStateStore as _MemoryStateStore
+    from fifty_agent_sdk import StateStore as _StateStore
 
     assert _AgentRunner is AgentRunner
     assert _StateStore is StateStore

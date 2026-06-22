@@ -1,4 +1,4 @@
-"""Integration tests for :class:`agent_sdk.loop.AgentLoop` hook dispatch.
+"""Integration tests for :class:`fifty_agent_sdk.loop.AgentLoop` hook dispatch.
 
 Covers BR-012's Loop-integration surface — the two Loop-tier hooks driven
 directly through :meth:`AgentLoop.run`, with no :class:`AgentRunner`:
@@ -21,7 +21,7 @@ import json
 from collections.abc import AsyncIterator
 from typing import Any
 
-from agent_sdk import (
+from fifty_agent_sdk import (
     AgentEvent,
     AgentLoop,
     ChatMessage,
@@ -36,7 +36,7 @@ from agent_sdk import (
     SafetyConfig,
     ToolResult,
 )
-from agent_sdk.errors import LLMError
+from fifty_agent_sdk.errors import LLMError
 from tests.loop.conftest import (
     FakeLLMClient,
     FakeTool,

@@ -3,15 +3,15 @@
 Three stand-ins:
 
 * :class:`FakeLLMClient` — replays a scripted sequence of
-  :class:`agent_sdk.llm.types.ChatResponse` values (or exceptions) on
+  :class:`fifty_agent_sdk.llm.types.ChatResponse` values (or exceptions) on
   successive :meth:`complete` / :meth:`stream` calls. Records every
-  inbound :class:`agent_sdk.llm.types.ChatRequest` for assertion.
+  inbound :class:`fifty_agent_sdk.llm.types.ChatRequest` for assertion.
 * :class:`DriftsOnceFakeLLM` — returns scripted prose drift on the first
   call and a clean JSON envelope on every subsequent call. Used by the
   BR-018 parser-retry tests to model the real failure pattern.
-* :class:`FakeTool` — a configurable :class:`agent_sdk.tools.protocol.Tool`
+* :class:`FakeTool` — a configurable :class:`fifty_agent_sdk.tools.protocol.Tool`
   whose :meth:`invoke` either returns a scripted
-  :class:`agent_sdk.tools.protocol.ToolResult` or raises a configured
+  :class:`fifty_agent_sdk.tools.protocol.ToolResult` or raises a configured
   exception, with optional latency.
 
 Helpers :func:`make_response` and :func:`make_stream_chunks` reduce
@@ -24,14 +24,14 @@ import asyncio
 from collections.abc import AsyncIterator
 from typing import Any
 
-from agent_sdk.llm.types import (
+from fifty_agent_sdk.llm.types import (
     ChatMessage,
     ChatRequest,
     ChatResponse,
     FinishReason,
     Usage,
 )
-from agent_sdk.tools.protocol import ToolResult, ToolSchema
+from fifty_agent_sdk.tools.protocol import ToolResult, ToolSchema
 
 
 class FakeLLMClient:
@@ -124,7 +124,7 @@ class DriftsOnceFakeLLM:
 
     Args:
         prose_reply: The drift content returned on the first call (the one
-            that triggers :class:`agent_sdk.errors.ParserError`).
+            that triggers :class:`fifty_agent_sdk.errors.ParserError`).
         json_reply: The well-formed JSON envelope returned on every
             subsequent call.
     """
@@ -157,7 +157,7 @@ class DriftsOnceFakeLLM:
 
 
 class FakeTool:
-    """Configurable :class:`agent_sdk.tools.protocol.Tool` for loop tests.
+    """Configurable :class:`fifty_agent_sdk.tools.protocol.Tool` for loop tests.
 
     Args:
         name: The tool name as the registry will key it.

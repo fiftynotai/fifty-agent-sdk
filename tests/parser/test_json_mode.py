@@ -1,4 +1,4 @@
-"""Tests for ``agent_sdk.parser.json_mode.JsonModeParser``."""
+"""Tests for ``fifty_agent_sdk.parser.json_mode.JsonModeParser``."""
 
 from __future__ import annotations
 
@@ -6,15 +6,15 @@ import json
 
 import pytest
 
-from agent_sdk.errors import ParserError
-from agent_sdk.parser import (
+from fifty_agent_sdk.errors import ParserError
+from fifty_agent_sdk.parser import (
     FinalAnswer,
     JsonModeParser,
     Parser,
     ThoughtAction,
 )
-from agent_sdk.parser.json_mode import _RawEnvelope
-from agent_sdk.prompts import JSON_MODE_OUTPUT_FORMAT
+from fifty_agent_sdk.parser.json_mode import _RawEnvelope
+from fifty_agent_sdk.prompts import JSON_MODE_OUTPUT_FORMAT
 
 
 def _parser() -> JsonModeParser:

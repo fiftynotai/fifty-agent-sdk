@@ -1,8 +1,8 @@
-"""Tests for :class:`agent_sdk.tools.mcp_provider.MCPProvider`.
+"""Tests for :class:`fifty_agent_sdk.tools.mcp_provider.MCPProvider`.
 
 These tests pair each scenario from the BR-008 plan §9 with a controllable
 in-memory MCP server (:class:`tests.mcp.conftest.ControllableServer`) driven
-through the REAL :class:`agent_sdk.mcp.client.MCPClient` mapping/unwrap code.
+through the REAL :class:`fifty_agent_sdk.mcp.client.MCPClient` mapping/unwrap code.
 The provider tests live in ``tests/tools/`` rather than ``tests/mcp/`` so they
 sit alongside the rest of the tool-layer suite — they exercise the bridge
 between protocol and registry, not the protocol itself.
@@ -22,14 +22,14 @@ from typing import Any
 import pytest
 import structlog
 
-from agent_sdk.errors import MCPError
-from agent_sdk.tools.mcp_provider import (
+from fifty_agent_sdk.errors import MCPError
+from fifty_agent_sdk.tools.mcp_provider import (
     MCPProvider,
     RefreshSummary,
     _to_tool_schema,
 )
-from agent_sdk.tools.protocol import ToolResult, ToolSchema
-from agent_sdk.tools.registry import Registry
+from fifty_agent_sdk.tools.protocol import ToolResult, ToolSchema
+from fifty_agent_sdk.tools.registry import Registry
 from tests.mcp.conftest import ControllableServer, make_controllable_client
 
 

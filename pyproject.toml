@@ -3,26 +3,44 @@ requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "agent-sdk"
-version = "1.0.0"
+name = "fifty-agent-sdk"
+version = "1.1.0"
 description = "Production-grade reusable agent loop SDK — custom ReACT, JSON-mode tool calls, MCP client, pluggable LLM/state/tools."
 readme = "README.md"
 requires-python = ">=3.11"
 license = {text = "MIT"}
-authors = [{name = "MOCA Team"}]
+authors = [{name = "fifty.dev"}]
+maintainers = [{name = "fifty.dev"}]
+keywords = ["agent", "llm", "react", "mcp", "tool-calling", "openai", "ai", "sdk"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries :: Application Frameworks",
+    "Typing :: Typed",
+]
 
 dependencies = [
     "pydantic>=2.5.0",
     "httpx>=0.26.0",
     "structlog>=24.1.0",
     "openai>=1.30.0,<3.0.0",
-    # Official MCP SDK. Standard-only: the MCP path is now the ONLY MCP path
-    # (the BR-008 hand-rolled JSON-RPC client was removed in BR-042), so this
-    # is a core dependency, not an optional extra. Floor pinned at the probed
-    # 1.27.0; <2.0.0 ceiling because FastMCP/transport surfaces drift across
-    # minors (re-probe the live API before coding against new minors).
+    # Official MCP SDK. Standard-only: the MCP path is the ONLY MCP path, so
+    # this is a core dependency, not an optional extra. Floor pinned at the
+    # probed 1.27.0; <2.0.0 ceiling because FastMCP/transport surfaces drift
+    # across minors (re-probe the live API before coding against new minors).
     "mcp>=1.27.0,<2.0.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/fiftynotai/fifty-agent-sdk"
+Repository = "https://github.com/fiftynotai/fifty-agent-sdk"
+Issues = "https://github.com/fiftynotai/fifty-agent-sdk/issues"
+Changelog = "https://github.com/fiftynotai/fifty-agent-sdk/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
 sql = [
@@ -46,8 +64,38 @@ dev = [
 
 [tool.setuptools.packages.find]
 where = ["src"]
-include = ["agent_sdk*"]
+include = ["fifty_agent_sdk*"]
 
 [tool.setuptools.package-data]
-# Ship the PEP 561 marker so downstream type-checkers see agent-sdk as typed.
-agent_sdk = ["py.typed"]
+# Ship the PEP 561 marker so downstream type-checkers see fifty-agent-sdk as typed.
+fifty_agent_sdk = ["py.typed"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "B", "UP", "SIM"]
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["fifty_agent_sdk"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+exclude = ["tests/", "build/", ".venv/"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = ["-v", "--tb=short", "--strict-markers", "--import-mode=importlib"]
+markers = [
+    "integration: Integration tests requiring external services",
+    "postgres: Integration tests against a real Postgres database (skipped unless POSTGRES_TEST_URL is set)",
+    "redis: Integration tests against a real Redis instance (skipped unless REDIS_TEST_URL is set)",
+]

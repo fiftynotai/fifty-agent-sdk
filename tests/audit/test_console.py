@@ -1,4 +1,4 @@
-"""Unit tests for :class:`agent_sdk.audit.console.ConsoleAuditSink`.
+"""Unit tests for :class:`fifty_agent_sdk.audit.console.ConsoleAuditSink`.
 
 Uses :func:`structlog.testing.capture_logs` to assert that
 :meth:`ConsoleAuditSink.record` emits exactly one structured ``INFO``
@@ -11,7 +11,7 @@ from datetime import UTC, datetime
 
 import structlog
 
-from agent_sdk import AuditEvent, AuditSink, ConsoleAuditSink
+from fifty_agent_sdk import AuditEvent, AuditSink, ConsoleAuditSink
 
 
 async def test_record_emits_single_info_event() -> None:
@@ -71,6 +71,6 @@ def test_console_sink_satisfies_audit_sink_protocol() -> None:
 
 def test_console_sink_exported_from_top_level() -> None:
     """:class:`ConsoleAuditSink` is importable from the package root."""
-    from agent_sdk import ConsoleAuditSink as _ConsoleAuditSink
+    from fifty_agent_sdk import ConsoleAuditSink as _ConsoleAuditSink
 
     assert _ConsoleAuditSink is ConsoleAuditSink

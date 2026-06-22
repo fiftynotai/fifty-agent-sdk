@@ -1,4 +1,4 @@
-"""Canonical end-to-end worked example for the agent-sdk.
+"""Canonical end-to-end worked example for the fifty-agent-sdk.
 
 This single test is the executable companion to the README Quickstart. It
 walks the full happy path a consumer follows — define a tool, wire it into a
@@ -19,8 +19,8 @@ from __future__ import annotations
 import re
 from typing import Any
 
-import agent_sdk
-from agent_sdk import (
+import fifty_agent_sdk
+from fifty_agent_sdk import (
     ActionEvent,
     AgentLoop,
     AgentRunner,
@@ -53,8 +53,8 @@ async def test_e2e_define_tool_wire_registry_run_stream() -> None:
     # 0.1.0 -> 1.0.0 release bump (TD-026). importlib.metadata.version is
     # deliberately NOT used as the oracle here — the editable install's dist
     # metadata is stale (reports 0.0.1), so it would diverge from __version__.
-    assert isinstance(agent_sdk.__version__, str) and agent_sdk.__version__
-    assert re.fullmatch(r"\d+\.\d+\.\d+.*", agent_sdk.__version__)
+    assert isinstance(fifty_agent_sdk.__version__, str) and fifty_agent_sdk.__version__
+    assert re.fullmatch(r"\d+\.\d+\.\d+.*", fifty_agent_sdk.__version__)
 
     # ── Step 1: define a real tool with the @tool decorator ───────────────
     # @tool derives the JSON Schema for `city` from the type annotation and

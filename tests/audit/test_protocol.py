@@ -1,4 +1,4 @@
-"""Unit tests for :mod:`agent_sdk.audit.protocol`.
+"""Unit tests for :mod:`fifty_agent_sdk.audit.protocol`.
 
 Covers the :class:`AuditEvent` Pydantic model (required/optional fields,
 ``extra="forbid"``) and the :class:`AuditSink` runtime-checkable protocol.
@@ -11,7 +11,7 @@ from datetime import UTC, datetime
 import pytest
 from pydantic import ValidationError
 
-from agent_sdk import AuditEvent, AuditSink
+from fifty_agent_sdk import AuditEvent, AuditSink
 
 # ---------------------------------------------------------------------------
 # AuditEvent model
@@ -109,8 +109,8 @@ def test_class_missing_record_fails_protocol_check() -> None:
 
 def test_protocol_is_exported_from_top_level() -> None:
     """:class:`AuditSink` and :class:`AuditEvent` are importable from the root."""
-    from agent_sdk import AuditEvent as _AuditEvent
-    from agent_sdk import AuditSink as _AuditSink
+    from fifty_agent_sdk import AuditEvent as _AuditEvent
+    from fifty_agent_sdk import AuditSink as _AuditSink
 
     assert _AuditEvent is AuditEvent
     assert _AuditSink is AuditSink

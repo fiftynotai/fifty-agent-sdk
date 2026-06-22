@@ -1,4 +1,4 @@
-"""Integration tests for :class:`agent_sdk.runner.AgentRunner` audit emission.
+"""Integration tests for :class:`fifty_agent_sdk.runner.AgentRunner` audit emission.
 
 Covers BR-011's Runner-integration surface:
 
@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import structlog
 
-from agent_sdk import AuditEvent, AuditSink, Registry, SafetyConfig, ToolResult
+from fifty_agent_sdk import AuditEvent, AuditSink, Registry, SafetyConfig, ToolResult
 from tests.loop.conftest import FakeLLMClient, FakeTool, make_response
 from tests.runner.conftest import collect, final_json, make_runner, tool_json
 
@@ -210,7 +210,7 @@ async def test_recoverable_tool_failure_marks_outcome_failed() -> None:
 
 async def test_llm_error_run_emits_session_start_then_error() -> None:
     """An LLM-error run audits session_start + error, never final_answer."""
-    from agent_sdk.errors import LLMError
+    from fifty_agent_sdk.errors import LLMError
 
     llm = FakeLLMClient(replies=[LLMError("provider down")])
     spy = SpyAuditSink()
@@ -226,7 +226,7 @@ async def test_llm_error_run_emits_session_start_then_error() -> None:
 
 async def test_state_store_error_on_assistant_persist_is_audited() -> None:
     """A persist_assistant durability failure emits an error audit event."""
-    from agent_sdk import ChatMessage, MemoryStateStore, StateStore, StateStoreError
+    from fifty_agent_sdk import ChatMessage, MemoryStateStore, StateStore, StateStoreError
 
     class _FailingAssistantStore:
         """Delegates to memory, but fails the 2nd append (assistant persist)."""
@@ -314,7 +314,7 @@ async def test_raising_sink_does_not_abort_run() -> None:
     events = await collect(runner.run("s1", "Hi"))
 
     # The run completed normally despite the raising sink.
-    from agent_sdk import FinalEvent
+    from fifty_agent_sdk import FinalEvent
 
     assert isinstance(events[-1], FinalEvent)
     history = await store.get_messages("s1")

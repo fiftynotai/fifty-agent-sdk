@@ -1,4 +1,4 @@
-"""Tests for agent_sdk.prompts — template rendering and presets."""
+"""Tests for fifty_agent_sdk.prompts — template rendering and presets."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ from dataclasses import FrozenInstanceError
 
 import pytest
 
-from agent_sdk.prompts import (
+from fifty_agent_sdk.prompts import (
     JSON_MODE_OUTPUT_FORMAT,
     PROSE_MODE_OUTPUT_FORMAT,
     PromptSections,

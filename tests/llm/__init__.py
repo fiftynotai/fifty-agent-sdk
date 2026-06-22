@@ -1,1 +1,1 @@
-"""Tests for the agent_sdk.llm subpackage."""
+"""Tests for the fifty_agent_sdk.llm subpackage."""

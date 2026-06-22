@@ -1,4 +1,4 @@
-"""Unit tests for :class:`agent_sdk.state.memory.MemoryStateStore`.
+"""Unit tests for :class:`fifty_agent_sdk.state.memory.MemoryStateStore`.
 
 Covers the documented contract: round-trip, ordering, defensive copy,
 idempotent delete, per-session locking that does not block unrelated
@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import asyncio
 
-from agent_sdk import ChatMessage, MemoryStateStore
+from fifty_agent_sdk import ChatMessage, MemoryStateStore
 
 # ---------------------------------------------------------------------------
 # Basic round-trip

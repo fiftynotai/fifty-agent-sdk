@@ -1,11 +1,11 @@
-"""Tests for ``agent_sdk.safety``: SafetyConfig validation."""
+"""Tests for ``fifty_agent_sdk.safety``: SafetyConfig validation."""
 
 from __future__ import annotations
 
 import pytest
 from pydantic import ValidationError
 
-from agent_sdk.safety import SafetyConfig
+from fifty_agent_sdk.safety import SafetyConfig
 
 
 def test_safety_config_defaults() -> None:

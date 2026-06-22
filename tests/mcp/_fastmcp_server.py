@@ -11,7 +11,7 @@ Sanitiser discipline (learning #760 pt3)
     never a raw exception carrying sensitive text. FastMCP serialises a
     ``ToolError`` into ``isError=True`` content as ``"Error executing tool
     <name>: <safe message>"``, so the test server never leaks secrets into
-    the error-content path our :class:`agent_sdk.errors.MCPError` captures.
+    the error-content path our :class:`fifty_agent_sdk.errors.MCPError` captures.
 """
 
 from __future__ import annotations
@@ -35,7 +35,7 @@ def build_test_server() -> FastMCP:
         - ``search``: a search-like tool with NO return annotation, so FastMCP
           generates no output schema and its ``structuredContent`` stays
           ``None`` — exercising the content-blocks success branch of
-          :meth:`agent_sdk.mcp.client.MCPClient.invoke`. (A typed return such
+          :meth:`fifty_agent_sdk.mcp.client.MCPClient.invoke`. (A typed return such
           as ``-> dict[str, object]`` WOULD populate ``structuredContent``.)
         - ``lookup``: returns a Pydantic-typed :class:`LookupResult` so FastMCP
           populates ``structuredContent`` (exercising the structured success
@@ -44,7 +44,7 @@ def build_test_server() -> FastMCP:
           (exercising the ``isError`` → :class:`MCPError` path with sanitised
           ``context["content"]``).
     """
-    server: FastMCP = FastMCP("agent-sdk-compat-test")
+    server: FastMCP = FastMCP("fifty-agent-sdk-compat-test")
 
     @server.tool()
     def search(q: str):  # no return annotation -> no output schema
