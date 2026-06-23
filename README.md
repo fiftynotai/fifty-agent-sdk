@@ -132,7 +132,9 @@ provider differences are absorbed entirely by that one argument.
 `StateStore` is the protocol for conversation-state persistence across turns.
 `MemoryStateStore` is the default in-memory implementation and needs no
 infrastructure. `SqlStateStore` and `RedisStateStore` are durable backends
-behind the `sql` and `redis` extras respectively.
+behind the `sql` and `redis` extras respectively. The `sql` extra installs
+SQLAlchemy but not a database driver — bring your own async driver to match
+your database (e.g. `aiosqlite` for SQLite, `asyncpg` for PostgreSQL).
 
 Every session is a **tree of branches** with an active head. `fork`,
 `switch_branch`, `list_branches`, and branch-scoped `get_messages(...,
