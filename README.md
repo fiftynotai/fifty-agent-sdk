@@ -143,6 +143,21 @@ turn forks a new branch and the old line stays reachable — while `append`
 always writes to the active branch. Branching is data-additive: existing
 single-line sessions read as the `trunk` branch with no migration.
 
+The "edit a turn / regenerate" flow is orchestrated by the consumer — fork the
+history before the turn you want to change, switch onto the new branch, then
+append the edited message:
+
+```python
+# Keep messages 1..4, then take the conversation a different way on a new
+# branch. The original line stays reachable via its branch id.
+branch = await store.fork(session_id, from_sequence=4)
+await store.switch_branch(session_id, branch)
+await store.append(session_id, ChatMessage(role="user", content="...edited question..."))
+
+# New turns now continue on `branch`; the old line is still intact:
+await store.get_messages(session_id, branch_id="trunk")
+```
+
 For redaction, retention, or rollback, `truncate_after(session_id, sequence,
 branch_id=...)` hard-deletes a branch's tail (messages beyond `sequence`) — the
 destructive sibling of branching. It only removes the target branch's own
