@@ -1,5 +1,5 @@
 <p align="center">
-  <img src=".github/banner.png" alt="fifty-agent-sdk — an embeddable ReACT loop. any endpoint. no infra." width="100%">
+  <img src=".github/banner.png" alt="fifty-agent-sdk — a reusable agent loop for python." width="100%">
 </p>
 
 # fifty-agent-sdk
@@ -9,19 +9,15 @@
 [![CI](https://github.com/fiftynotai/fifty-agent-sdk/actions/workflows/ci.yml/badge.svg)](https://github.com/fiftynotai/fifty-agent-sdk/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-an embeddable ReACT agent loop you drop into your own service. it talks to
-any OpenAI-compatible Chat Completions endpoint — OpenAI, Google Distributed
-Cloud, a local OSS server — by changing one `base_url`. transport-free,
-infra-free by default, and pluggable behind protocols the whole way down.
+fifty-agent-sdk is a reusable agent loop for python. it implements a custom reACT loop with json-mode tool calls, an mcp client, and pluggable llm, state, and tool backends. it exists because the loop, the parser, the safety checks, and the runner kept getting rewritten per project. this is that loop, factored out once: write the tools, hand them to the runner, let it iterate.
 
 ## At a glance
 
-- endpoint-agnostic — one `base_url` points the loop at OpenAI, GDC, or a local OSS server; the loop doesn't care which.
-- pluggable tools — `@tool` derives a JSON Schema from type hints; MCP discovery adds remote tools to the same registry.
-- pluggable state — conversation state lives behind a `StateStore` protocol: in-memory, SQL, or Redis.
-- typed event stream — every ReACT step emits exactly one `AgentEvent`; every run ends with exactly one `FinalEvent`.
-- safety caps — iteration ceiling, per-tool timeouts, and a fallback answer on error or cap.
-- zero-infra default — memory backends ship in core; run an agent with no extra dependency.
+- talks to any openai-compatible chat-completions endpoint by swapping one `base_url`: openai, google distributed cloud, a local oss server.
+- llm clients, state stores, and tools are pluggable behind protocols: bring your own, the loop stays the same.
+- the run emits a typed event stream the caller consumes, so you watch the react loop step by step.
+- an iteration cap and per-tool timeouts bound every run, with a fallback answer on error or cap: a loop that can't end is a loop that doesn't ship.
+- zero-infra by default: no db, no redis, until you opt into an extra.
 
 ## Installation
 
@@ -29,25 +25,18 @@ infra-free by default, and pluggable behind protocols the whole way down.
 pip install fifty-agent-sdk
 ```
 
-The SDK requires Python 3.11 or newer. The core install ships with the
-in-memory backends, so an agent can run with no infrastructure dependency.
+Optional extras:
 
-Two optional extras add durable backends:
+- `pip install 'fifty-agent-sdk[sql]'` — enables SqlStateStore, SqlAuditSink, SQLAlchemy
+- `pip install 'fifty-agent-sdk[redis]'` — enables RedisStateStore
 
-- `pip install 'fifty-agent-sdk[sql]'` — pulls SQLAlchemy and enables
-  `SqlStateStore` (durable conversation state) and `SqlAuditSink` (durable
-  audit log).
-- `pip install 'fifty-agent-sdk[redis]'` — pulls redis-py and enables
-  `RedisStateStore` (Redis-backed conversation state).
+Importing `fifty_agent_sdk` pulls neither extra; the extra symbols are re-exported lazily, and first access without the relevant extra installed raises a clear `ImportError`. The `sql` extra installs SQLAlchemy but not a database driver — bring your own async driver (e.g. `aiosqlite` for SQLite, `asyncpg` for PostgreSQL).
 
-Importing `fifty_agent_sdk` itself pulls neither SQLAlchemy nor redis-py. The
-extra symbols are re-exported lazily; first access to one without the
-relevant extra installed raises a clear `ImportError`.
+Requires Python >=3.11.
 
 ## Quickstart
 
-A complete agent fits in a handful of lines. The example below defines a
-tool, wires the loop and runner, and drains the event stream:
+the example builds a tool, hands it to the `AgentRunner`, and consumes the typed event stream the run emits.
 
 ```python
 import asyncio
@@ -75,6 +64,7 @@ async def get_weather(city: str) -> dict[str, Any]:
 
 async def main() -> None:
     # 1. An LLM client — points at any OpenAI-compatible endpoint.
+    #    Pass base_url=... to target GDC or a local OSS server instead of OpenAI.
     llm = OpenAICompatibleClient(api_key="sk-...")
 
     # 2. A tool registry — register the decorated tool.
@@ -111,100 +101,106 @@ asyncio.run(main())
 
 ## Core concepts
 
-### Tools
+### tools
 
-The `@tool` decorator turns an async function into a `Tool`: it derives a
-JSON Schema for the arguments from the function's type annotations and
-docstring. A `Registry` is the dispatch table the loop talks to —
-`Registry().register(my_tool)` adds a tool by name. `InProcProvider` is a
-convenience helper for bulk-registering a batch of decorated callables.
+the registry of functions the agent can call. each tool is a side-effecting action exposed to the loop, so the model can do something in the world and not just talk about it.
 
-### LLM clients
+### llm
 
-`LLMClient` is the protocol the loop depends on — anything implementing it
-can drive the agent. `OpenAICompatibleClient` is the shipped implementation;
-it works against any OpenAI-compatible Chat Completions endpoint. Point it at
-GDC, a local OSS server, or OpenAI itself by passing `base_url` — the
-provider differences are absorbed entirely by that one argument.
+the llm client. a protocol plus an openai-compatible adapter, so the loop talks to any chat-completions endpoint by changing one base_url.
 
-### State stores
+### state
 
-`StateStore` is the protocol for conversation-state persistence across turns.
-`MemoryStateStore` is the default in-memory implementation and needs no
-infrastructure. `SqlStateStore` and `RedisStateStore` are durable backends
-behind the `sql` and `redis` extras respectively. The `sql` extra installs
-SQLAlchemy but not a database driver — bring your own async driver to match
-your database (e.g. `aiosqlite` for SQLite, `asyncpg` for PostgreSQL).
+the state stores. where conversation state persists between turns, with branching built in: fork a session, switch between branches, truncate back to an earlier point. `MemoryStateStore` needs no infrastructure; `SqlStateStore` and `RedisStateStore` are durable backends behind the extras.
 
-Every session is a **tree of branches** with an active head. `fork`,
-`switch_branch`, `list_branches`, and branch-scoped `get_messages(...,
-branch_id=...)` give you the "edit a message / regenerate" model — the edited
-turn forks a new branch and the old line stays reachable — while `append`
-always writes to the active branch. Branching is data-additive: existing
-single-line sessions read as the `trunk` branch with no migration.
+### streaming
 
-The "edit a turn / regenerate" flow is orchestrated by the consumer — fork the
-history before the turn you want to change, switch onto the new branch, then
-append the edited message:
+a typed event stream the caller consumes while the loop runs. each step in the run surfaces as an event instead of waiting for a final blob.
 
-```python
-# Keep messages 1..4, then take the conversation a different way on a new
-# branch. The original line stays reachable via its branch id.
-branch = await store.fork(session_id, from_sequence=4)
-await store.switch_branch(session_id, branch)
-await store.append(session_id, ChatMessage(role="user", content="...edited question..."))
+### safety
 
-# New turns now continue on `branch`; the old line is still intact:
-await store.get_messages(session_id, branch_id="trunk")
+the caps that bound a run: a max-iteration ceiling on react cycles and a per-tool timeout, plus the fallback answer returned when a run errors or hits the cap. a loop that can't end is a loop that doesn't ship.
+
+### audit
+
+the audit sinks and observability hooks. they record what the agent did, so a run can be read back after it finishes.
+
+## Architecture
+
+```
+fifty_agent_sdk  —  module graph (from src/fifty_agent_sdk/, ground-truth imports)
+
+src/fifty_agent_sdk/
+├─ ▢ audit
+├─ errors
+├─ ▢ llm
+├─ loop
+├─ ▢ mcp
+├─ ▢ observability
+├─ ▢ parser
+├─ prompts
+├─ ▶ runner
+├─ safety
+├─ ▢ state
+├─ streaming
+└─ ▢ tools
+
+depends (→):
+   audit → errors
+   llm → errors
+   loop → errors
+   loop → llm
+   loop → observability
+   loop → parser
+   loop → prompts
+   loop → safety
+   loop → streaming
+   loop → tools
+   mcp → errors
+   observability → llm
+   parser → errors
+   parser → llm
+   runner → audit
+   runner → errors
+   runner → llm
+   runner → loop
+   runner → observability
+   runner → state
+   runner → streaming
+   state → errors
+   state → llm
+   streaming → tools
+   tools → errors
+   tools → llm
+   tools → mcp
+
+legend: ▶ entry   ▢ package   name module   → depends
 ```
 
-For redaction, retention, or rollback, `truncate_after(session_id, sequence,
-branch_id=...)` hard-deletes a branch's tail (messages beyond `sequence`) — the
-destructive sibling of branching. It only removes the target branch's own
-messages, so a fork's shared/inherited prefix is never affected.
+## What's new in 1.2.0
 
-### The event stream
+- **branching** — first-class conversation branching on `StateStore`: `fork`, `list_branches`, `switch_branch`, branch-scoped `get_messages(..., branch_id=...)`, plus `BranchInfo` and `TRUNK_BRANCH_ID`. a session is now a tree of branches with an active head, and `append` writes to the active branch (the edit-a-message / regenerate model). implemented across memory, SQL, and Redis backends, data-additive and zero-migration: existing sessions read as the trunk branch. breaking for custom `StateStore` implementations: they must add the new methods.
+- **`StateStore.truncate_after(session_id, sequence, *, branch_id=None)`** — a destructive hard-delete of a branch's tail (messages with sequence > N), for redaction, retention, and rollback. only the target branch's own messages are removed (a `fork`'s inherited prefix is never touched), and it is idempotent: a no-op on an unknown session or branch.
 
-Every step of the ReACT cycle emits exactly one event from the `AgentEvent`
-union: `ThoughtEvent`, `ActionEvent`, `ToolStartedEvent`,
-`ToolProgressEvent` (reserved — never emitted by the v1 loop),
-`ObservationEvent`, `ToolFailedEvent`, `TokenEvent`, `FinalEvent`, and
-`ErrorEvent`. Events carry a monotonic `sequence` counter and a `timestamp`
-so consumers can detect drops or reorders. Every run ends with exactly one
-`FinalEvent` — consumers can rely on it as the "iteration done" signal.
+editing a turn is a consumer-side fork-then-append, and the original line stays reachable:
 
-### Safety
-
-`SafetyConfig` bounds a run: it caps the iteration count, sets per-tool
-timeouts, and supplies the fallback answer used when a run terminates on an
-error or safety cap.
-
-### Audit & observability
-
-Two optional collaborators plug into the runner. An `AuditSink` records an
-`AuditEvent` at session start, each tool invocation, the final answer, and
-any error. A `Hooks` instance fires lifecycle callbacks for logging, metrics,
-and tracing. Both are best-effort and isolated — a raising sink or hook
-never aborts a live run.
-
-## Design principles
-
-- **Pluggable everything.** LLM clients, tool sources, state stores, audit
-  sinks, observability hooks all sit behind protocols.
-- **Transport-free.** No HTTP, no WebSocket, no auth. Consumers wrap the
-  `Runner` in whatever transport makes sense.
-- **Production-first.** Iter caps, tool timeouts, structured errors,
-  graceful fallbacks, full-fidelity event stream.
-- **Standalone usable.** Memory backends ship by default so you can run an
-  agent without any infrastructure dependency.
+```python
+# Edit a turn = fork the history before it, switch onto the new branch, then
+# append the edited message. `store` is any StateStore; import `ChatMessage`
+# from fifty_agent_sdk.
+branch = await store.fork(session_id, from_sequence=4)   # keep messages 1..4
+await store.switch_branch(session_id, branch)
+await store.append(session_id, ChatMessage(role="user", content="...edited..."))
+await store.get_messages(session_id, branch_id="trunk")  # original line intact
+```
 
 ## Links
 
-- package — https://pypi.org/project/fifty-agent-sdk/
-- source & issues — https://github.com/fiftynotai/fifty-agent-sdk
-- changelog — [CHANGELOG.md](CHANGELOG.md)
-- contributing — issues and PRs welcome.
+- [Homepage](https://github.com/fiftynotai/fifty-agent-sdk)
+- [Repository](https://github.com/fiftynotai/fifty-agent-sdk)
+- [Issues](https://github.com/fiftynotai/fifty-agent-sdk/issues)
+- [Changelog](https://github.com/fiftynotai/fifty-agent-sdk/blob/main/CHANGELOG.md)
 
 ## License
 
-[MIT](LICENSE) © fifty.dev
+MIT.
