@@ -271,6 +271,143 @@ async def test_tool_returns_is_error_without_error_message() -> None:
 
 
 # ---------------------------------------------------------------------------
+# MCP isError converges on the native recoverable-observation path (BR-005)
+# ---------------------------------------------------------------------------
+
+
+async def test_mcp_is_error_emits_tool_failed_and_continues() -> None:
+    """An MCP ``isError=True`` is a recoverable observation, not a fatal error.
+
+    BR-005 acceptance criterion 1: the ``_MCPToolAdapter`` now returns a
+    ``ToolResult(output=None, is_error=True, error="MCP tool '...' returned
+    isError=True")`` for a per-call ``isError``. The loop CANNOT distinguish
+    that from a native ``ToolResult(is_error=True)`` — same code path — so we
+    model the adapter's output with a FakeTool and assert the event sequence is
+    byte-for-byte the native ``is_error`` sequence: a ``ToolFailedEvent``, a
+    continued loop, a ``FinalEvent``, NO ``ErrorEvent``, and a ``"Tool error:"``
+    tool-role observation fed back to the model.
+    """
+    tool = FakeTool(
+        "submit_leave_request",
+        result=ToolResult(
+            output=None,
+            is_error=True,
+            error="MCP tool 'submit_leave_request' returned isError=True",
+        ),
+    )
+    registry = Registry()
+    registry.register(tool)
+    llm = FakeLLMClient(
+        replies=[
+            make_response(_tool_json("t", "submit_leave_request", {})),
+            make_response(_final_json("recovered")),
+        ]
+    )
+    loop = _make_loop(llm=llm, registry=registry)
+
+    events = await _collect(loop.run([ChatMessage(role="user", content="q")]))
+
+    types = [type(e) for e in events]
+    assert types == [
+        ThoughtEvent,
+        ActionEvent,
+        ToolStartedEvent,
+        ToolFailedEvent,
+        ThoughtEvent,
+        FinalEvent,
+    ]
+    # A FinalEvent is produced and NO ErrorEvent appears: the run did not
+    # terminate on the MCP failure.
+    assert any(isinstance(e, FinalEvent) for e in events)
+    assert not any(isinstance(e, ErrorEvent) for e in events)
+
+    failed_event = events[3]
+    assert isinstance(failed_event, ToolFailedEvent)
+    assert failed_event.error == "MCP tool 'submit_leave_request' returned isError=True"
+
+    # The second LLM call sees a tool-role observation starting with "Tool error:".
+    second_request = llm.calls[1]
+    tool_msgs = [m for m in second_request.messages if m.role == "tool"]
+    assert len(tool_msgs) == 1
+    assert tool_msgs[0].content.startswith("Tool error:")
+
+
+def _native_is_error_case() -> tuple[Registry, SafetyConfig, str]:
+    tool = FakeTool("t", result=ToolResult(output=None, is_error=True, error="native boom"))
+    registry = Registry()
+    registry.register(tool)
+    return registry, SafetyConfig(), "t"
+
+
+def _tool_not_found_case() -> tuple[Registry, SafetyConfig, str]:
+    # Empty registry -> ToolNotFound on invocation.
+    return Registry(), SafetyConfig(), "ghost"
+
+
+def _tool_timeout_case() -> tuple[Registry, SafetyConfig, str]:
+    tool = FakeTool("slow", sleep_seconds=0.5)
+    registry = Registry()
+    registry.register(tool)
+    return registry, SafetyConfig(max_iterations=4, tool_timeout_seconds=0.05), "slow"
+
+
+def _mcp_is_error_case() -> tuple[Registry, SafetyConfig, str]:
+    # The adapter's output for a per-call MCP isError: ToolResult(is_error=True).
+    tool = FakeTool(
+        "mcp_tool",
+        result=ToolResult(
+            output=None,
+            is_error=True,
+            error="MCP tool 'mcp_tool' returned isError=True",
+        ),
+    )
+    registry = Registry()
+    registry.register(tool)
+    return registry, SafetyConfig(), "mcp_tool"
+
+
+@pytest.mark.parametrize(
+    "case_factory",
+    [
+        _native_is_error_case,
+        _tool_not_found_case,
+        _tool_timeout_case,
+        _mcp_is_error_case,
+    ],
+    ids=["native_is_error", "tool_not_found", "tool_timeout", "mcp_is_error"],
+)
+async def test_recoverable_tool_failures_converge(
+    case_factory: Any,
+) -> None:
+    """All four recoverable tool-failure channels land on the SAME behavior.
+
+    BR-005 acceptance criterion 2: native ``ToolResult(is_error=True)``,
+    ``ToolNotFound``, ``ToolTimeout``, and an MCP ``isError`` (the adapter's
+    ``ToolResult(is_error=True)``) each yield exactly one ``ToolFailedEvent``,
+    then a continued loop, then a ``FinalEvent``, and zero ``ErrorEvent``. This
+    is the single test proving the four channels converge on the recoverable-
+    observation path rather than terminating the run.
+    """
+    registry, safety, tool_name = case_factory()
+    llm = FakeLLMClient(
+        replies=[
+            make_response(_tool_json("t", tool_name, {})),
+            make_response(_final_json("recovered")),
+        ]
+    )
+    loop = _make_loop(llm=llm, registry=registry, safety=safety)
+
+    events = await _collect(loop.run([ChatMessage(role="user", content="q")]))
+
+    failed_events = [e for e in events if isinstance(e, ToolFailedEvent)]
+    assert len(failed_events) == 1
+    # The loop continued (a second LLM call happened) and produced a final.
+    assert len(llm.calls) == 2
+    assert any(isinstance(e, FinalEvent) for e in events)
+    assert not any(isinstance(e, ErrorEvent) for e in events)
+
+
+# ---------------------------------------------------------------------------
 # Tool not found
 # ---------------------------------------------------------------------------
 

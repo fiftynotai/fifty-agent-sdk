@@ -45,6 +45,7 @@ import structlog
 from pydantic import BaseModel, ConfigDict
 
 from fifty_agent_sdk.mcp import MCPClient, MCPToolDef
+from fifty_agent_sdk.mcp.client import _MCPCallError
 from fifty_agent_sdk.tools.protocol import ToolResult, ToolSchema
 from fifty_agent_sdk.tools.registry import Registry
 
@@ -122,13 +123,28 @@ class _MCPToolAdapter:
     Constructed by :class:`MCPProvider` — one instance per MCP-advertised
     tool. ``invoke`` delegates to :meth:`fifty_agent_sdk.mcp.client.MCPClient.invoke`
     and translates the result into a
-    :class:`fifty_agent_sdk.tools.protocol.ToolResult`. The adapter does NOT catch
-    :class:`fifty_agent_sdk.errors.MCPError` — by design, the
-    :class:`fifty_agent_sdk.tools.registry.Registry` re-raises
-    :class:`fifty_agent_sdk.errors.AgentSdkError` subclasses untouched
-    (registry.py:154), giving the surrounding runner the chance to surface
-    the MCP failure as a system error rather than as a per-tool recoverable
-    failure.
+    :class:`fifty_agent_sdk.tools.protocol.ToolResult`.
+
+    Recoverable vs. fatal split (BR-005):
+        A per-call ``tools/call`` ``isError=True`` result is **recoverable**:
+        the underlying :meth:`MCPClient.invoke` returns a
+        :class:`fifty_agent_sdk.mcp.client._MCPCallError` (it does NOT raise), and
+        this adapter maps it to ``ToolResult(is_error=True, error=...)`` so the
+        agent loop feeds it back to the model as a tool observation and
+        continues — exactly like a native ``ToolResult(is_error=True)``,
+        :class:`fifty_agent_sdk.errors.ToolNotFound`, or
+        :class:`fifty_agent_sdk.errors.ToolTimeout`. The run does NOT terminate.
+
+        Transport, protocol, and session failures remain **fatal**: those are
+        raised as :class:`fifty_agent_sdk.errors.MCPError` at the ``call_tool``
+        boundary inside :meth:`MCPClient.invoke`, *before* the result is
+        unwrapped, so they never become a :class:`_MCPCallError`. The adapter
+        does NOT catch that :class:`MCPError`; the
+        :class:`fifty_agent_sdk.tools.registry.Registry` re-raises
+        :class:`fifty_agent_sdk.errors.AgentSdkError` subclasses untouched
+        (registry.py), giving the surrounding runner the chance to surface a
+        genuine connection failure as a system error rather than masking a dead
+        connection as a recoverable per-tool failure.
     """
 
     def __init__(self, defn: MCPToolDef, client: MCPClient) -> None:
@@ -139,14 +155,25 @@ class _MCPToolAdapter:
         self.schema: ToolSchema = _to_tool_schema(defn.input_schema)
 
     async def invoke(self, args: dict[str, Any]) -> ToolResult:
-        """Delegate to the underlying :class:`MCPClient`.
+        """Delegate to the underlying :class:`MCPClient` and map the outcome.
 
-        On success returns ``ToolResult(output=..., is_error=False)``. On
-        :class:`fifty_agent_sdk.errors.MCPError` the exception propagates
-        untouched per the Tool protocol's "system failure" escape route
-        (protocol.py:107-115).
+        On a per-call ``isError=True`` result (a
+        :class:`fifty_agent_sdk.mcp.client._MCPCallError`) returns a recoverable
+        ``ToolResult(output=None, is_error=True, error=...)`` carrying only the
+        bounded ``message`` (BR-005). The verbatim server error ``content`` is
+        deliberately kept OFF the model-facing ``error`` string — only the
+        bounded message reaches the model, mirroring the security caution on
+        :meth:`MCPClient._unwrap_invoke_result`.
+
+        On success returns ``ToolResult(output=..., is_error=False)``.
+
+        A transport/protocol/session :class:`fifty_agent_sdk.errors.MCPError`
+        raised by :meth:`MCPClient.invoke` propagates untouched per the Tool
+        protocol's "system failure" escape route (protocol.py:107-115).
         """
         output = await self._client.invoke(self._defn.name, args)
+        if isinstance(output, _MCPCallError):
+            return ToolResult(output=None, is_error=True, error=output.message)
         return ToolResult(output=output, is_error=False, error=None)
 
 

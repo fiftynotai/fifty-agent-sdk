@@ -19,18 +19,26 @@ import asyncio
 import inspect
 from typing import Any
 
+import httpx
 import pytest
 import structlog
 
 from fifty_agent_sdk.errors import MCPError
+from fifty_agent_sdk.mcp import MCPClient, MCPClientConfig, MCPToolDef
 from fifty_agent_sdk.tools.mcp_provider import (
     MCPProvider,
     RefreshSummary,
+    _MCPToolAdapter,
     _to_tool_schema,
 )
 from fifty_agent_sdk.tools.protocol import ToolResult, ToolSchema
 from fifty_agent_sdk.tools.registry import Registry
-from tests.mcp.conftest import ControllableServer, make_controllable_client
+from tests.mcp.conftest import (
+    MCP_URL,
+    ControllableServer,
+    make_controllable_client,
+    make_strict_http_client,
+)
 
 
 def _tool_def(name: str, *, schema: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -126,32 +134,81 @@ async def test_adapter_invoke_returns_tool_result_on_success(
     assert result.output == {"answer": 42}
 
 
-async def test_adapter_propagates_mcp_error_unwrapped(
+async def test_adapter_maps_is_error_to_tool_result(
     controllable_server: ControllableServer,
 ) -> None:
-    # No handler registered -> isError result -> MCPError with tool_name.
+    """A per-call ``isError=True`` becomes a recoverable ToolResult, not a raise.
+
+    BR-005: an unregistered tool on the ControllableServer returns a real
+    ``CallToolResult(isError=True)``; the adapter maps it to
+    ``ToolResult(is_error=True)`` carrying the tool name in ``.error`` and does
+    NOT raise.
+    """
+    # No handler registered -> isError result -> recoverable ToolResult.
     controllable_server.set_tool_catalog([_tool_def("missing")])
     client = make_controllable_client(controllable_server)
     provider = MCPProvider(client)
     registry = Registry()
     await provider.attach(registry)
     adapter = registry.get("missing")
-    with pytest.raises(MCPError) as exc:
-        await adapter.invoke({})
-    assert exc.value.context["tool_name"] == "missing"
+    result = await adapter.invoke({})
+    assert isinstance(result, ToolResult)
+    assert result.is_error is True
+    assert result.output is None
+    assert result.error is not None
+    assert "missing" in result.error
 
 
-async def test_registry_invoke_propagates_mcp_error(
+async def test_registry_invoke_maps_is_error_to_tool_result(
     controllable_server: ControllableServer,
 ) -> None:
-    """Registry.invoke() re-raises AgentSdkError subclasses untouched."""
+    """Registry.invoke() passes the adapter's recoverable ToolResult through.
+
+    BR-005: the per-call ``isError`` path no longer raises an AgentSdkError, so
+    the registry returns the ``ToolResult(is_error=True)`` end-to-end instead of
+    re-raising.
+    """
     controllable_server.set_tool_catalog([_tool_def("missing")])
     client = make_controllable_client(controllable_server)
     provider = MCPProvider(client)
     registry = Registry()
     await provider.attach(registry)
+    result = await registry.invoke("missing", {}, timeout=1.0)
+    assert isinstance(result, ToolResult)
+    assert result.is_error is True
+    assert "missing" in (result.error or "")
+
+
+async def test_mcp_transport_error_still_raises() -> None:
+    """A transport/connection failure STILL raises MCPError (fatal path).
+
+    BR-005 guardrail (acceptance criterion 3): the recoverable/fatal split is
+    structural — a dead connection is raised as :class:`MCPError` at the
+    ``call_tool`` boundary, *before* ``_unwrap_invoke_result`` runs, so it can
+    NEVER be downgraded to a recoverable ``ToolResult(is_error=True)``. This
+    locks the split so a future change cannot silently mask an outage as a
+    recoverable per-tool observation. Asserted through BOTH the adapter and the
+    registry.
+    """
+
+    def boom(_request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("nope")
+
+    http_client, _ = make_strict_http_client(boom)
+    client = MCPClient(MCPClientConfig(base_url=MCP_URL), client=http_client)
+    defn = MCPToolDef(name="search", description="search", input_schema={})
+    adapter = _MCPToolAdapter(defn, client)
+
+    # Through the adapter directly.
+    with pytest.raises(MCPError) as exc:
+        await adapter.invoke({"q": "x"})
+    assert exc.value.context["wrapped"] == "ConnectError"
+
+    # And end-to-end through the registry (which re-raises AgentSdkError).
+    registry = Registry()
+    registry.register(adapter)
     with pytest.raises(MCPError):
-        await registry.invoke("missing", {}, timeout=1.0)
+        await registry.invoke("search", {"q": "x"}, timeout=1.0)
 
 
 # ---------------------------------------------------------------------------

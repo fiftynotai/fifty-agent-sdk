@@ -63,6 +63,7 @@ Error contract
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import dataclass
 from typing import Any, Final
 
 import httpx
@@ -214,6 +215,49 @@ def _iter_leaf_exceptions(exc: BaseException) -> list[BaseException]:
 
 
 # ---------------------------------------------------------------------------
+# Per-call error carrier (recoverable `isError` outcome)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _MCPCallError:
+    """A per-call ``tools/call`` ``isError=True`` outcome (recoverable).
+
+    Returned (NOT raised) by :meth:`MCPClient._unwrap_invoke_result` when a
+    ``tools/call`` completes the transport/protocol/session round-trip
+    successfully but the server marks the *result* as an error
+    (``CallToolResult.isError is True``). The
+    :class:`fifty_agent_sdk.tools.mcp_provider._MCPToolAdapter` maps this into a
+    recoverable :class:`fifty_agent_sdk.tools.protocol.ToolResult` with
+    ``is_error=True`` so the agent loop reasons about it as a tool observation
+    rather than terminating the run (BR-005).
+
+    This is deliberately a plain frozen dataclass and NOT an
+    :class:`fifty_agent_sdk.errors.AgentSdkError`/:class:`Exception` subclass: if
+    it were an exception, the tool
+    :class:`fifty_agent_sdk.tools.registry.Registry`'s ``except AgentSdkError``
+    branch (registry.py) would re-raise it untouched and defeat the recoverable
+    mapping. The recoverable/fatal split is structural — transport, protocol,
+    and session failures are raised as :class:`MCPError` *before*
+    ``_unwrap_invoke_result`` is reached, so a value of this type can only ever
+    represent a per-call result error, never a connection failure.
+
+    Attributes:
+        message: A bounded, model-safe description of the failure
+            (``"MCP tool '<name>' returned isError=True"``). This is the ONLY
+            field surfaced into the model-facing observation.
+        content: The server's error content blocks serialised verbatim to plain
+            JSON dicts (``[c.model_dump(mode="json") for c in result.content]``).
+            Retained for logs/diagnostics ONLY — see the security note on
+            :meth:`MCPClient._unwrap_invoke_result`. The adapter MUST NOT splice
+            this into the model observation unredacted.
+    """
+
+    message: str
+    content: list[dict[str, Any]]
+
+
+# ---------------------------------------------------------------------------
 # Client
 # ---------------------------------------------------------------------------
 
@@ -233,8 +277,11 @@ class MCPClient:
     Invariant — auth headers MUST NEVER appear in MCPError.context.
         Every :class:`MCPError` raised by this client builds its
         ``context`` dict from the small allow-list ``{server_url, method,
-        tool_name, wrapped, status_code, error_code, error_data, content,
-        operation}`` — no header dict is ever captured. ``_resolve_auth``
+        tool_name, wrapped, status_code, error_code, error_data,
+        operation}`` — no header dict is ever captured. (The per-call
+        ``isError`` content lives on :class:`_MCPCallError.content`, NOT in any
+        :class:`MCPError.context`, since that path no longer raises — BR-005.)
+        ``_resolve_auth``
         still tracks declared header names for any future code path that
         *does* need to surface headers (e.g. a debug-mode dump): that path
         MUST funnel through :func:`_redact_headers` first. The next person
@@ -334,7 +381,7 @@ class MCPClient:
             args: Argument object passed verbatim as the ``arguments``.
 
         Returns:
-            The unwrapped tool payload. When the server populates
+            On success, the unwrapped tool payload. When the server populates
             ``structuredContent`` (a JSON object — e.g. a typed/object return),
             that dict is returned verbatim. Otherwise the content blocks are
             returned as a list of plain JSON dicts
@@ -346,11 +393,22 @@ class MCPClient:
             ``ToolResult.output`` should expect ``dict`` (structured) or
             ``list[dict]`` (content blocks).
 
+            On a per-call ``isError=True`` result, returns a
+            :class:`_MCPCallError` (NOT raised — BR-005): the transport,
+            protocol, and session round-trip succeeded, so the failure is a
+            recoverable per-tool error the
+            :class:`fifty_agent_sdk.tools.mcp_provider._MCPToolAdapter` maps to a
+            :class:`fifty_agent_sdk.tools.protocol.ToolResult` with
+            ``is_error=True``.
+
         Raises:
-            MCPError: For transport failure, protocol/handshake failure,
-                server-returned JSON-RPC error, or a result carrying
-                ``isError=True``. Also raised with
-                ``message == "MCP client is closed"`` after :meth:`aclose`.
+            MCPError: For transport failure, protocol/handshake failure, or
+                server-returned JSON-RPC error (all raised at the
+                ``call_tool`` boundary, *before* the result is unwrapped). Also
+                raised with ``message == "MCP client is closed"`` after
+                :meth:`aclose`. A per-call ``isError=True`` result no longer
+                raises — it is returned as a :class:`_MCPCallError` (see
+                ``Returns``).
         """
         if self._closed:
             raise MCPError(
@@ -581,19 +639,38 @@ class MCPClient:
     def _unwrap_invoke_result(self, result: CallToolResult, *, tool_name: str) -> Any:
         """Unwrap the typed ``tools/call`` :class:`mcp.types.CallToolResult`.
 
+        Reached ONLY after :meth:`mcp.ClientSession.call_tool` returned a
+        ``CallToolResult`` without raising — i.e. the transport, protocol, and
+        session are provably healthy. Therefore a ``result.isError`` here is
+        always a recoverable *per-call* failure, never a connection failure:
+        the latter is raised as :class:`MCPError` at the ``call_tool`` boundary
+        (``invoke``) and never enters this function. This call-site structure —
+        not field-sniffing — is the discriminator between recoverable and fatal
+        MCP errors (BR-005).
+
+        Recoverable error shape (BR-005):
+            When ``result.isError`` is True, this RETURNS (does not raise) a
+            :class:`_MCPCallError` carrying a bounded model-safe ``message`` and
+            the server's error ``content`` blocks. The
+            :class:`fifty_agent_sdk.tools.mcp_provider._MCPToolAdapter` translates
+            it into a recoverable
+            :class:`fifty_agent_sdk.tools.protocol.ToolResult` with
+            ``is_error=True``.
+
         Security note — error-content capture (TD-007 item 3):
-            When ``isError`` is True, ``result.content`` is serialised
-            verbatim into ``MCPError.context["content"]``. The SDK has no way
-            to know what an MCP server places in that field — a non-conformant
-            or poorly-implemented server MAY echo request arguments,
-            credentials, or other sensitive material into the error content,
-            in which case that material surfaces in our error logs. We
-            intentionally preserve the value as-is rather than redact it: the
-            SDK does not own the schema, redaction would mask real debug info,
-            and the threat model here is a misbehaving downstream (which we
-            cannot fix from the client side). Consumers running against
-            untrusted MCP servers SHOULD scrub ``MCPError.context["content"]``
-            before logging.
+            When ``isError`` is True, ``result.content`` is serialised verbatim
+            onto :attr:`_MCPCallError.content`. The SDK has no way to know what
+            an MCP server places in that field — a non-conformant or
+            poorly-implemented server MAY echo request arguments, credentials,
+            or other sensitive material into the error content, in which case
+            that material surfaces in our error logs. We intentionally preserve
+            the value as-is rather than redact it: the SDK does not own the
+            schema, redaction would mask real debug info, and the threat model
+            here is a misbehaving downstream (which we cannot fix from the
+            client side). The adapter keeps this content OFF the model-facing
+            observation (only the bounded ``message`` is surfaced to the model);
+            consumers running against untrusted MCP servers SHOULD scrub
+            :attr:`_MCPCallError.content` before logging.
 
         Success shape:
             Returns ``result.structuredContent`` when the server provides it
@@ -601,14 +678,9 @@ class MCPClient:
             dicts: ``[c.model_dump(mode="json") for c in result.content]``.
         """
         if result.isError:
-            raise MCPError(
-                f"MCP tool '{tool_name}' returned isError=True",
-                context={
-                    "server_url": self._config.base_url,
-                    "method": "tools/call",
-                    "tool_name": tool_name,
-                    "content": [c.model_dump(mode="json") for c in result.content],
-                },
+            return _MCPCallError(
+                message=f"MCP tool '{tool_name}' returned isError=True",
+                content=[c.model_dump(mode="json") for c in result.content],
             )
         if result.structuredContent is not None:
             return result.structuredContent

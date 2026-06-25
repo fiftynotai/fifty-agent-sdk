@@ -11,7 +11,10 @@ Sanitiser discipline (learning #760 pt3)
     never a raw exception carrying sensitive text. FastMCP serialises a
     ``ToolError`` into ``isError=True`` content as ``"Error executing tool
     <name>: <safe message>"``, so the test server never leaks secrets into
-    the error-content path our :class:`fifty_agent_sdk.errors.MCPError` captures.
+    the error-content path our
+    :class:`fifty_agent_sdk.mcp.client._MCPCallError` captures (BR-005: a
+    per-call ``isError`` is surfaced as a recoverable ``ToolResult(is_error=
+    True)``, not raised as an ``MCPError``).
 """
 
 from __future__ import annotations
@@ -41,8 +44,9 @@ def build_test_server() -> FastMCP:
           populates ``structuredContent`` (exercising the structured success
           branch — a plain ``dict`` return does NOT populate it).
         - ``boom``: raises :class:`ToolError` with a safe message
-          (exercising the ``isError`` → :class:`MCPError` path with sanitised
-          ``context["content"]``).
+          (exercising the ``isError`` → ``_MCPCallError`` path with sanitised
+          ``content``, surfaced to the loop as a recoverable
+          ``ToolResult(is_error=True)``).
     """
     server: FastMCP = FastMCP("fifty-agent-sdk-compat-test")
 
