@@ -381,13 +381,12 @@ async def test_mcperror_context_keys_match_class_docstring_allowlist(
     def _capture(exc: MCPError) -> None:
         runtime.update(exc.context.keys())
 
-    # Group 1: tool isError=True -> tool_name, content (+ server_url, method).
+    # Group 1: post-aclose call -> operation, server_url.
+    # (A per-call isError=True no longer raises MCPError — it returns a
+    # _MCPCallError, BR-005 — so it contributes no MCPError.context keys. The
+    # tool_name/method/server_url keys are still exercised by the transport
+    # groups below, which carry invoke()'s base_context.)
     async with make_compat_client(fastmcp_server) as compat:
-        with pytest.raises(MCPError) as exc:
-            await compat.invoke("boom", {"x": "y"})
-        _capture(exc.value)
-
-        # Group 2: post-aclose call -> operation.
         await compat.aclose()
         with pytest.raises(MCPError) as exc:
             await compat.discover()

@@ -4,6 +4,21 @@ All notable changes to `fifty-agent-sdk` are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- An MCP tool returning `isError=True` is now a **recoverable** tool
+  observation instead of a run-terminating error. Previously the MCP adapter
+  raised `MCPError` on `isError=True`; that exception escaped the agent loop
+  (which only caught `ToolNotFound`/`ToolTimeout`) and propagated out of
+  `Runner.run()`, crashing the turn with a raw `MCPError`. Now a per-call
+  `isError=True` is surfaced as a `ToolResult(is_error=True)` — the model
+  receives it as a `"Tool error: …"` observation and produces a grounded
+  reply — converging MCP tool failures onto the exact same recoverable path as
+  native `is_error`, `ToolNotFound`, and `ToolTimeout`. Genuinely-fatal
+  transport / protocol / session `MCPError`s still terminate the run as before.
+  (BR-005)
+
 ## [1.2.0] - 2026-06-22
 
 ### Added

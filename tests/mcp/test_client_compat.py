@@ -7,17 +7,16 @@ official :class:`mcp.ClientSession` connected to a :class:`FastMCP` server via
 wrapper is NOT its own oracle. The full ``initialize → list_tools →
 call_tool`` path is exercised: the harness runs ``initialize``, and these
 tests assert ``list_tools`` round-trips the FastMCP-declared catalog and
-``call_tool`` produces the chosen success-shape (and the sanitised
-``isError`` → :class:`MCPError`).
+``call_tool`` produces the chosen success-shape (and the sanitised per-call
+``isError`` → :class:`fifty_agent_sdk.mcp.client._MCPCallError`, BR-005).
 """
 
 from __future__ import annotations
 
-import pytest
 from mcp.server.fastmcp import FastMCP
 
-from fifty_agent_sdk.errors import MCPError
 from fifty_agent_sdk.mcp import MCPToolDef
+from fifty_agent_sdk.mcp.client import _MCPCallError
 
 from .conftest import make_compat_client
 
@@ -71,23 +70,25 @@ async def test_invoke_returns_structured_content_when_present(fastmcp_server: Fa
     assert result["found"] is True
 
 
-async def test_invoke_maps_is_error_to_mcp_error_with_sanitised_content(
+async def test_invoke_maps_is_error_to_call_error_with_sanitised_content(
     fastmcp_server: FastMCP,
 ) -> None:
-    """``isError=True`` raises :class:`MCPError` carrying the sanitised content.
+    """``isError=True`` RETURNS a :class:`_MCPCallError` with sanitised content.
 
-    The ``boom`` tool raises ``ToolError("safe message")`` (learning #760 pt3),
-    so the FastMCP-serialised error content carries only the safe message —
-    asserting it appears in ``context["content"]`` proves both the
-    ``isError`` path and that no raw exception text leaked.
+    BR-005: a per-call ``isError`` no longer raises — ``invoke`` returns a
+    recoverable :class:`_MCPCallError`. The ``boom`` tool raises
+    ``ToolError("safe message")`` (learning #760 pt3), so the FastMCP-serialised
+    error content carries only the safe message — asserting it appears in
+    ``.content`` proves both the ``isError`` path and that no raw exception text
+    leaked. The bounded ``.message`` names the tool (the only field the adapter
+    surfaces to the model).
     """
     async with make_compat_client(fastmcp_server) as client:
-        with pytest.raises(MCPError) as exc:
-            await client.invoke("boom", {"x": "y"})
+        result = await client.invoke("boom", {"x": "y"})
 
-    assert exc.value.context["tool_name"] == "boom"
-    assert exc.value.context["method"] == "tools/call"
-    content = exc.value.context["content"]
+    assert isinstance(result, _MCPCallError)
+    assert "boom" in result.message
+    content = result.content
     assert isinstance(content, list)
     joined = " ".join(block.get("text", "") for block in content)
     assert "safe message" in joined

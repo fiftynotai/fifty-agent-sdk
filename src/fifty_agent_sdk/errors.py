@@ -55,7 +55,7 @@ class LLMError(AgentSdkError):
 
 
 class MCPError(AgentSdkError):
-    """MCP transport, protocol, or tool-call failure.
+    """MCP transport, protocol, or session failure (a genuine system error).
 
     Raised by :class:`fifty_agent_sdk.mcp.client.MCPClient`, which wraps the
     official ``mcp`` SDK's :class:`mcp.ClientSession`, for:
@@ -66,24 +66,35 @@ class MCPError(AgentSdkError):
     - Protocol/handshake failures and server-returned JSON-RPC errors
       surfaced by the SDK as :class:`mcp.shared.exceptions.McpError`
       (``error.code``/``error.data``).
-    - A ``tools/call`` result carrying ``isError=True``.
+    - Session/handshake :class:`RuntimeError`s (e.g. an unsupported protocol
+      version) and use after :meth:`fifty_agent_sdk.mcp.client.MCPClient.aclose`.
 
-    The wrapping guarantees the uniform-MCPError contract (TD-007): neither
-    ``mcp``'s ``McpError`` nor any ``httpx`` exception leaks from
-    :meth:`fifty_agent_sdk.mcp.client.MCPClient.discover`/``invoke``.
+    The wrapping guarantees the uniform-MCPError contract (TD-007) for these
+    fatal paths: neither ``mcp``'s ``McpError`` nor any ``httpx`` exception
+    leaks from :meth:`fifty_agent_sdk.mcp.client.MCPClient.discover`/``invoke``.
+
+    A per-call ``tools/call`` result carrying ``isError=True`` does NOT raise
+    this error (BR-005). It is a *recoverable* per-tool failure — the server
+    ran and reported failure, while the transport/protocol/session are healthy —
+    so :meth:`MCPClient.invoke` returns a per-call signal that the
+    :class:`fifty_agent_sdk.tools.mcp_provider._MCPToolAdapter` surfaces as a
+    :class:`fifty_agent_sdk.tools.protocol.ToolResult` with ``is_error=True``,
+    which the agent loop feeds back to the model as a tool observation rather
+    than terminating the run.
 
     ``context`` typically carries ``server_url``, ``method``, ``tool_name``,
-    ``error_code``, ``error_data``, ``status_code``, ``content``,
-    ``operation``, or ``wrapped`` (the underlying httpx exception class name).
-    It NEVER includes auth headers — auth lives on the httpx client and is
-    stripped before recording (see :class:`fifty_agent_sdk.mcp.client.MCPClient`).
+    ``error_code``, ``error_data``, ``status_code``, ``operation``, or
+    ``wrapped`` (the underlying httpx exception class name). It NEVER includes
+    auth headers — auth lives on the httpx client and is stripped before
+    recording (see :class:`fifty_agent_sdk.mcp.client.MCPClient`).
 
-    Because :class:`MCPError` is an :class:`AgentSdkError`, the tool
+    Because :class:`MCPError` is an :class:`AgentSdkError`, when one DOES occur
+    (transport/protocol/session) the tool
     :class:`fifty_agent_sdk.tools.registry.Registry` re-raises it untouched rather
     than wrapping it in a :class:`fifty_agent_sdk.tools.protocol.ToolResult` with
-    ``is_error=True``. This treats MCP failures as system errors the
-    surrounding runner can catch and surface, NOT as recoverable per-tool
-    failures the LLM should reason about.
+    ``is_error=True``. This treats a genuine connection/protocol failure as a
+    system error the surrounding runner can catch and surface, NOT as a
+    recoverable per-tool failure the LLM should reason about.
     """
 
 
