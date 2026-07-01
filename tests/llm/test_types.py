@@ -151,6 +151,25 @@ def test_chat_request_response_format_passthrough() -> None:
     assert req.response_format == {"type": "json_object"}
 
 
+def test_chat_request_tools_and_tool_choice_default_none() -> None:
+    """The BR-008 additive fields default to None — flag-OFF wire is unchanged."""
+    req = ChatRequest(messages=[ChatMessage(role="user", content="hi")], model="gpt-4o")
+    assert req.tools is None
+    assert req.tool_choice is None
+
+
+def test_chat_request_accepts_tools_and_tool_choice() -> None:
+    tools = [{"type": "function", "function": {"name": "search"}}]
+    req = ChatRequest(
+        messages=[ChatMessage(role="user", content="hi")],
+        model="gpt-4o",
+        tools=tools,
+        tool_choice="auto",
+    )
+    assert req.tools == tools
+    assert req.tool_choice == "auto"
+
+
 def test_chat_request_forbids_extra_fields() -> None:
     with pytest.raises(ValidationError):
         ChatRequest(
@@ -226,6 +245,8 @@ def test_round_trip_chat_request_via_model_validate() -> None:
         temperature=0.2,
         max_tokens=64,
         response_format={"type": "text"},
+        tools=[{"type": "function", "function": {"name": "search"}}],
+        tool_choice="auto",
     )
     same = ChatRequest.model_validate(req.model_dump())
     assert same == req

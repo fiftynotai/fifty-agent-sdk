@@ -116,6 +116,50 @@ def _render_tool_descriptions(tools: list[Tool]) -> str:
     return "\n".join(lines)
 
 
+def _render_openai_tools(tools: list[Tool]) -> list[dict[str, Any]]:
+    """Build the OpenAI ``tools`` request-param envelope from registered tools.
+
+    Each tool becomes::
+
+        {"type": "function",
+         "function": {"name": t.name, "description": t.description,
+                      "parameters": {"type": t.schema.type,
+                                     "properties": t.schema.properties,
+                                     "required": t.schema.required,
+                                     "additionalProperties": t.schema.additionalProperties}}}
+
+    The ``parameters`` sub-object mirrors the four fields on
+    :class:`fifty_agent_sdk.tools.protocol.ToolSchema` exactly. This is only
+    called when :attr:`SafetyConfig.native_tools_enabled` is on — the default
+    flag-OFF path never builds this envelope, so no tool declaration reaches
+    the wire and the request is byte-for-byte pre-BR-008.
+
+    Args:
+        tools: Snapshot of registered tools from
+            :meth:`fifty_agent_sdk.tools.registry.Registry.list`.
+
+    Returns:
+        A list of OpenAI ``tools`` entries, one per tool. Empty list for an
+        empty tool set (the consumer can decide whether to omit the param).
+    """
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": tool.name,
+                "description": tool.description,
+                "parameters": {
+                    "type": tool.schema.type,
+                    "properties": tool.schema.properties,
+                    "required": tool.schema.required,
+                    "additionalProperties": tool.schema.additionalProperties,
+                },
+            },
+        }
+        for tool in tools
+    ]
+
+
 def _serialize_tool_output(output: Any) -> str:
     """Convert a tool's return value into a string suitable for a ``role="tool"`` message.
 
@@ -296,8 +340,20 @@ class AgentLoop:
         self._system_prompt = self._build_system_prompt(prompts, output_format)
 
     def _build_system_prompt(self, prompts: PromptSections, output_format: str) -> str:
-        """Render the system prompt from a registry snapshot and the provided slots."""
-        tool_block = _render_tool_descriptions(self._registry.list())
+        """Render the system prompt from a registry snapshot and the provided slots.
+
+        When :attr:`SafetyConfig.native_tools_enabled` is on, the prompt-side
+        tool-description block is SUPPRESSED (left empty) so tools are declared
+        to the model ONLY via the OpenAI ``tools`` request param. Declaring
+        them in both places risks the model emitting text-mode JSON tool calls
+        instead of native ``tool_calls`` — the structured ``tools`` param is
+        the sole source of truth under native mode. When the flag is off (the
+        default), the renderer runs exactly as before — byte-for-byte.
+        """
+        if self._safety.native_tools_enabled:
+            tool_block = ""
+        else:
+            tool_block = _render_tool_descriptions(self._registry.list())
         chosen_format = output_format or prompts.output_format
         composed = PromptSections(
             persona=prompts.persona,
@@ -308,7 +364,22 @@ class AgentLoop:
         return render_system_prompt(composed)
 
     def _build_request(self, messages: list[ChatMessage]) -> ChatRequest:
-        """Wrap the working message list in a :class:`ChatRequest` for this loop's model."""
+        """Wrap the working message list in a :class:`ChatRequest` for this loop's model.
+
+        When :attr:`SafetyConfig.native_tools_enabled` is on, the request
+        carries the registry's tools as the OpenAI ``tools`` param (built via
+        :func:`_render_openai_tools`) plus ``tool_choice="auto"``. When the
+        flag is off (the default), the request is exactly
+        ``ChatRequest(messages=..., model=...)`` — byte-for-byte pre-BR-008.
+        """
+        if self._safety.native_tools_enabled:
+            tools = _render_openai_tools(self._registry.list())
+            return ChatRequest(
+                messages=list(messages),
+                model=self._model,
+                tools=tools,
+                tool_choice="auto",
+            )
         return ChatRequest(messages=list(messages), model=self._model)
 
     async def run(
@@ -622,15 +693,27 @@ class AgentLoop:
             # BR-007 (D6): a native tool turn MUST carry the structured
             # `tool_calls` on the assistant turn so provider-native replay can
             # pair the subsequent `role="tool"` reply (keyed by `tool_call_id`)
-            # to this turn. The pairing key is the loop-synthesized `call_id`
-            # generated below (D7); `ToolCall` carries only `{name, args}` (no
-            # `id`) — the provider id is intentionally not surfaced in
-            # BR-007's single-call scope.
+            # to this turn.
+            #
+            # BR-008 (Decision B — the id-pairing reordering): mint the
+            # `call_id` BEFORE the assistant-turn append and embed it on the
+            # assistant message's `tool_call_id` (reusing the existing field —
+            # `ToolCall` carries only `{name, args}` per BR-007 D7). The SAME
+            # `call_id` is then reused for the `ToolStartedEvent`,
+            # `registry.invoke`, and the `_build_tool_message(call_id=...)`
+            # reply, so the assistant turn's id and the tool reply's
+            # `tool_call_id` match — a strict OpenAI endpoint requires the
+            # pairing key on BOTH sides or it returns 400 on turn 2. The
+            # text-path `else` branch never read `call_id`; hoisting the mint
+            # above both branches is a no-op for text.
+            tool_name = parsed.tool_call.name
+            call_id = uuid4().hex
             if native_turn:
                 working.append(
                     ChatMessage(
                         role="assistant",
                         content=completion,
+                        tool_call_id=call_id,
                         tool_calls=[
                             ToolCall(
                                 name=parsed.tool_call.name,
@@ -648,8 +731,6 @@ class AgentLoop:
             tool_invoked_this_run = True
 
             # ----- 4. Invoke tool ------------------------------------------
-            call_id = uuid4().hex
-            tool_name = parsed.tool_call.name
             yield self._make_event(
                 ToolStartedEvent,
                 sequence_box,

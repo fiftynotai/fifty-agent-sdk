@@ -113,6 +113,20 @@ class ChatRequest(BaseModel):
         response_format: Optional provider-format hint. Common values are
             ``{"type": "json_object"}`` or ``{"type": "text"}``. Adapters
             pass this through verbatim where supported.
+        tools: Optional OpenAI-style tool-declaration envelope for native
+            (provider-structured) function-calling. Each entry has the shape
+            ``{"type": "function", "function": {"name", "description",
+            "parameters": {...JSON Schema...}}}``. When set, the adapter
+            declares the tools to the provider via the ``tools`` request param
+            so the model may return native ``tool_calls``. ``None`` (the
+            default) means NO tools are declared and the request wire is
+            byte-for-byte the pre-BR-008 shape.
+        tool_choice: Optional steering for native tool-calling when
+            :attr:`tools` is set. Common values are ``"auto"`` (the default
+            the adapter emits when this is ``None``), ``"required"``,
+            ``"none"``, or a specific-tool object
+            ``{"type": "function", "function": {"name": ...}}``. Ignored when
+            :attr:`tools` is ``None``.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -122,6 +136,8 @@ class ChatRequest(BaseModel):
     temperature: float = Field(default=0.0, ge=0.0, le=2.0)
     max_tokens: int | None = Field(default=None, ge=1)
     response_format: dict[str, Any] | None = None
+    tools: list[dict[str, Any]] | None = None
+    tool_choice: str | None = None
 
 
 class ChatResponse(BaseModel):

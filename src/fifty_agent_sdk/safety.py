@@ -99,6 +99,19 @@ class SafetyConfig(BaseModel):
             re-answer when no tool is actually needed (greetings, capability
             questions), or the guard would wrongly coerce those into tool
             calls.
+        native_tools_enabled: BR-008 opt-in knob for provider-native
+            function-calling. When ``True``, the loop declares the
+            registry's tools to the provider via the OpenAI ``tools`` request
+            param (built from each tool's :class:`~fifty_agent_sdk.tools.
+            protocol.ToolSchema`), suppresses the prompt-side
+            tool-description block (the ``tools`` param becomes the single
+            source of truth for the model), and round-trips native assistant
+            ``tool_calls`` turns in valid OpenAI envelope shape so a
+            multi-turn native conversation replays without a 400. ``False``
+            (the default) means NO tools are declared, NO assistant envelope
+            translation runs, and the prompt-side tool block renders exactly
+            as before — byte-for-byte the pre-BR-008 path, so existing
+            JSON-mode text-tool consumers are unaffected.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -129,6 +142,7 @@ class SafetyConfig(BaseModel):
         ),
         min_length=1,
     )
+    native_tools_enabled: bool = Field(default=False)
 
 
 __all__ = ["SafetyConfig"]

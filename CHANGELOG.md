@@ -7,23 +7,26 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
-- **Native function-calling infrastructure** (dormant until tool declaration
-  lands). `ChatMessage` gains an optional `tool_calls: list[ToolCall] | None`
-  field; the OpenAI-compatible adapter now populates it from an upstream
-  `choices[].message.tool_calls` (parsing the provider's JSON-string
-  `arguments`, raising `LLMError(type="MalformedResponse")` on a malformed
-  envelope); and `NativeToolsParser` is now a concrete parser (the former
-  `NativeToolsParserStub` is gone) the loop dispatches through when
-  `response.message.tool_calls` is populated. The text/JSON parse path is
-  byte-for-byte unchanged as the fallback. The `NativeToolsParser` Protocol is
-  renamed `NativeToolsParserProtocol` to disambiguate it from the concrete
-  class. **Status: dormant** — the adapter does not yet declare `tools` to the
-  provider, so a provider will not emit native `tool_calls` until a follow-up
-  brief wires OpenAI tool declaration; this is the reliable `list[ToolCall]`
-  source BR-006 (concurrent tool dispatch) builds on. Single native call
-  reproduces the identical event sequence to an equivalent text call; a
-  multi-call response uses the first and logs `native_tool_calls_truncated`
-  (multi-call dispatch is BR-006's scope). (BR-007)
+- **Native function-calling (opt-in).** The agent loop can now dispatch tools
+  from a provider's structured `tool_calls` instead of only from JSON-mode text.
+  Set `SafetyConfig(native_tools_enabled=True)` and the OpenAI-compatible
+  adapter declares the registry's tools via the `tools`/`tool_choice` request
+  params (built from each tool's `ToolSchema`); a provider returning
+  `choices[].message.tool_calls` is dispatched through the new concrete
+  `NativeToolsParser`, and assistant `tool_calls` turns round-trip on the
+  request wire in valid OpenAI envelope shape (`{id, type:"function",
+  function:{name, arguments(JSON string)}}`) so multi-turn native conversations
+  replay without a 400. `ChatMessage` gains an optional `tool_calls` field; the
+  adapter populates it (parsing the provider's JSON-string `arguments`,
+  `LLMError(type="MalformedResponse")` on a malformed envelope). The
+  `tool_call_id` is minted before the native assistant-turn append and reused
+  for the tool reply so provider replay pairs correctly. **Default OFF** — the
+  text/JSON parse path (BR-018-hardened) is byte-for-byte unchanged when the
+  flag is off; native mode is an explicit per-deployment choice. The
+  `NativeToolsParser` Protocol is renamed `NativeToolsParserProtocol`. A
+  multi-call native response uses the first call and logs
+  `native_tool_calls_truncated` (concurrent/batched dispatch is BR-006's
+  scope). (BR-007, BR-008)
 
 ## [1.2.1] - 2026-06-25
 

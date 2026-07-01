@@ -93,3 +93,19 @@ def test_safety_config_require_tool_custom_round_trips() -> None:
 def test_safety_config_require_tool_empty_reminder_rejected() -> None:
     with pytest.raises(ValidationError):
         SafetyConfig(tool_required_reminder="")
+
+
+# ---------------------------------------------------------------------------
+# Native tools (BR-008)
+# ---------------------------------------------------------------------------
+
+
+def test_safety_config_native_tools_defaults_false() -> None:
+    """The BR-008 opt-in knob is OFF by default — backward-compat for every consumer."""
+    cfg = SafetyConfig()
+    assert cfg.native_tools_enabled is False
+
+
+def test_safety_config_native_tools_opt_in_round_trips() -> None:
+    cfg = SafetyConfig(native_tools_enabled=True)
+    assert cfg.native_tools_enabled is True

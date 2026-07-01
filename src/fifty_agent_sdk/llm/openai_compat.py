@@ -225,11 +225,56 @@ class OpenAICompatibleClient:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _build_body(request: ChatRequest, *, model: str, stream: bool) -> dict[str, Any]:
+    def _serialize_message(msg: ChatMessage) -> dict[str, Any]:
+        """Serialize a single :class:`ChatMessage` for the request wire.
+
+        For every message EXCEPT an assistant turn carrying native
+        ``tool_calls``, this is byte-for-byte ``msg.model_dump(exclude_none=True)``
+        (the pre-BR-008 behavior). For an assistant turn carrying
+        ``tool_calls`` (only set when native function-calling is on), the
+        message is translated into the OpenAI envelope:
+
+            {role:"assistant", content, tool_calls: [
+                {id, type:"function",
+                 function:{name, arguments: json.dumps(args)}}
+            ]}
+
+        The ``id`` is ``msg.tool_call_id`` — the loop-synthesized pairing key
+        (BR-008 Decision B) that also keys the subsequent ``role="tool"``
+        reply, so a multi-turn native conversation replays with matching ids.
+        ``arguments`` is emitted as a JSON STRING (not an object), per the
+        OpenAI function-calling spec.
+
+        Flag-OFF proof: ``ChatMessage.tool_calls`` defaults to ``None`` and is
+        only populated on a native turn (which requires
+        ``native_tools_enabled=True`` to even reach the provider), so every
+        flag-OFF message takes the ``else`` branch — identical to today.
+        """
+        if msg.role == "assistant" and msg.tool_calls:
+            tool_calls_envelope = [
+                {
+                    "id": msg.tool_call_id,
+                    "type": "function",
+                    "function": {
+                        "name": tc.name,
+                        "arguments": json.dumps(tc.args),
+                    },
+                }
+                for tc in msg.tool_calls
+            ]
+            return {
+                "role": "assistant",
+                "content": msg.content,
+                "tool_calls": tool_calls_envelope,
+            }
+        return msg.model_dump(exclude_none=True)
+
+    @classmethod
+    def _build_body(cls, request: ChatRequest, *, model: str, stream: bool) -> dict[str, Any]:
         """Build the kwargs passed to ``client.chat.completions.create``."""
         body: dict[str, Any] = {
             "model": model,
-            "messages": [m.model_dump(exclude_none=True) for m in request.messages],
+            "messages": [cls._serialize_message(m) for m in request.messages],
             "temperature": request.temperature,
             "stream": stream,
         }
@@ -237,6 +282,9 @@ class OpenAICompatibleClient:
             body["max_tokens"] = request.max_tokens
         if request.response_format is not None:
             body["response_format"] = request.response_format
+        if request.tools is not None:
+            body["tools"] = request.tools
+            body["tool_choice"] = request.tool_choice or "auto"
         return body
 
     @staticmethod

@@ -1765,3 +1765,81 @@ async def test_text_only_response_unchanged_no_tool_calls() -> None:
     # The text-path assistant turn carries NO tool_calls (the native branch
     # did not fire).
     assert all(m.tool_calls is None for m in assistant_turns)
+
+
+# ---------------------------------------------------------------------------
+# BR-008: native_tools_enabled populates request.tools + id-pairing match
+# ---------------------------------------------------------------------------
+
+
+async def test_native_tools_enabled_populates_request_tools_from_registry() -> None:
+    """With native_tools_enabled=True, the request carries tools built from the registry schema."""
+    tool = FakeTool("search", result=ToolResult(output="ok"))
+    registry = Registry()
+    registry.register(tool)
+    llm = FakeLLMClient(replies=[make_response(_final_json("done"))])
+    loop = _make_loop(llm=llm, registry=registry, safety=SafetyConfig(native_tools_enabled=True))
+
+    await _collect(loop.run([ChatMessage(role="user", content="q")]))
+
+    request = llm.calls[0]
+    assert request.tools is not None
+    assert len(request.tools) == 1
+    entry = request.tools[0]
+    assert entry["type"] == "function"
+    assert entry["function"]["name"] == "search"
+    assert entry["function"]["description"] == "Test fake tool: search"
+    # parameters carries the four ToolSchema fields.
+    params = entry["function"]["parameters"]
+    assert params["type"] == "object"
+    assert params["properties"] == {}
+    assert params["required"] == []
+    assert params["additionalProperties"] is False
+    # tool_choice defaults to "auto" when native is on.
+    assert request.tool_choice == "auto"
+
+
+async def test_native_disabled_leaves_request_tools_unset() -> None:
+    """Flag-OFF (default): the request carries NO tools/tool_choice."""
+    tool = FakeTool("search", result=ToolResult(output="ok"))
+    registry = Registry()
+    registry.register(tool)
+    llm = FakeLLMClient(replies=[make_response(_final_json("done"))])
+    loop = _make_loop(llm=llm, registry=registry)  # default safety: native OFF
+
+    await _collect(loop.run([ChatMessage(role="user", content="q")]))
+
+    request = llm.calls[0]
+    assert request.tools is None
+    assert request.tool_choice is None
+
+
+async def test_native_id_pairing_assistant_and_tool_reply_match() -> None:
+    """The assistant turn's tool_call_id matches the tool reply's tool_call_id.
+
+    BR-008 Decision B: the loop mints call_id BEFORE the assistant append and
+    reuses it for the tool reply, so both sides carry the same pairing key.
+    """
+    tool = FakeTool("search", result=ToolResult(output="ok"))
+    registry = Registry()
+    registry.register(tool)
+    llm = FakeLLMClient(
+        replies=[
+            _native_tool_response("search", {"q": "x"}),
+            make_response(_final_json("done")),
+        ]
+    )
+    loop = _make_loop(llm=llm, registry=registry, safety=SafetyConfig(native_tools_enabled=True))
+
+    await _collect(loop.run([ChatMessage(role="user", content="q")]))
+
+    # The second request replays the assistant turn + tool reply.
+    second_request = llm.calls[1]
+    assistant_turns = [m for m in second_request.messages if m.role == "assistant"]
+    native_assistant = assistant_turns[-1]
+    assert native_assistant.tool_calls is not None
+    tool_msgs = [m for m in second_request.messages if m.role == "tool"]
+    assert len(tool_msgs) == 1
+    # The pairing key is on BOTH sides and matches.
+    assert native_assistant.tool_call_id is not None
+    assert native_assistant.tool_call_id == tool_msgs[0].tool_call_id
