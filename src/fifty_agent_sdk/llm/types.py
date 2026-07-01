@@ -44,6 +44,15 @@ class ChatMessage(BaseModel):
         name: Optional name for a function/tool message or a named speaker.
         tool_call_id: Identifier echoed back on a ``role="tool"`` reply so
             the model can match it to the originating tool call.
+        tool_calls: Native (provider-structured) tool invocations carried on
+            an ``assistant`` turn. Populated by the LLM adapter when the
+            upstream provider returns structured ``tool_calls`` (OpenAI
+            function-calling); ``None`` on every text-only turn. When the
+            loop dispatches a native call, the assistant turn is replayed to
+            the provider WITH ``tool_calls`` set so the subsequent
+            ``role="tool"`` reply (keyed by ``tool_call_id``) pairs correctly.
+            An assistant turn carrying only tool calls may have
+            ``content=""``.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -52,6 +61,7 @@ class ChatMessage(BaseModel):
     content: str
     name: str | None = None
     tool_call_id: str | None = None
+    tool_calls: list[ToolCall] | None = None
 
 
 class ToolCall(BaseModel):

@@ -16,7 +16,7 @@ from pytest_httpx import HTTPXMock
 from fifty_agent_sdk.errors import LLMError
 from fifty_agent_sdk.llm.openai_compat import OpenAICompatibleClient
 from fifty_agent_sdk.llm.protocol import LLMClient
-from fifty_agent_sdk.llm.types import ChatMessage, ChatRequest
+from fifty_agent_sdk.llm.types import ChatMessage, ChatRequest, ToolCall
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -34,7 +34,11 @@ def _canonical_response(
     completion_tokens: int = 3,
     total_tokens: int = 8,
     model: str = "gpt-4o",
+    tool_calls: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
+    message: dict[str, Any] = {"role": "assistant", "content": content}
+    if tool_calls is not None:
+        message["tool_calls"] = tool_calls
     return {
         "id": "cmpl-1",
         "object": "chat.completion",
@@ -43,7 +47,7 @@ def _canonical_response(
         "choices": [
             {
                 "index": 0,
-                "message": {"role": "assistant", "content": content},
+                "message": message,
                 "finish_reason": finish_reason,
             }
         ],
@@ -260,6 +264,127 @@ async def test_complete_handles_null_content(httpx_mock: HTTPXMock) -> None:
     resp = await client.complete(_basic_request())
     assert resp.message.content == ""
     assert resp.finish_reason == "tool_calls"
+
+
+# ---------------------------------------------------------------------------
+# Native tool_calls mapping (BR-007)
+# ---------------------------------------------------------------------------
+
+
+async def test_complete_maps_native_tool_calls(httpx_mock: HTTPXMock) -> None:
+    """OpenAI tool_calls (JSON-string arguments) map to SDK ToolCall list."""
+    payload = _canonical_response(
+        content="",
+        finish_reason="tool_calls",
+        tool_calls=[
+            {
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "search", "arguments": '{"q": "x"}'},
+            }
+        ],
+    )
+    httpx_mock.add_response(method="POST", url=ENDPOINT, json=payload)
+    client = _make_client()
+    resp = await client.complete(_basic_request())
+
+    assert resp.finish_reason == "tool_calls"
+    assert resp.message.tool_calls is not None
+    assert len(resp.message.tool_calls) == 1
+    mapped = resp.message.tool_calls[0]
+    assert isinstance(mapped, ToolCall)
+    assert mapped.name == "search"
+    # The JSON-string `arguments` is parsed into a dict.
+    assert mapped.args == {"q": "x"}
+
+
+async def test_complete_maps_native_tool_calls_empty_arguments(httpx_mock: HTTPXMock) -> None:
+    """An empty-arguments tool call maps to an empty args dict."""
+    payload = _canonical_response(
+        finish_reason="tool_calls",
+        tool_calls=[
+            {
+                "id": "call_2",
+                "type": "function",
+                "function": {"name": "ping", "arguments": ""},
+            }
+        ],
+    )
+    httpx_mock.add_response(method="POST", url=ENDPOINT, json=payload)
+    client = _make_client()
+    resp = await client.complete(_basic_request())
+
+    assert resp.message.tool_calls is not None
+    assert resp.message.tool_calls[0].name == "ping"
+    assert resp.message.tool_calls[0].args == {}
+
+
+async def test_complete_malformed_arguments_raises_llm_error(httpx_mock: HTTPXMock) -> None:
+    """Non-JSON `arguments` raises LLMError(MalformedResponse) with the call id."""
+    payload = _canonical_response(
+        finish_reason="tool_calls",
+        tool_calls=[
+            {
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "search", "arguments": "not json"},
+            }
+        ],
+    )
+    httpx_mock.add_response(method="POST", url=ENDPOINT, json=payload)
+    client = _make_client()
+    with pytest.raises(LLMError) as exc:
+        await client.complete(_basic_request())
+    assert exc.value.context["type"] == "MalformedResponse"
+    assert exc.value.context["tool_call_id"] == "call_1"
+    assert exc.value.context["model"] == "gpt-4o"
+    assert exc.value.context["arguments_excerpt"] == "not json"
+    assert exc.value.__cause__ is not None
+
+
+async def test_complete_non_object_arguments_raises_llm_error(httpx_mock: HTTPXMock) -> None:
+    """A non-object JSON `arguments` (e.g. a bare array) is rejected."""
+    payload = _canonical_response(
+        finish_reason="tool_calls",
+        tool_calls=[
+            {
+                "id": "call_3",
+                "type": "function",
+                "function": {"name": "search", "arguments": "[1, 2, 3]"},
+            }
+        ],
+    )
+    httpx_mock.add_response(method="POST", url=ENDPOINT, json=payload)
+    client = _make_client()
+    with pytest.raises(LLMError) as exc:
+        await client.complete(_basic_request())
+    assert exc.value.context["type"] == "MalformedResponse"
+    assert exc.value.context["tool_call_id"] == "call_3"
+
+
+async def test_complete_no_tool_calls_field_is_none(httpx_mock: HTTPXMock) -> None:
+    """The default response (no tool_calls) leaves `tool_calls` as None (additive)."""
+    httpx_mock.add_response(method="POST", url=ENDPOINT, json=_canonical_response())
+    client = _make_client()
+    resp = await client.complete(_basic_request())
+    assert resp.message.tool_calls is None
+    # Existing assertions on the additive path are unchanged.
+    assert resp.message.content == "hello"
+    assert resp.finish_reason == "stop"
+
+
+async def test_complete_native_tool_call_excluded_from_request_body(
+    httpx_mock: HTTPXMock,
+) -> None:
+    """A None tool_calls on request messages emits no `tool_calls` key on the wire."""
+    httpx_mock.add_response(method="POST", url=ENDPOINT, json=_canonical_response())
+    client = _make_client()
+    await client.complete(_basic_request())
+    raw = httpx_mock.get_request()
+    assert raw is not None
+    body = json.loads(raw.read())
+    for msg in body["messages"]:
+        assert "tool_calls" not in msg
 
 
 # ---------------------------------------------------------------------------

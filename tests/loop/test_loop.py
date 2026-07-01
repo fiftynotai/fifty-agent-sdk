@@ -32,9 +32,11 @@ from fifty_agent_sdk import (
     SafetyConfig,
     ThoughtEvent,
     TokenEvent,
+    ToolCall,
     ToolFailedEvent,
     ToolResult,
     ToolStartedEvent,
+    Usage,
 )
 from fifty_agent_sdk.errors import LLMError
 from fifty_agent_sdk.streaming import ToolProgressEvent
@@ -72,6 +74,24 @@ def _tool_json(thought: str, name: str, args: dict[str, Any] | None) -> str:
             "tool_args": args,
             "answer": None,
         }
+    )
+
+
+def _native_tool_response(name: str, args: dict[str, Any], *, content: str = "") -> ChatResponse:
+    """Build a non-streaming ChatResponse carrying a native tool_calls entry.
+
+    Models a provider-native function-calling reply: the adapter has already
+    normalized the upstream envelope into an SDK
+    :class:`~fifty_agent_sdk.llm.types.ToolCall` on ``message.tool_calls``.
+    """
+    return ChatResponse(
+        message=ChatMessage(
+            role="assistant",
+            content=content,
+            tool_calls=[ToolCall(name=name, args=dict(args))],
+        ),
+        usage=Usage(prompt_tokens=0, completion_tokens=0, total_tokens=0),
+        finish_reason="tool_calls",
     )
 
 
@@ -1600,3 +1620,148 @@ async def test_tool_message_role_default_is_tool_unchanged() -> None:
     # Content must remain BYTE-IDENTICAL to the pre-BR-017 shape — the
     # serialized output with no "Tool ... returned:" prefix.
     assert tool_msgs[0].content == "ok"
+
+
+# ---------------------------------------------------------------------------
+# Native provider tool_calls (BR-007)
+#
+# The native precedence branch dispatches a populated
+# `response.message.tool_calls` through NativeToolsParser; an absent/empty
+# one falls back to the byte-for-byte unchanged text path. The guardrail for
+# these tests is that a single native call produces an event sequence
+# IDENTICAL to the equivalent text-mode call, and that the assistant turn
+# replayed to the provider carries `tool_calls` for native replay pairing.
+# ---------------------------------------------------------------------------
+
+
+def _event_signature(events: list[AgentEvent]) -> list[tuple[type, str, dict[str, Any]]]:
+    """Reduce an event stream to a comparable signature.
+
+    Captures the event type, the event_type string, and a payload subset
+    (tool_name / args for ActionEvent; call_id pairing is checked separately
+    by the tests that need it). Two event streams with the same signature
+    have the same shape, order, and tool identity.
+    """
+    sig: list[tuple[type, str, dict[str, Any]]] = []
+    for e in events:
+        payload: dict[str, Any] = {}
+        if isinstance(e, ActionEvent):
+            payload = {"tool_name": e.tool_name, "args": dict(e.args)}
+        elif isinstance(e, (ObservationEvent, ToolStartedEvent)):
+            payload = {"tool_name": e.tool_name}
+        sig.append((type(e), e.event_type, payload))
+    return sig
+
+
+async def test_native_single_call_event_sequence_matches_text() -> None:
+    """A native tool call yields the same event sequence as the equivalent text call."""
+    tool = FakeTool("search", result=ToolResult(output="ok"))
+    registry = Registry()
+    registry.register(tool)
+
+    # Text-mode run: the JsonModeParser parses the completion into the same
+    # ToolCall(name="search", args={"q": "x"}) the native path produces.
+    text_llm = FakeLLMClient(
+        replies=[
+            make_response(_tool_json("look it up", "search", {"q": "x"})),
+            make_response(_final_json("done")),
+        ]
+    )
+    text_loop = _make_loop(llm=text_llm, registry=registry)
+    text_events = await _collect(text_loop.run([ChatMessage(role="user", content="q")]))
+
+    # Native run: the adapter populated message.tool_calls directly.
+    native_llm = FakeLLMClient(
+        replies=[
+            _native_tool_response("search", {"q": "x"}),
+            make_response(_final_json("done")),
+        ]
+    )
+    native_loop = _make_loop(llm=native_llm, registry=registry)
+    native_events = await _collect(native_loop.run([ChatMessage(role="user", content="q")]))
+
+    # The event types/order/tool identity are identical. (Sequence numbers and
+    # timestamps differ per-run and are excluded from the signature; call_ids
+    # are random uuids and are excluded too — they pair within a single run.)
+    assert _event_signature(text_events) == _event_signature(native_events)
+
+    # The full type sequence is the canonical multi-step shape.
+    assert [type(e) for e in native_events] == [
+        ThoughtEvent,
+        ActionEvent,
+        ToolStartedEvent,
+        ObservationEvent,
+        ThoughtEvent,
+        FinalEvent,
+    ]
+    # The native tool name/args flow through to the ActionEvent and the tool.
+    action_event = native_events[1]
+    assert isinstance(action_event, ActionEvent)
+    assert action_event.tool_name == "search"
+    assert action_event.args == {"q": "x"}
+    assert tool.last_args == {"q": "x"}
+    # Each run made exactly two LLM calls.
+    assert len(native_llm.calls) == 2
+
+
+async def test_native_assistant_turn_carries_tool_calls_in_history() -> None:
+    """The native assistant turn replayed to the provider carries tool_calls."""
+    tool = FakeTool("search", result=ToolResult(output="ok"))
+    registry = Registry()
+    registry.register(tool)
+    native_llm = FakeLLMClient(
+        replies=[
+            _native_tool_response("search", {"q": "x"}),
+            make_response(_final_json("done")),
+        ]
+    )
+    loop = _make_loop(llm=native_llm, registry=registry)
+
+    events = await _collect(loop.run([ChatMessage(role="user", content="q")]))
+
+    # The assistant turn in the SECOND request must carry tool_calls for
+    # provider-native replay pairing, AND the following tool-role reply's
+    # tool_call_id must pair with it (the loop reuses the same call_id).
+    second_request = native_llm.calls[1]
+    assistant_turns = [m for m in second_request.messages if m.role == "assistant"]
+    assert len(assistant_turns) >= 1
+    native_assistant = assistant_turns[-1]
+    assert native_assistant.tool_calls is not None
+    assert len(native_assistant.tool_calls) == 1
+    assert native_assistant.tool_calls[0].name == "search"
+    assert native_assistant.tool_calls[0].args == {"q": "x"}
+
+    # The tool-role reply pairs via tool_call_id with the ToolStartedEvent.
+    tool_msgs = [m for m in second_request.messages if m.role == "tool"]
+    assert len(tool_msgs) == 1
+    started = events[2]
+    assert isinstance(started, ToolStartedEvent)
+    assert tool_msgs[0].tool_call_id == started.call_id
+    assert tool_msgs[0].name == "search"
+
+
+async def test_text_only_response_unchanged_no_tool_calls() -> None:
+    """A text-only response (tool_calls is None) never enters the native branch.
+
+    Confirms the precedence branch is purely additive: when the adapter did
+    NOT populate tool_calls, the byte-for-byte unchanged text path runs and
+    the assistant turn carries NO tool_calls.
+    """
+    tool = FakeTool("search", result=ToolResult(output="ok"))
+    registry = Registry()
+    registry.register(tool)
+    llm = FakeLLMClient(
+        replies=[
+            make_response(_tool_json("t", "search", {"q": "y"})),
+            make_response(_final_json("done")),
+        ]
+    )
+    loop = _make_loop(llm=llm, registry=registry)
+
+    await _collect(loop.run([ChatMessage(role="user", content="q")]))
+
+    second_request = llm.calls[1]
+    assistant_turns = [m for m in second_request.messages if m.role == "assistant"]
+    # The text-path assistant turn carries NO tool_calls (the native branch
+    # did not fire).
+    assert all(m.tool_calls is None for m in assistant_turns)

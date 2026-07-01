@@ -45,10 +45,11 @@ import structlog
 
 from fifty_agent_sdk.errors import LLMError, ParserError, ToolNotFound, ToolTimeout
 from fifty_agent_sdk.llm.protocol import LLMClient
-from fifty_agent_sdk.llm.types import ChatMessage, ChatRequest, ChatResponse, Usage
+from fifty_agent_sdk.llm.types import ChatMessage, ChatRequest, ChatResponse, ToolCall, Usage
 from fifty_agent_sdk.observability import Hooks
 from fifty_agent_sdk.observability.hooks import invoke_hook
 from fifty_agent_sdk.parser.base import FinalAnswer, Parser, ParseResult
+from fifty_agent_sdk.parser.native_tools import NativeToolsParser
 from fifty_agent_sdk.prompts import PromptSections, render_system_prompt
 from fifty_agent_sdk.safety import SafetyConfig
 from fifty_agent_sdk.streaming import (
@@ -279,6 +280,12 @@ class AgentLoop:
         self._llm = llm
         self._registry = registry
         self._parser = parser
+        # BR-007: native (provider-structured) tool-call parser. Constructed
+        # here (no constructor arg — concrete class) so the precedence branch
+        # in `run()` can dispatch a populated `response.message.tool_calls`
+        # through it. Independent of the text `Parser`; does not participate
+        # in prompt building (the system-prompt snapshot below is unchanged).
+        self._native_parser = NativeToolsParser()
         self._safety = safety
         self._model = model
         self._stream = stream
@@ -385,6 +392,7 @@ class AgentLoop:
             completion: str = ""
             deltas: list[str] = []
             parsed: ParseResult
+            native_turn: bool = False
             while True:
                 # ----- 1. Build request and call LLM ------------------------
                 request = self._build_request(working)
@@ -439,6 +447,46 @@ class AgentLoop:
                     )
 
                 # ----- 2. Parse the completion -----------------------------
+                # BR-007 precedence branch: if the adapter populated a
+                # structured `response.message.tool_calls`, dispatch through
+                # the native parser (bypassing text parsing entirely). Native
+                # parse does NOT participate in the BR-018 one-shot retry
+                # (D4): a structured `tool_calls` array comes from the
+                # provider SDK already formed, so a malformed one is an
+                # unrecoverable adapter/provider error — emit the same
+                # terminal ErrorEvent + fallback FinalEvent as the
+                # retry-disabled / budget-exhausted text path below, then
+                # return. In stream mode `response is None` (a stream has no
+                # single response object), so a streamed turn CANNOT go
+                # native (D5) and falls through to the text path unchanged.
+                if response is not None and response.message.tool_calls:
+                    try:
+                        parsed = self._native_parser.parse(response)
+                    except ParserError as exc:
+                        yield self._make_event(
+                            ErrorEvent,
+                            sequence_box,
+                            error_type="ParserError",
+                            message=exc.message,
+                            context=dict(exc.context),
+                        )
+                        yield self._make_event(
+                            FinalEvent,
+                            sequence_box,
+                            text=self._safety.fallback_message,
+                        )
+                        _log.info(
+                            "agent_loop_completed",
+                            iterations=iteration,
+                            run_id=run_id,
+                            terminated_by="parser_error",
+                        )
+                        return
+                    native_turn = True
+                    # Native parse does not retry — leave the inner loop and
+                    # continue with the unchanged branching logic below.
+                    break
+                native_turn = False
                 try:
                     parsed = self._parser.parse(completion)
                 except ParserError as exc:
@@ -571,7 +619,28 @@ class AgentLoop:
 
             # Append the assistant turn to history before emitting ToolStarted, so the
             # subsequent tool reply sits on top of the model's reasoning turn.
-            working.append(ChatMessage(role="assistant", content=completion))
+            # BR-007 (D6): a native tool turn MUST carry the structured
+            # `tool_calls` on the assistant turn so provider-native replay can
+            # pair the subsequent `role="tool"` reply (keyed by `tool_call_id`)
+            # to this turn. The pairing key is the loop-synthesized `call_id`
+            # generated below (D7); `ToolCall` carries only `{name, args}` (no
+            # `id`) — the provider id is intentionally not surfaced in
+            # BR-007's single-call scope.
+            if native_turn:
+                working.append(
+                    ChatMessage(
+                        role="assistant",
+                        content=completion,
+                        tool_calls=[
+                            ToolCall(
+                                name=parsed.tool_call.name,
+                                args=dict(parsed.tool_call.args),
+                            )
+                        ],
+                    )
+                )
+            else:
+                working.append(ChatMessage(role="assistant", content=completion))
 
             # BR-036: a tool is being dispatched this run, so a later `final`
             # is now grounded (from the loop's structural view) and must NOT

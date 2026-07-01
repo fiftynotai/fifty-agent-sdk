@@ -4,6 +4,27 @@ All notable changes to `fifty-agent-sdk` are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **Native function-calling infrastructure** (dormant until tool declaration
+  lands). `ChatMessage` gains an optional `tool_calls: list[ToolCall] | None`
+  field; the OpenAI-compatible adapter now populates it from an upstream
+  `choices[].message.tool_calls` (parsing the provider's JSON-string
+  `arguments`, raising `LLMError(type="MalformedResponse")` on a malformed
+  envelope); and `NativeToolsParser` is now a concrete parser (the former
+  `NativeToolsParserStub` is gone) the loop dispatches through when
+  `response.message.tool_calls` is populated. The text/JSON parse path is
+  byte-for-byte unchanged as the fallback. The `NativeToolsParser` Protocol is
+  renamed `NativeToolsParserProtocol` to disambiguate it from the concrete
+  class. **Status: dormant** — the adapter does not yet declare `tools` to the
+  provider, so a provider will not emit native `tool_calls` until a follow-up
+  brief wires OpenAI tool declaration; this is the reliable `list[ToolCall]`
+  source BR-006 (concurrent tool dispatch) builds on. Single native call
+  reproduces the identical event sequence to an equivalent text call; a
+  multi-call response uses the first and logs `native_tool_calls_truncated`
+  (multi-call dispatch is BR-006's scope). (BR-007)
+
 ## [1.2.1] - 2026-06-25
 
 ### Fixed
