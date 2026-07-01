@@ -112,6 +112,21 @@ class SafetyConfig(BaseModel):
             translation runs, and the prompt-side tool block renders exactly
             as before — byte-for-byte the pre-BR-008 path, so existing
             JSON-mode text-tool consumers are unaffected.
+        max_concurrent_tool_calls: BR-006 concurrency cap for the multi-call
+            dispatch path. Bounds how many tool invocations within a single
+            native multi-call iteration run in-flight at once via an
+            :class:`asyncio.Semaphore`, so a wide batch (the model requests
+            8 reads) cannot exhaust a downstream GDC/MCP connection pool.
+            Default ``1`` preserves the current single-call-per-iteration
+            dispatch semantics: even a consumer that opts into native
+            multi-call parsing without raising this cap gets serialized
+            dispatch (wall-clock ≈ sum). A consumer that wants the
+            concurrency benefit sets this explicitly (e.g. ``8``). When the
+            batch has more calls than the cap, the Semaphore queues the
+            excess — all N still run within the single iteration; only their
+            concurrency is bounded. The single-call path never reaches the
+            multi-call branch, so this field is irrelevant to every
+            pre-BR-006 caller.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -143,6 +158,7 @@ class SafetyConfig(BaseModel):
         min_length=1,
     )
     native_tools_enabled: bool = Field(default=False)
+    max_concurrent_tool_calls: int = Field(default=1, ge=1)
 
 
 __all__ = ["SafetyConfig"]

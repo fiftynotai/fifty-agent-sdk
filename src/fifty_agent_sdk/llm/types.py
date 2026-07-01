@@ -74,12 +74,25 @@ class ToolCall(BaseModel):
     Attributes:
         name: Name of the tool to invoke. Must match a registered tool.
         args: Arguments to pass to the tool. Defaults to an empty dict.
+        id: Optional provider-pairing key (BR-006). The ReACT loop mints a
+            per-call id for EVERY call it dispatches and embeds it on the
+            assistant turn's ``tool_calls[].id`` so the subsequent
+            ``role="tool"`` reply (keyed by ``ChatMessage.tool_call_id``)
+            pairs with the correct entry. ``None`` (the default) on a freshly
+            adapter-mapped provider response — the single-call native path
+            relies on the message-level ``tool_call_id`` instead (see
+            :meth:`fifty_agent_sdk.llm.openai_compat.OpenAICompatibleClient.
+            _serialize_message`'s fallback). The field is excluded from
+            ``model_dump(exclude_none=True)`` output when ``None``, so the
+            text/JSON request wire is byte-for-byte unchanged for every
+            pre-BR-006 caller.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     name: str
     args: dict[str, Any] = Field(default_factory=dict)
+    id: str | None = None
 
 
 class Usage(BaseModel):

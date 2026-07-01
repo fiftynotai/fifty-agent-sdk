@@ -54,6 +54,7 @@ from fifty_agent_sdk.observability import Hooks
 from fifty_agent_sdk.parser import (
     FinalAnswer,
     JsonModeParser,
+    MultiAction,
     NativeToolsParser,
     NativeToolsParserProtocol,
     Parser,
@@ -144,6 +145,7 @@ __all__ = [
     "MCPToolDef",
     "MaxIterationsExceeded",
     "MemoryStateStore",
+    "MultiAction",
     "NativeToolsParser",
     "NativeToolsParserProtocol",
     "ObservationEvent",

@@ -34,6 +34,7 @@ Streaming semantics
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from collections.abc import AsyncIterator
@@ -43,12 +44,18 @@ from uuid import uuid4
 
 import structlog
 
-from fifty_agent_sdk.errors import LLMError, ParserError, ToolNotFound, ToolTimeout
+from fifty_agent_sdk.errors import (
+    AgentSdkError,
+    LLMError,
+    ParserError,
+    ToolNotFound,
+    ToolTimeout,
+)
 from fifty_agent_sdk.llm.protocol import LLMClient
 from fifty_agent_sdk.llm.types import ChatMessage, ChatRequest, ChatResponse, ToolCall, Usage
 from fifty_agent_sdk.observability import Hooks
 from fifty_agent_sdk.observability.hooks import invoke_hook
-from fifty_agent_sdk.parser.base import FinalAnswer, Parser, ParseResult
+from fifty_agent_sdk.parser.base import FinalAnswer, MultiAction, Parser, ParseResult
 from fifty_agent_sdk.parser.native_tools import NativeToolsParser
 from fifty_agent_sdk.prompts import PromptSections, render_system_prompt
 from fifty_agent_sdk.safety import SafetyConfig
@@ -63,7 +70,7 @@ from fifty_agent_sdk.streaming import (
     ToolFailedEvent,
     ToolStartedEvent,
 )
-from fifty_agent_sdk.tools.protocol import Tool
+from fifty_agent_sdk.tools.protocol import Tool, ToolResult
 from fifty_agent_sdk.tools.registry import Registry
 
 _log: Final = structlog.get_logger(__name__)
@@ -678,6 +685,241 @@ class AgentLoop:
                     terminated_by="final_answer",
                 )
                 return
+
+            # BR-006: a native response carrying MORE THAN ONE tool call yields
+            # a MultiAction. Dispatch all N calls concurrently under a
+            # Semaphore-bounded gather, feed their observations back in CALL
+            # order, and emit per-call events with monotonic sequence — then
+            # `continue` (the batch counts as ONE iteration unit). The single-
+            # call path (ThoughtAction, below) is UNCHANGED: a single native
+            # call returns ThoughtAction, never MultiAction, so this branch is
+            # dead code for every text/JSON/single-call turn.
+            if isinstance(parsed, MultiAction):
+                calls = parsed.tool_calls
+                # Mint N DISTINCT call_ids BEFORE the assistant-turn append so
+                # each entry on the replayed assistant turn carries its own
+                # pairing key (learning #934: minting after would share one id
+                # across N entries → the provider cannot pair N distinct tool
+                # replies → HTTP 400). Each id is reused for the matching
+                # ToolStartedEvent, registry.invoke, and tool-reply message.
+                call_ids = [uuid4().hex for _ in calls]
+
+                # One ThoughtEvent for the batch (the MultiAction's thought,
+                # mirroring the single-call ThoughtEvent below).
+                yield self._make_event(ThoughtEvent, sequence_box, text=parsed.thought)
+
+                # One ActionEvent PER call, in CALL order, via _make_event so
+                # sequence stays monotonic and dense.
+                for tc in calls:
+                    yield self._make_event(
+                        ActionEvent,
+                        sequence_box,
+                        tool_name=tc.name,
+                        args=dict(tc.args),
+                    )
+
+                # Append the assistant turn carrying ALL N tool_calls (each
+                # with its minted id). ChatMessage.tool_call_id is left None —
+                # it is single-valued and cannot carry N ids; the per-call ids
+                # live on tool_calls[].id and _serialize_message sources each
+                # wire id from there (falling back to tool_call_id for the
+                # single-call path).
+                working.append(
+                    ChatMessage(
+                        role="assistant",
+                        content=completion,
+                        tool_calls=[
+                            ToolCall(name=tc.name, args=dict(tc.args), id=cid)
+                            for tc, cid in zip(calls, call_ids, strict=True)
+                        ],
+                    )
+                )
+
+                # BR-036: a tool is being dispatched this run, so a later
+                # `final` is now grounded and must NOT trigger the
+                # force-reconsider guard.
+                tool_invoked_this_run = True
+
+                # One ToolStartedEvent PER call, in CALL order.
+                for tc, cid in zip(calls, call_ids, strict=True):
+                    yield self._make_event(
+                        ToolStartedEvent,
+                        sequence_box,
+                        tool_name=tc.name,
+                        call_id=cid,
+                    )
+                    _log.debug(
+                        "tool_invoked",
+                        name=tc.name,
+                        call_id=cid,
+                        run_id=run_id,
+                    )
+
+                # Semaphore-bounded gather (Decision §C). `return_exceptions=
+                # True` is MANDATORY: without it, the first failing call
+                # cancels all sibling tasks (learning #886 — per-call
+                # isolation). NO asyncio.wait_for is added (learning #819) —
+                # Registry.invoke already enforces the per-tool timeout via
+                # `async with asyncio.timeout`, so the gather inherits correct
+                # inline-task timeout/cancellation semantics.
+                sem = asyncio.Semaphore(self._safety.max_concurrent_tool_calls)
+
+                async def _run_one(
+                    cid: str, tc: ToolCall, _sem: asyncio.Semaphore = sem
+                ) -> ToolResult:
+                    async with _sem:
+                        return await self._registry.invoke(
+                            tc.name,
+                            dict(tc.args),
+                            timeout=self._safety.tool_timeout_seconds,
+                        )
+
+                raw_results = await asyncio.gather(
+                    *[_run_one(cid, tc) for cid, tc in zip(call_ids, calls, strict=True)],
+                    return_exceptions=True,
+                )
+
+                # Per-call classification loop, in CALL order (NOT completion
+                # order — zip preserves the call index, so observations are
+                # appended deterministically regardless of which call finished
+                # first). Fatal BaseExceptions / AgentSdkError returned by
+                # return_exceptions=True are RE-RAISED here (learning #886):
+                # a genuinely fatal error must still terminate; recoverable
+                # tool failures (ToolNotFound/ToolTimeout/is_error) yield a
+                # ToolFailedEvent + observation for THAT call only.
+                for tc, cid, raw in zip(calls, call_ids, raw_results, strict=True):
+                    tool_name = tc.name
+                    if isinstance(raw, ToolNotFound):
+                        yield self._make_event(
+                            ToolFailedEvent,
+                            sequence_box,
+                            tool_name=tool_name,
+                            call_id=cid,
+                            error=f"ToolNotFound: {raw.message}",
+                        )
+                        working.append(
+                            self._build_tool_message(
+                                tool_name=tool_name,
+                                call_id=cid,
+                                content_for_tool_role=(
+                                    f"ToolNotFound: tool '{tool_name}' is not registered."
+                                ),
+                                content_for_other_role=(
+                                    f"Tool {tool_name} failed: "
+                                    f"ToolNotFound: tool '{tool_name}' is not registered."
+                                ),
+                            )
+                        )
+                    elif isinstance(raw, ToolTimeout):
+                        yield self._make_event(
+                            ToolFailedEvent,
+                            sequence_box,
+                            tool_name=tool_name,
+                            call_id=cid,
+                            error=f"ToolTimeout: {raw.message}",
+                        )
+                        working.append(
+                            self._build_tool_message(
+                                tool_name=tool_name,
+                                call_id=cid,
+                                content_for_tool_role=f"ToolTimeout: {raw.message}",
+                                content_for_other_role=(
+                                    f"Tool {tool_name} failed: ToolTimeout: {raw.message}"
+                                ),
+                            )
+                        )
+                    elif isinstance(
+                        raw, (AgentSdkError, asyncio.CancelledError, KeyboardInterrupt, SystemExit)
+                    ):
+                        # Fatal: do NOT swallow as a recoverable observation.
+                        # Registry.invoke re-raises these untouched; their
+                        # presence here means they escaped as a returned
+                        # value via return_exceptions=True — re-raise so the
+                        # run terminates (and consumer CancelledError
+                        # propagates out of gather untouched).
+                        #
+                        # ORDER IS LOAD-BEARING: this arm MUST stay AFTER the
+                        # ToolNotFound/ToolTimeout arms above — both are
+                        # AgentSdkError subclasses, so checking AgentSdkError
+                        # first would silently turn a recoverable tool error
+                        # into a fatal run termination. test_multi_call_failure_isolation
+                        # locks the recoverable contract.
+                        raise raw
+                    elif isinstance(raw, ToolResult):
+                        if raw.is_error:
+                            error_text = (
+                                raw.error
+                                if raw.error is not None
+                                else "tool reported error with no message"
+                            )
+                            yield self._make_event(
+                                ToolFailedEvent,
+                                sequence_box,
+                                tool_name=tool_name,
+                                call_id=cid,
+                                error=error_text,
+                            )
+                            working.append(
+                                self._build_tool_message(
+                                    tool_name=tool_name,
+                                    call_id=cid,
+                                    content_for_tool_role=f"Tool error: {error_text}",
+                                    content_for_other_role=(
+                                        f"Tool {tool_name} failed: {error_text}"
+                                    ),
+                                )
+                            )
+                        else:
+                            yield self._make_event(
+                                ObservationEvent,
+                                sequence_box,
+                                tool_name=tool_name,
+                                call_id=cid,
+                                result=raw,
+                            )
+                            working.append(
+                                self._build_tool_message(
+                                    tool_name=tool_name,
+                                    call_id=cid,
+                                    content_for_tool_role=_serialize_tool_output(raw.output),
+                                    content_for_other_role=(
+                                        f"Tool {tool_name} returned: "
+                                        f"{_serialize_tool_output(raw.output)}"
+                                    ),
+                                )
+                            )
+                    elif isinstance(raw, Exception):
+                        # Defensive: a plain non-SDK Exception should not
+                        # occur post-Registry.invoke (the registry catches
+                        # Exception → ToolResult(is_error=True)). Treat as a
+                        # recoverable tool error rather than terminating.
+                        error_text = f"{type(raw).__name__}: {raw}"
+                        yield self._make_event(
+                            ToolFailedEvent,
+                            sequence_box,
+                            tool_name=tool_name,
+                            call_id=cid,
+                            error=error_text,
+                        )
+                        working.append(
+                            self._build_tool_message(
+                                tool_name=tool_name,
+                                call_id=cid,
+                                content_for_tool_role=f"Tool error: {error_text}",
+                                content_for_other_role=(f"Tool {tool_name} failed: {error_text}"),
+                            )
+                        )
+                    else:
+                        # Unexpected non-Exception, non-ToolResult value —
+                        # raise loudly rather than silently dropping a call.
+                        raise TypeError(
+                            f"unexpected gather result type for tool '{tool_name}': "
+                            f"{type(raw).__name__}",
+                        )
+                # The batch consumed ONE iteration unit; re-enter the outer
+                # while loop for the next round (still bounded by
+                # max_iterations).
+                continue
 
             # parsed is a ThoughtAction (narrowed by isinstance check above).
             yield self._make_event(ThoughtEvent, sequence_box, text=parsed.thought)

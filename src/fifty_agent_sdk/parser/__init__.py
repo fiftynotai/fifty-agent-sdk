@@ -3,7 +3,9 @@
 A parser converts an LLM completion (or, in the native-tools case, a
 structured :class:`fifty_agent_sdk.llm.types.ChatResponse`) into a
 :data:`ParseResult` — a tagged union of :class:`ThoughtAction` (the model
-chose a tool) or :class:`FinalAnswer` (the model produced a terminal answer).
+chose a single tool), :class:`MultiAction` (the model requested multiple
+tool calls in one turn, BR-006), or :class:`FinalAnswer` (the model produced
+a terminal answer).
 
 Four concrete parsers ship today:
 
@@ -17,7 +19,13 @@ Four concrete parsers ship today:
   Satisfies the runtime-checkable :class:`NativeToolsParserProtocol`.
 """
 
-from fifty_agent_sdk.parser.base import FinalAnswer, Parser, ParseResult, ThoughtAction
+from fifty_agent_sdk.parser.base import (
+    FinalAnswer,
+    MultiAction,
+    Parser,
+    ParseResult,
+    ThoughtAction,
+)
 from fifty_agent_sdk.parser.json_mode import JsonModeParser
 from fifty_agent_sdk.parser.native_tools import NativeToolsParser, NativeToolsParserProtocol
 from fifty_agent_sdk.parser.prose_mode import ProseModeParser
@@ -25,6 +33,7 @@ from fifty_agent_sdk.parser.prose_mode import ProseModeParser
 __all__ = [
     "FinalAnswer",
     "JsonModeParser",
+    "MultiAction",
     "NativeToolsParser",
     "NativeToolsParserProtocol",
     "ParseResult",

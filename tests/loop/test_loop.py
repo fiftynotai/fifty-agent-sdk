@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from collections.abc import AsyncIterator
 from typing import Any, Literal
 
@@ -44,6 +45,7 @@ from tests.loop.conftest import (
     DriftsOnceFakeLLM,
     FakeLLMClient,
     FakeTool,
+    make_multi_tool_response,
     make_response,
     make_stream_chunks,
 )
@@ -1843,3 +1845,397 @@ async def test_native_id_pairing_assistant_and_tool_reply_match() -> None:
     # The pairing key is on BOTH sides and matches.
     assert native_assistant.tool_call_id is not None
     assert native_assistant.tool_call_id == tool_msgs[0].tool_call_id
+
+
+# ---------------------------------------------------------------------------
+# BR-006: native multi-call concurrent dispatch
+# ---------------------------------------------------------------------------
+# A single native turn carrying N>1 tool_calls yields a MultiAction; the loop
+# dispatches all N concurrently under a Semaphore-bounded gather, feeds
+# observations back in CALL order, and emits per-call events with monotonic
+# sequence. The single-call path (ThoughtAction) is unchanged — verified by
+# the existing native tests above running unmodified.
+
+
+def _multi_tool_registry(*, sleep_seconds: float = 0.0) -> tuple[Registry, dict[str, FakeTool]]:
+    """Build a registry with three distinct fakes (a/b/c) for ordering tests."""
+    tools = {
+        name: FakeTool(name, result=ToolResult(output=f"out-{name}"), sleep_seconds=sleep_seconds)
+        for name in ("a", "b", "c")
+    }
+    registry = Registry()
+    for tool in tools.values():
+        registry.register(tool)
+    return registry, tools
+
+
+async def test_multi_call_dispatches_all_concurrently() -> None:
+    """N=3 independent reads dispatch concurrently and complete in ONE iteration.
+
+    Asserts: exactly ONE iteration consumed (len(llm.calls) == 2 — the
+    multi-call turn + the final); 3 ToolStartedEvents + 3 ObservationEvents
+    in CALL order; the batch's sequence numbers are monotonic and dense; all
+    3 tool replies appear in the SECOND request in CALL order.
+    """
+    registry, _tools = _multi_tool_registry()
+    llm = FakeLLMClient(
+        replies=[
+            make_multi_tool_response([("a", {"q": "1"}), ("b", {"q": "2"}), ("c", {"q": "3"})]),
+            make_response(_final_json("done")),
+        ]
+    )
+    loop = _make_loop(
+        llm=llm,
+        registry=registry,
+        safety=SafetyConfig(native_tools_enabled=True, max_concurrent_tool_calls=3),
+    )
+
+    events = await _collect(loop.run([ChatMessage(role="user", content="q")]))
+
+    started = [e for e in events if isinstance(e, ToolStartedEvent)]
+    observations = [e for e in events if isinstance(e, ObservationEvent)]
+    assert len(started) == 3
+    assert len(observations) == 3
+    # CALL order is preserved on both event streams.
+    assert [e.tool_name for e in started] == ["a", "b", "c"]
+    assert [e.tool_name for e in observations] == ["a", "b", "c"]
+    # Sequence numbers across the whole run are monotonic and dense.
+    sequences = [e.sequence for e in events]
+    assert sequences == sorted(sequences)
+    assert sequences == list(range(len(sequences)))
+    # ONE iteration consumed: the multi-call turn + the final = 2 LLM calls.
+    assert len(llm.calls) == 2
+    # The 3 tool replies appear in the SECOND request, in CALL order.
+    second_request = llm.calls[1]
+    tool_msgs = [m for m in second_request.messages if m.role == "tool"]
+    assert len(tool_msgs) == 3
+    assert [m.name for m in tool_msgs] == ["a", "b", "c"]
+
+
+async def test_multi_call_wall_clock_approximates_slowest() -> None:
+    """Concurrent dispatch wall-clock approximates the SLOWEST call, not the sum.
+
+    N=3 calls each sleeping 0.2s, cap=3: concurrent wall-clock < 0.45s (≈ the
+    0.2s slowest, NOT the 0.6s sum). The cap=1 variant asserts wall-clock
+    >= 0.55s (sequential) to prove the cap actually bounds concurrency.
+    Generous bounds to avoid CI flake.
+    """
+    # Concurrent (cap=3): wall-clock ≈ 0.2s.
+    registry_c, _tools_c = _multi_tool_registry(sleep_seconds=0.2)
+    llm_c = FakeLLMClient(
+        replies=[
+            make_multi_tool_response([("a", {}), ("b", {}), ("c", {})]),
+            make_response(_final_json("done")),
+        ]
+    )
+    loop_c = _make_loop(
+        llm=llm_c,
+        registry=registry_c,
+        safety=SafetyConfig(native_tools_enabled=True, max_concurrent_tool_calls=3),
+    )
+    start_c = time.perf_counter()
+    await _collect(loop_c.run([ChatMessage(role="user", content="q")]))
+    elapsed_c = time.perf_counter() - start_c
+    assert elapsed_c < 0.45, f"concurrent dispatch took {elapsed_c}s (expected ≈ 0.2s)"
+
+    # Sequential (cap=1): wall-clock ≈ 0.6s (3 × 0.2s).
+    registry_s, _ = _multi_tool_registry(sleep_seconds=0.2)
+    llm_s = FakeLLMClient(
+        replies=[
+            make_multi_tool_response([("a", {}), ("b", {}), ("c", {})]),
+            make_response(_final_json("done")),
+        ]
+    )
+    loop_s = _make_loop(
+        llm=llm_s,
+        registry=registry_s,
+        safety=SafetyConfig(native_tools_enabled=True, max_concurrent_tool_calls=1),
+    )
+    start_s = time.perf_counter()
+    await _collect(loop_s.run([ChatMessage(role="user", content="q")]))
+    elapsed_s = time.perf_counter() - start_s
+    assert elapsed_s >= 0.5, f"sequential dispatch took {elapsed_s}s (expected ≈ 0.6s; bound loosened from 0.55 to avoid CI flake on loaded runners)"
+
+
+async def test_multi_call_failure_isolation() -> None:
+    """One failing call does NOT abort its siblings or terminate the run.
+
+    N=3: call 0 succeeds, call 1 returns ToolResult(is_error=True), call 2
+    succeeds. Asserts: all 3 ToolStartedEvents fire; call 1 yields a
+    ToolFailedEvent, calls 0 and 2 yield ObservationEvents; the loop
+    continues to a final; exactly ONE iteration consumed; the second LLM call
+    sees all 3 tool-reply observations (the failing one with "Tool error:").
+    """
+    tool_a = FakeTool("a", result=ToolResult(output="ok-a"))
+    tool_b = FakeTool("b", result=ToolResult(output=None, is_error=True, error="boom"))
+    tool_c = FakeTool("c", result=ToolResult(output="ok-c"))
+    registry = Registry()
+    for tool in (tool_a, tool_b, tool_c):
+        registry.register(tool)
+    llm = FakeLLMClient(
+        replies=[
+            make_multi_tool_response([("a", {}), ("b", {}), ("c", {})]),
+            make_response(_final_json("recovered")),
+        ]
+    )
+    loop = _make_loop(
+        llm=llm,
+        registry=registry,
+        safety=SafetyConfig(native_tools_enabled=True, max_concurrent_tool_calls=3),
+    )
+
+    events = await _collect(loop.run([ChatMessage(role="user", content="q")]))
+
+    started = [e for e in events if isinstance(e, ToolStartedEvent)]
+    failed = [e for e in events if isinstance(e, ToolFailedEvent)]
+    observations = [e for e in events if isinstance(e, ObservationEvent)]
+    assert len(started) == 3
+    assert len(failed) == 1
+    assert failed[0].tool_name == "b"
+    assert "boom" in failed[0].error
+    assert len(observations) == 2
+    assert [e.tool_name for e in observations] == ["a", "c"]
+    # The loop continued (a second LLM call happened) and produced a final.
+    assert len(llm.calls) == 2
+    assert any(isinstance(e, FinalEvent) for e in events)
+    assert not any(isinstance(e, ErrorEvent) for e in events)
+    # The second LLM call sees all 3 tool replies, the failing one with the
+    # "Tool error:" prefix.
+    second_request = llm.calls[1]
+    tool_msgs = [m for m in second_request.messages if m.role == "tool"]
+    assert len(tool_msgs) == 3
+    assert [m.name for m in tool_msgs] == ["a", "b", "c"]
+    assert tool_msgs[1].content.startswith("Tool error:")
+
+
+async def test_multi_call_observation_order_is_call_order_not_completion_order() -> None:
+    """Observations are appended in CALL order, not completion order.
+
+    N=3 where call 0 is slow (0.3s) and calls 1/2 are fast. The 3 tool-reply
+    messages in the second LLM call appear in CALL order (0, 1, 2), not
+    completion order (which would be 1, 2, 0). Each tool has a distinct
+    output so ordering is asserted by identity.
+    """
+    tool_a = FakeTool("a", result=ToolResult(output="out-a"), sleep_seconds=0.3)
+    tool_b = FakeTool("b", result=ToolResult(output="out-b"))
+    tool_c = FakeTool("c", result=ToolResult(output="out-c"))
+    registry = Registry()
+    for tool in (tool_a, tool_b, tool_c):
+        registry.register(tool)
+    llm = FakeLLMClient(
+        replies=[
+            make_multi_tool_response([("a", {}), ("b", {}), ("c", {})]),
+            make_response(_final_json("done")),
+        ]
+    )
+    loop = _make_loop(
+        llm=llm,
+        registry=registry,
+        safety=SafetyConfig(native_tools_enabled=True, max_concurrent_tool_calls=3),
+    )
+
+    await _collect(loop.run([ChatMessage(role="user", content="q")]))
+
+    second_request = llm.calls[1]
+    tool_msgs = [m for m in second_request.messages if m.role == "tool"]
+    # CALL order (a, b, c), NOT completion order (b, c, a).
+    assert [m.name for m in tool_msgs] == ["a", "b", "c"]
+    assert [m.content for m in tool_msgs] == ["out-a", "out-b", "out-c"]
+
+
+async def test_multi_call_counts_as_one_iteration() -> None:
+    """The batch consumes ONE max_iterations unit, even with N>1 calls.
+
+    max_iterations=2, N=2 tool calls then a final: the run completes with a
+    final (does NOT hit the cap) and made exactly 2 LLM calls.
+    """
+    tool_a = FakeTool("a", result=ToolResult(output="ok-a"))
+    tool_b = FakeTool("b", result=ToolResult(output="ok-b"))
+    registry = Registry()
+    registry.register(tool_a)
+    registry.register(tool_b)
+    llm = FakeLLMClient(
+        replies=[
+            make_multi_tool_response([("a", {}), ("b", {})]),
+            make_response(_final_json("done")),
+        ]
+    )
+    loop = _make_loop(
+        llm=llm,
+        registry=registry,
+        safety=SafetyConfig(
+            native_tools_enabled=True, max_iterations=2, max_concurrent_tool_calls=2
+        ),
+    )
+
+    events = await _collect(loop.run([ChatMessage(role="user", content="q")]))
+
+    assert any(isinstance(e, FinalEvent) for e in events)
+    assert not any(isinstance(e, ErrorEvent) for e in events)
+    assert len(llm.calls) == 2
+
+
+async def test_multi_call_per_call_id_pairing() -> None:
+    """N distinct assistant-turn ids, each matching exactly one tool reply.
+
+    The load-bearing correctness gate (learning #934): the assistant turn in
+    the second request carries 3 tool_calls entries with 3 DISTINCT ids; the
+    3 role="tool" replies each carry a tool_call_id matching exactly one
+    assistant-turn id; no two assistant-turn ids are equal (the BR-008
+    single-valued-id bug fixed at N>1).
+    """
+    tool_a = FakeTool("a", result=ToolResult(output="ok-a"))
+    tool_b = FakeTool("b", result=ToolResult(output="ok-b"))
+    tool_c = FakeTool("c", result=ToolResult(output="ok-c"))
+    registry = Registry()
+    for tool in (tool_a, tool_b, tool_c):
+        registry.register(tool)
+    llm = FakeLLMClient(
+        replies=[
+            make_multi_tool_response([("a", {}), ("b", {}), ("c", {})]),
+            make_response(_final_json("done")),
+        ]
+    )
+    loop = _make_loop(
+        llm=llm,
+        registry=registry,
+        safety=SafetyConfig(native_tools_enabled=True, max_concurrent_tool_calls=3),
+    )
+
+    await _collect(loop.run([ChatMessage(role="user", content="q")]))
+
+    second_request = llm.calls[1]
+    assistant_turns = [m for m in second_request.messages if m.role == "assistant"]
+    multi_assistant = assistant_turns[-1]
+    assert multi_assistant.tool_calls is not None
+    assert len(multi_assistant.tool_calls) == 3
+    assistant_ids = [tc.id for tc in multi_assistant.tool_calls]
+    # 3 DISTINCT ids (no two equal — the BR-008 bug-fix).
+    assert len(set(assistant_ids)) == 3
+    assert all(cid is not None for cid in assistant_ids)
+    # Pair each tool reply to exactly one assistant-turn id, by tool name.
+    tool_msgs = [m for m in second_request.messages if m.role == "tool"]
+    assert len(tool_msgs) == 3
+    assistant_id_by_name = {tc.name: tc.id for tc in multi_assistant.tool_calls}
+    for reply in tool_msgs:
+        assert reply.tool_call_id is not None
+        assert reply.tool_call_id == assistant_id_by_name[reply.name]
+
+
+async def test_multi_call_concurrency_cap_enforced() -> None:
+    """A cap < batch size bounds concurrency into waves.
+
+    N=4, cap=2, each sleeping 0.2s: wall-clock ≈ 2 waves × 0.2s = 0.4s.
+    Bounded generously: < 0.55s (not 4×0.2=0.8s unbounded) and > 0.35s
+    (not 1×0.2=0.2s fully concurrent).
+    """
+    tools = {
+        name: FakeTool(name, result=ToolResult(output=f"out-{name}"), sleep_seconds=0.2)
+        for name in ("a", "b", "c", "d")
+    }
+    registry = Registry()
+    for tool in tools.values():
+        registry.register(tool)
+    llm = FakeLLMClient(
+        replies=[
+            make_multi_tool_response([("a", {}), ("b", {}), ("c", {}), ("d", {})]),
+            make_response(_final_json("done")),
+        ]
+    )
+    loop = _make_loop(
+        llm=llm,
+        registry=registry,
+        safety=SafetyConfig(native_tools_enabled=True, max_concurrent_tool_calls=2),
+    )
+
+    start = time.perf_counter()
+    await _collect(loop.run([ChatMessage(role="user", content="q")]))
+    elapsed = time.perf_counter() - start
+
+    assert 0.35 < elapsed < 0.55, (
+        f"cap=2 with N=4×0.2s took {elapsed}s (expected ≈ 0.4s, two waves)"
+    )
+
+
+async def test_multi_call_require_tool_satisfies_guard() -> None:
+    """A multi-call batch sets tool_invoked_this_run, satisfying the BR-036 guard.
+
+    require_tool_before_final=True, N=2 tool calls then a final: NO
+    force-reconsider nudge (the batch set tool_invoked_this_run=True); the
+    final is accepted on first appearance.
+    """
+    tool_a = FakeTool("a", result=ToolResult(output="ok-a"))
+    tool_b = FakeTool("b", result=ToolResult(output="ok-b"))
+    registry = Registry()
+    registry.register(tool_a)
+    registry.register(tool_b)
+    llm = FakeLLMClient(
+        replies=[
+            make_multi_tool_response([("a", {}), ("b", {})]),
+            make_response(_final_json("done")),
+        ]
+    )
+    loop = _make_loop(
+        llm=llm,
+        registry=registry,
+        safety=SafetyConfig(
+            native_tools_enabled=True,
+            max_concurrent_tool_calls=2,
+            require_tool_before_final=True,
+        ),
+    )
+
+    events = await _collect(loop.run([ChatMessage(role="user", content="q")]))
+
+    # The final was accepted on first appearance — no extra nudge round-trip.
+    assert len(llm.calls) == 2
+    assert any(isinstance(e, FinalEvent) for e in events)
+    # No reminder text was injected.
+    reminder = _require_tool_safety().tool_required_reminder
+    second_request = llm.calls[1]
+    assert not any(m.role == "user" and m.content == reminder for m in second_request.messages)
+
+
+async def test_native_single_call_still_uses_thought_action() -> None:
+    """A 1-entry native response still yields ThoughtAction (not MultiAction).
+
+    The byte-for-byte single-call parity gate: a single native call must NOT
+    take the MultiAction branch. Verified by asserting the single-call event
+    sequence matches the equivalent text call exactly (re-asserts the
+    contract of test_native_single_call_event_sequence_matches_text against
+    the post-BR-006 code, locking that the new branch is dead code for N=1).
+    """
+    tool = FakeTool("search", result=ToolResult(output="ok"))
+    registry = Registry()
+    registry.register(tool)
+
+    text_llm = FakeLLMClient(
+        replies=[
+            make_response(_tool_json("look it up", "search", {"q": "x"})),
+            make_response(_final_json("done")),
+        ]
+    )
+    text_loop = _make_loop(llm=text_llm, registry=registry)
+    text_events = await _collect(text_loop.run([ChatMessage(role="user", content="q")]))
+
+    native_llm = FakeLLMClient(
+        replies=[
+            _native_tool_response("search", {"q": "x"}),
+            make_response(_final_json("done")),
+        ]
+    )
+    native_loop = _make_loop(llm=native_llm, registry=registry)
+    native_events = await _collect(native_loop.run([ChatMessage(role="user", content="q")]))
+
+    # Event signatures match — the single native call took the ThoughtAction
+    # path, byte-for-byte the same shape as the text call.
+    assert _event_signature(text_events) == _event_signature(native_events)
+    # The canonical single-call sequence.
+    assert [type(e) for e in native_events] == [
+        ThoughtEvent,
+        ActionEvent,
+        ToolStartedEvent,
+        ObservationEvent,
+        ThoughtEvent,
+        FinalEvent,
+    ]

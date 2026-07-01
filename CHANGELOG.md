@@ -7,6 +7,26 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- **Concurrent multi-call tool dispatch (opt-in).** A single native ReACT
+  iteration can now dispatch up to N independent tool calls concurrently under
+  a bounded `asyncio.gather`, feeding all observations back to the model in
+  one turn. Set `SafetyConfig(max_concurrent_tool_calls=N)` (default `1` —
+  serialized, so a caller who enables native multi-call parsing without
+  raising the cap sees no pool surprise) alongside `native_tools_enabled=True`.
+  A native response carrying >1 `tool_calls` yields a new `MultiAction` parse
+  result; the loop mints one distinct `call_id` per call (carried on the new
+  `ToolCall.id` field), embeds all N on the replayed assistant turn, dispatches
+  them through a `Semaphore`-bounded gather with `return_exceptions=True`, and
+  appends observations in CALL order (deterministic regardless of completion
+  order). Per-call recoverable failures (`ToolNotFound`/`ToolTimeout`/`is_error`)
+  yield a `ToolFailedEvent` for that call only — siblings still complete; fatal
+  `AgentSdkError`/`BaseException` re-raise and terminate. The batch counts as
+  ONE `max_iterations` unit. **Single-call turns are byte-for-byte unchanged**
+  — a 1-entry native response still yields `ThoughtAction` and the gather is
+  unreachable; the text/JSON path never produces `MultiAction`.
+  (`OpenAICompatibleClient._serialize_message` sources each wire
+  `tool_calls[].id` from the entry's `ToolCall.id`, falling back to
+  `tool_call_id` for the single-call path.) (BR-006)
 - **Native function-calling (opt-in).** The agent loop can now dispatch tools
   from a provider's structured `tool_calls` instead of only from JSON-mode text.
   Set `SafetyConfig(native_tools_enabled=True)` and the OpenAI-compatible
@@ -23,10 +43,15 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   for the tool reply so provider replay pairs correctly. **Default OFF** — the
   text/JSON parse path (BR-018-hardened) is byte-for-byte unchanged when the
   flag is off; native mode is an explicit per-deployment choice. The
-  `NativeToolsParser` Protocol is renamed `NativeToolsParserProtocol`. A
-  multi-call native response uses the first call and logs
-  `native_tool_calls_truncated` (concurrent/batched dispatch is BR-006's
-  scope). (BR-007, BR-008)
+  `NativeToolsParser` Protocol is renamed `NativeToolsParserProtocol`.
+  (BR-007, BR-008)
+
+### Changed
+- A native response carrying more than one `tool_calls` entry no longer
+  truncates to the first call (the BR-007 scope limitation). The
+  `NativeToolsParser` now validates EVERY entry's schema and returns a
+  `MultiAction` carrying the full list; the `native_tool_calls_truncated`
+  DEBUG log is removed. Concurrent/batched dispatch landed in BR-006 (above).
 
 ## [1.2.1] - 2026-06-25
 

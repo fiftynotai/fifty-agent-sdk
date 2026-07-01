@@ -1,21 +1,22 @@
 """Tests for ``fifty_agent_sdk.parser.native_tools``.
 
-Covers the concrete :class:`NativeToolsParser` (BR-007): it consumes a
-populated ``response.message.tool_calls`` list and returns a single
-:class:`ThoughtAction`, satisfying :class:`NativeToolsParserProtocol`. Mirrors
-the helper-built ``ChatResponse`` + ``pytest.raises(ParserError)`` +
-context-dict style of the text-parser suites.
+Covers the concrete :class:`NativeToolsParser`: it consumes a populated
+``response.message.tool_calls`` list and returns a single
+:class:`ThoughtAction` for one call (byte-identical to a text-parsed call) or
+a :class:`MultiAction` carrying the full list for more than one call (BR-006),
+satisfying :class:`NativeToolsParserProtocol`. Mirrors the helper-built
+``ChatResponse`` + ``pytest.raises(ParserError)`` + context-dict style of the
+text-parser suites.
 """
 
 from __future__ import annotations
 
 import pytest
-import structlog
 
 from fifty_agent_sdk.errors import ParserError
 from fifty_agent_sdk.llm.types import ChatMessage, ChatResponse, ToolCall, Usage
 from fifty_agent_sdk.parser import NativeToolsParser, NativeToolsParserProtocol
-from fifty_agent_sdk.parser.base import ParseResult, ThoughtAction
+from fifty_agent_sdk.parser.base import MultiAction, ParseResult, ThoughtAction
 
 
 def _make_response(
@@ -145,25 +146,47 @@ def test_native_parser_non_dict_args_raises() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Multi-call (BR-007 scope limitation)
+# Multi-call (BR-006: full list, no truncation)
 # ---------------------------------------------------------------------------
 
 
-def test_native_parser_multi_call_uses_first_and_logs() -> None:
+def test_native_parser_multi_call_returns_multi_action_with_full_list() -> None:
+    """BR-006: a >1-call response yields a MultiAction carrying the FULL list.
+
+    The pre-BR-006 parser truncated to the first call and logged the drop;
+    BR-006 removes the truncation so the loop can dispatch all calls
+    concurrently. The list order is preserved (CALL order) so the loop's
+    observation ordering is deterministic.
+    """
     first = ToolCall(name="search", args={"q": "first"})
     second = ToolCall(name="lookup", args={"id": "second"})
     parser = NativeToolsParser()
 
-    with structlog.testing.capture_logs() as logs:
-        result = parser.parse(_make_response(tool_calls=[first, second]))
+    result = parser.parse(_make_response(tool_calls=[first, second]))
 
-    # The FIRST call is used; the rest are dropped until BR-006.
-    assert isinstance(result, ThoughtAction)
-    assert result.tool_call.name == "search"
-    assert result.tool_call.args == {"q": "first"}
+    assert isinstance(result, MultiAction)
+    assert result.kind == "multi_action"
+    assert result.thought == ""
+    # The FULL list is carried, in CALL order.
+    assert len(result.tool_calls) == 2
+    assert result.tool_calls[0].name == "search"
+    assert result.tool_calls[0].args == {"q": "first"}
+    assert result.tool_calls[1].name == "lookup"
+    assert result.tool_calls[1].args == {"id": "second"}
 
-    # The truncation is observable at DEBUG, not silent.
-    truncated = [e for e in logs if e.get("event") == "native_tool_calls_truncated"]
-    assert len(truncated) == 1
-    assert truncated[0]["count"] == 2
-    assert truncated[0]["log_level"] == "debug"
+
+def test_native_parser_multi_call_validates_every_entry() -> None:
+    """BR-006: EVERY entry's schema is validated, not just the first.
+
+    A malformed SECOND entry must raise (the whole list will be dispatched,
+    so a bad entry in any position is caught here rather than mid-dispatch).
+    """
+    good = ToolCall(name="search", args={"q": "x"})
+    bad = ToolCall.model_construct(name="", args={})  # bypass schema validation
+    parser = NativeToolsParser()
+    response = _make_response(tool_calls=[good, bad])  # type: ignore[list-item]
+
+    with pytest.raises(ParserError) as excinfo:
+        parser.parse(response)
+
+    assert excinfo.value.context["error_phase"] == "schema_validation"

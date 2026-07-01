@@ -239,11 +239,18 @@ class OpenAICompatibleClient:
                  function:{name, arguments: json.dumps(args)}}
             ]}
 
-        The ``id`` is ``msg.tool_call_id`` — the loop-synthesized pairing key
-        (BR-008 Decision B) that also keys the subsequent ``role="tool"``
-        reply, so a multi-turn native conversation replays with matching ids.
-        ``arguments`` is emitted as a JSON STRING (not an object), per the
-        OpenAI function-calling spec.
+        The ``id`` is sourced PER ENTRY from the entry's own
+        :attr:`~fifty_agent_sdk.llm.types.ToolCall.id` (BR-006): the loop
+        mints a distinct id per dispatched call so a multi-call assistant
+        turn carries N DISTINCT ids, and each subsequent ``role="tool"``
+        reply pairs with exactly one entry (a strict OpenAI endpoint returns
+        400 otherwise). The fallback
+        ``tc.id if tc.id is not None else msg.tool_call_id`` preserves the
+        BR-008 single-call wire byte-for-byte: the single-call native path
+        sets ``ToolCall(id=None)`` and ``msg.tool_call_id=call_id``, so
+        ``tc.id is None`` falls back to ``msg.tool_call_id`` and emits the
+        same id BR-008 did. ``arguments`` is emitted as a JSON STRING (not an
+        object), per the OpenAI function-calling spec.
 
         Flag-OFF proof: ``ChatMessage.tool_calls`` defaults to ``None`` and is
         only populated on a native turn (which requires
@@ -253,7 +260,7 @@ class OpenAICompatibleClient:
         if msg.role == "assistant" and msg.tool_calls:
             tool_calls_envelope = [
                 {
-                    "id": msg.tool_call_id,
+                    "id": tc.id if tc.id is not None else msg.tool_call_id,
                     "type": "function",
                     "function": {
                         "name": tc.name,
