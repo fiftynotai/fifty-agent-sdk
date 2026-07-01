@@ -1954,7 +1954,9 @@ async def test_multi_call_wall_clock_approximates_slowest() -> None:
     start_s = time.perf_counter()
     await _collect(loop_s.run([ChatMessage(role="user", content="q")]))
     elapsed_s = time.perf_counter() - start_s
-    assert elapsed_s >= 0.5, f"sequential dispatch took {elapsed_s}s (expected ≈ 0.6s; bound loosened from 0.55 to avoid CI flake on loaded runners)"
+    assert elapsed_s >= 0.5, (
+        f"sequential dispatch took {elapsed_s}s (expected ≈ 0.6s; bound loosened from 0.55 to avoid CI flake on loaded runners)"
+    )
 
 
 async def test_multi_call_failure_isolation() -> None:
