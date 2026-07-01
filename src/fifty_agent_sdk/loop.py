@@ -34,6 +34,7 @@ Streaming semantics
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from collections.abc import AsyncIterator
@@ -43,12 +44,19 @@ from uuid import uuid4
 
 import structlog
 
-from fifty_agent_sdk.errors import LLMError, ParserError, ToolNotFound, ToolTimeout
+from fifty_agent_sdk.errors import (
+    AgentSdkError,
+    LLMError,
+    ParserError,
+    ToolNotFound,
+    ToolTimeout,
+)
 from fifty_agent_sdk.llm.protocol import LLMClient
-from fifty_agent_sdk.llm.types import ChatMessage, ChatRequest, ChatResponse, Usage
+from fifty_agent_sdk.llm.types import ChatMessage, ChatRequest, ChatResponse, ToolCall, Usage
 from fifty_agent_sdk.observability import Hooks
 from fifty_agent_sdk.observability.hooks import invoke_hook
-from fifty_agent_sdk.parser.base import FinalAnswer, Parser, ParseResult
+from fifty_agent_sdk.parser.base import FinalAnswer, MultiAction, Parser, ParseResult
+from fifty_agent_sdk.parser.native_tools import NativeToolsParser
 from fifty_agent_sdk.prompts import PromptSections, render_system_prompt
 from fifty_agent_sdk.safety import SafetyConfig
 from fifty_agent_sdk.streaming import (
@@ -62,7 +70,7 @@ from fifty_agent_sdk.streaming import (
     ToolFailedEvent,
     ToolStartedEvent,
 )
-from fifty_agent_sdk.tools.protocol import Tool
+from fifty_agent_sdk.tools.protocol import Tool, ToolResult
 from fifty_agent_sdk.tools.registry import Registry
 
 _log: Final = structlog.get_logger(__name__)
@@ -113,6 +121,50 @@ def _render_tool_descriptions(tools: list[Tool]) -> str:
         args_json = json.dumps(tool.schema.properties, sort_keys=True)
         lines.append(f"- {tool.name}: {tool.description}\n  args: {args_json}")
     return "\n".join(lines)
+
+
+def _render_openai_tools(tools: list[Tool]) -> list[dict[str, Any]]:
+    """Build the OpenAI ``tools`` request-param envelope from registered tools.
+
+    Each tool becomes::
+
+        {"type": "function",
+         "function": {"name": t.name, "description": t.description,
+                      "parameters": {"type": t.schema.type,
+                                     "properties": t.schema.properties,
+                                     "required": t.schema.required,
+                                     "additionalProperties": t.schema.additionalProperties}}}
+
+    The ``parameters`` sub-object mirrors the four fields on
+    :class:`fifty_agent_sdk.tools.protocol.ToolSchema` exactly. This is only
+    called when :attr:`SafetyConfig.native_tools_enabled` is on — the default
+    flag-OFF path never builds this envelope, so no tool declaration reaches
+    the wire and the request is byte-for-byte pre-BR-008.
+
+    Args:
+        tools: Snapshot of registered tools from
+            :meth:`fifty_agent_sdk.tools.registry.Registry.list`.
+
+    Returns:
+        A list of OpenAI ``tools`` entries, one per tool. Empty list for an
+        empty tool set (the consumer can decide whether to omit the param).
+    """
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": tool.name,
+                "description": tool.description,
+                "parameters": {
+                    "type": tool.schema.type,
+                    "properties": tool.schema.properties,
+                    "required": tool.schema.required,
+                    "additionalProperties": tool.schema.additionalProperties,
+                },
+            },
+        }
+        for tool in tools
+    ]
 
 
 def _serialize_tool_output(output: Any) -> str:
@@ -279,6 +331,12 @@ class AgentLoop:
         self._llm = llm
         self._registry = registry
         self._parser = parser
+        # BR-007: native (provider-structured) tool-call parser. Constructed
+        # here (no constructor arg — concrete class) so the precedence branch
+        # in `run()` can dispatch a populated `response.message.tool_calls`
+        # through it. Independent of the text `Parser`; does not participate
+        # in prompt building (the system-prompt snapshot below is unchanged).
+        self._native_parser = NativeToolsParser()
         self._safety = safety
         self._model = model
         self._stream = stream
@@ -289,8 +347,20 @@ class AgentLoop:
         self._system_prompt = self._build_system_prompt(prompts, output_format)
 
     def _build_system_prompt(self, prompts: PromptSections, output_format: str) -> str:
-        """Render the system prompt from a registry snapshot and the provided slots."""
-        tool_block = _render_tool_descriptions(self._registry.list())
+        """Render the system prompt from a registry snapshot and the provided slots.
+
+        When :attr:`SafetyConfig.native_tools_enabled` is on, the prompt-side
+        tool-description block is SUPPRESSED (left empty) so tools are declared
+        to the model ONLY via the OpenAI ``tools`` request param. Declaring
+        them in both places risks the model emitting text-mode JSON tool calls
+        instead of native ``tool_calls`` — the structured ``tools`` param is
+        the sole source of truth under native mode. When the flag is off (the
+        default), the renderer runs exactly as before — byte-for-byte.
+        """
+        if self._safety.native_tools_enabled:
+            tool_block = ""
+        else:
+            tool_block = _render_tool_descriptions(self._registry.list())
         chosen_format = output_format or prompts.output_format
         composed = PromptSections(
             persona=prompts.persona,
@@ -301,7 +371,22 @@ class AgentLoop:
         return render_system_prompt(composed)
 
     def _build_request(self, messages: list[ChatMessage]) -> ChatRequest:
-        """Wrap the working message list in a :class:`ChatRequest` for this loop's model."""
+        """Wrap the working message list in a :class:`ChatRequest` for this loop's model.
+
+        When :attr:`SafetyConfig.native_tools_enabled` is on, the request
+        carries the registry's tools as the OpenAI ``tools`` param (built via
+        :func:`_render_openai_tools`) plus ``tool_choice="auto"``. When the
+        flag is off (the default), the request is exactly
+        ``ChatRequest(messages=..., model=...)`` — byte-for-byte pre-BR-008.
+        """
+        if self._safety.native_tools_enabled:
+            tools = _render_openai_tools(self._registry.list())
+            return ChatRequest(
+                messages=list(messages),
+                model=self._model,
+                tools=tools,
+                tool_choice="auto",
+            )
         return ChatRequest(messages=list(messages), model=self._model)
 
     async def run(
@@ -385,6 +470,7 @@ class AgentLoop:
             completion: str = ""
             deltas: list[str] = []
             parsed: ParseResult
+            native_turn: bool = False
             while True:
                 # ----- 1. Build request and call LLM ------------------------
                 request = self._build_request(working)
@@ -439,6 +525,46 @@ class AgentLoop:
                     )
 
                 # ----- 2. Parse the completion -----------------------------
+                # BR-007 precedence branch: if the adapter populated a
+                # structured `response.message.tool_calls`, dispatch through
+                # the native parser (bypassing text parsing entirely). Native
+                # parse does NOT participate in the BR-018 one-shot retry
+                # (D4): a structured `tool_calls` array comes from the
+                # provider SDK already formed, so a malformed one is an
+                # unrecoverable adapter/provider error — emit the same
+                # terminal ErrorEvent + fallback FinalEvent as the
+                # retry-disabled / budget-exhausted text path below, then
+                # return. In stream mode `response is None` (a stream has no
+                # single response object), so a streamed turn CANNOT go
+                # native (D5) and falls through to the text path unchanged.
+                if response is not None and response.message.tool_calls:
+                    try:
+                        parsed = self._native_parser.parse(response)
+                    except ParserError as exc:
+                        yield self._make_event(
+                            ErrorEvent,
+                            sequence_box,
+                            error_type="ParserError",
+                            message=exc.message,
+                            context=dict(exc.context),
+                        )
+                        yield self._make_event(
+                            FinalEvent,
+                            sequence_box,
+                            text=self._safety.fallback_message,
+                        )
+                        _log.info(
+                            "agent_loop_completed",
+                            iterations=iteration,
+                            run_id=run_id,
+                            terminated_by="parser_error",
+                        )
+                        return
+                    native_turn = True
+                    # Native parse does not retry — leave the inner loop and
+                    # continue with the unchanged branching logic below.
+                    break
+                native_turn = False
                 try:
                     parsed = self._parser.parse(completion)
                 except ParserError as exc:
@@ -560,6 +686,241 @@ class AgentLoop:
                 )
                 return
 
+            # BR-006: a native response carrying MORE THAN ONE tool call yields
+            # a MultiAction. Dispatch all N calls concurrently under a
+            # Semaphore-bounded gather, feed their observations back in CALL
+            # order, and emit per-call events with monotonic sequence — then
+            # `continue` (the batch counts as ONE iteration unit). The single-
+            # call path (ThoughtAction, below) is UNCHANGED: a single native
+            # call returns ThoughtAction, never MultiAction, so this branch is
+            # dead code for every text/JSON/single-call turn.
+            if isinstance(parsed, MultiAction):
+                calls = parsed.tool_calls
+                # Mint N DISTINCT call_ids BEFORE the assistant-turn append so
+                # each entry on the replayed assistant turn carries its own
+                # pairing key (learning #934: minting after would share one id
+                # across N entries → the provider cannot pair N distinct tool
+                # replies → HTTP 400). Each id is reused for the matching
+                # ToolStartedEvent, registry.invoke, and tool-reply message.
+                call_ids = [uuid4().hex for _ in calls]
+
+                # One ThoughtEvent for the batch (the MultiAction's thought,
+                # mirroring the single-call ThoughtEvent below).
+                yield self._make_event(ThoughtEvent, sequence_box, text=parsed.thought)
+
+                # One ActionEvent PER call, in CALL order, via _make_event so
+                # sequence stays monotonic and dense.
+                for tc in calls:
+                    yield self._make_event(
+                        ActionEvent,
+                        sequence_box,
+                        tool_name=tc.name,
+                        args=dict(tc.args),
+                    )
+
+                # Append the assistant turn carrying ALL N tool_calls (each
+                # with its minted id). ChatMessage.tool_call_id is left None —
+                # it is single-valued and cannot carry N ids; the per-call ids
+                # live on tool_calls[].id and _serialize_message sources each
+                # wire id from there (falling back to tool_call_id for the
+                # single-call path).
+                working.append(
+                    ChatMessage(
+                        role="assistant",
+                        content=completion,
+                        tool_calls=[
+                            ToolCall(name=tc.name, args=dict(tc.args), id=cid)
+                            for tc, cid in zip(calls, call_ids, strict=True)
+                        ],
+                    )
+                )
+
+                # BR-036: a tool is being dispatched this run, so a later
+                # `final` is now grounded and must NOT trigger the
+                # force-reconsider guard.
+                tool_invoked_this_run = True
+
+                # One ToolStartedEvent PER call, in CALL order.
+                for tc, cid in zip(calls, call_ids, strict=True):
+                    yield self._make_event(
+                        ToolStartedEvent,
+                        sequence_box,
+                        tool_name=tc.name,
+                        call_id=cid,
+                    )
+                    _log.debug(
+                        "tool_invoked",
+                        name=tc.name,
+                        call_id=cid,
+                        run_id=run_id,
+                    )
+
+                # Semaphore-bounded gather (Decision §C). `return_exceptions=
+                # True` is MANDATORY: without it, the first failing call
+                # cancels all sibling tasks (learning #886 — per-call
+                # isolation). NO asyncio.wait_for is added (learning #819) —
+                # Registry.invoke already enforces the per-tool timeout via
+                # `async with asyncio.timeout`, so the gather inherits correct
+                # inline-task timeout/cancellation semantics.
+                sem = asyncio.Semaphore(self._safety.max_concurrent_tool_calls)
+
+                async def _run_one(
+                    cid: str, tc: ToolCall, _sem: asyncio.Semaphore = sem
+                ) -> ToolResult:
+                    async with _sem:
+                        return await self._registry.invoke(
+                            tc.name,
+                            dict(tc.args),
+                            timeout=self._safety.tool_timeout_seconds,
+                        )
+
+                raw_results = await asyncio.gather(
+                    *[_run_one(cid, tc) for cid, tc in zip(call_ids, calls, strict=True)],
+                    return_exceptions=True,
+                )
+
+                # Per-call classification loop, in CALL order (NOT completion
+                # order — zip preserves the call index, so observations are
+                # appended deterministically regardless of which call finished
+                # first). Fatal BaseExceptions / AgentSdkError returned by
+                # return_exceptions=True are RE-RAISED here (learning #886):
+                # a genuinely fatal error must still terminate; recoverable
+                # tool failures (ToolNotFound/ToolTimeout/is_error) yield a
+                # ToolFailedEvent + observation for THAT call only.
+                for tc, cid, raw in zip(calls, call_ids, raw_results, strict=True):
+                    tool_name = tc.name
+                    if isinstance(raw, ToolNotFound):
+                        yield self._make_event(
+                            ToolFailedEvent,
+                            sequence_box,
+                            tool_name=tool_name,
+                            call_id=cid,
+                            error=f"ToolNotFound: {raw.message}",
+                        )
+                        working.append(
+                            self._build_tool_message(
+                                tool_name=tool_name,
+                                call_id=cid,
+                                content_for_tool_role=(
+                                    f"ToolNotFound: tool '{tool_name}' is not registered."
+                                ),
+                                content_for_other_role=(
+                                    f"Tool {tool_name} failed: "
+                                    f"ToolNotFound: tool '{tool_name}' is not registered."
+                                ),
+                            )
+                        )
+                    elif isinstance(raw, ToolTimeout):
+                        yield self._make_event(
+                            ToolFailedEvent,
+                            sequence_box,
+                            tool_name=tool_name,
+                            call_id=cid,
+                            error=f"ToolTimeout: {raw.message}",
+                        )
+                        working.append(
+                            self._build_tool_message(
+                                tool_name=tool_name,
+                                call_id=cid,
+                                content_for_tool_role=f"ToolTimeout: {raw.message}",
+                                content_for_other_role=(
+                                    f"Tool {tool_name} failed: ToolTimeout: {raw.message}"
+                                ),
+                            )
+                        )
+                    elif isinstance(
+                        raw, (AgentSdkError, asyncio.CancelledError, KeyboardInterrupt, SystemExit)
+                    ):
+                        # Fatal: do NOT swallow as a recoverable observation.
+                        # Registry.invoke re-raises these untouched; their
+                        # presence here means they escaped as a returned
+                        # value via return_exceptions=True — re-raise so the
+                        # run terminates (and consumer CancelledError
+                        # propagates out of gather untouched).
+                        #
+                        # ORDER IS LOAD-BEARING: this arm MUST stay AFTER the
+                        # ToolNotFound/ToolTimeout arms above — both are
+                        # AgentSdkError subclasses, so checking AgentSdkError
+                        # first would silently turn a recoverable tool error
+                        # into a fatal run termination. test_multi_call_failure_isolation
+                        # locks the recoverable contract.
+                        raise raw
+                    elif isinstance(raw, ToolResult):
+                        if raw.is_error:
+                            error_text = (
+                                raw.error
+                                if raw.error is not None
+                                else "tool reported error with no message"
+                            )
+                            yield self._make_event(
+                                ToolFailedEvent,
+                                sequence_box,
+                                tool_name=tool_name,
+                                call_id=cid,
+                                error=error_text,
+                            )
+                            working.append(
+                                self._build_tool_message(
+                                    tool_name=tool_name,
+                                    call_id=cid,
+                                    content_for_tool_role=f"Tool error: {error_text}",
+                                    content_for_other_role=(
+                                        f"Tool {tool_name} failed: {error_text}"
+                                    ),
+                                )
+                            )
+                        else:
+                            yield self._make_event(
+                                ObservationEvent,
+                                sequence_box,
+                                tool_name=tool_name,
+                                call_id=cid,
+                                result=raw,
+                            )
+                            working.append(
+                                self._build_tool_message(
+                                    tool_name=tool_name,
+                                    call_id=cid,
+                                    content_for_tool_role=_serialize_tool_output(raw.output),
+                                    content_for_other_role=(
+                                        f"Tool {tool_name} returned: "
+                                        f"{_serialize_tool_output(raw.output)}"
+                                    ),
+                                )
+                            )
+                    elif isinstance(raw, Exception):
+                        # Defensive: a plain non-SDK Exception should not
+                        # occur post-Registry.invoke (the registry catches
+                        # Exception → ToolResult(is_error=True)). Treat as a
+                        # recoverable tool error rather than terminating.
+                        error_text = f"{type(raw).__name__}: {raw}"
+                        yield self._make_event(
+                            ToolFailedEvent,
+                            sequence_box,
+                            tool_name=tool_name,
+                            call_id=cid,
+                            error=error_text,
+                        )
+                        working.append(
+                            self._build_tool_message(
+                                tool_name=tool_name,
+                                call_id=cid,
+                                content_for_tool_role=f"Tool error: {error_text}",
+                                content_for_other_role=(f"Tool {tool_name} failed: {error_text}"),
+                            )
+                        )
+                    else:
+                        # Unexpected non-Exception, non-ToolResult value —
+                        # raise loudly rather than silently dropping a call.
+                        raise TypeError(
+                            f"unexpected gather result type for tool '{tool_name}': "
+                            f"{type(raw).__name__}",
+                        )
+                # The batch consumed ONE iteration unit; re-enter the outer
+                # while loop for the next round (still bounded by
+                # max_iterations).
+                continue
+
             # parsed is a ThoughtAction (narrowed by isinstance check above).
             yield self._make_event(ThoughtEvent, sequence_box, text=parsed.thought)
             yield self._make_event(
@@ -571,7 +932,40 @@ class AgentLoop:
 
             # Append the assistant turn to history before emitting ToolStarted, so the
             # subsequent tool reply sits on top of the model's reasoning turn.
-            working.append(ChatMessage(role="assistant", content=completion))
+            # BR-007 (D6): a native tool turn MUST carry the structured
+            # `tool_calls` on the assistant turn so provider-native replay can
+            # pair the subsequent `role="tool"` reply (keyed by `tool_call_id`)
+            # to this turn.
+            #
+            # BR-008 (Decision B — the id-pairing reordering): mint the
+            # `call_id` BEFORE the assistant-turn append and embed it on the
+            # assistant message's `tool_call_id` (reusing the existing field —
+            # `ToolCall` carries only `{name, args}` per BR-007 D7). The SAME
+            # `call_id` is then reused for the `ToolStartedEvent`,
+            # `registry.invoke`, and the `_build_tool_message(call_id=...)`
+            # reply, so the assistant turn's id and the tool reply's
+            # `tool_call_id` match — a strict OpenAI endpoint requires the
+            # pairing key on BOTH sides or it returns 400 on turn 2. The
+            # text-path `else` branch never read `call_id`; hoisting the mint
+            # above both branches is a no-op for text.
+            tool_name = parsed.tool_call.name
+            call_id = uuid4().hex
+            if native_turn:
+                working.append(
+                    ChatMessage(
+                        role="assistant",
+                        content=completion,
+                        tool_call_id=call_id,
+                        tool_calls=[
+                            ToolCall(
+                                name=parsed.tool_call.name,
+                                args=dict(parsed.tool_call.args),
+                            )
+                        ],
+                    )
+                )
+            else:
+                working.append(ChatMessage(role="assistant", content=completion))
 
             # BR-036: a tool is being dispatched this run, so a later `final`
             # is now grounded (from the loop's structural view) and must NOT
@@ -579,8 +973,6 @@ class AgentLoop:
             tool_invoked_this_run = True
 
             # ----- 4. Invoke tool ------------------------------------------
-            call_id = uuid4().hex
-            tool_name = parsed.tool_call.name
             yield self._make_event(
                 ToolStartedEvent,
                 sequence_box,

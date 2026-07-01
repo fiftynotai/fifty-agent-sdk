@@ -12,6 +12,7 @@ at the public method boundary, in line with the
 
 from __future__ import annotations
 
+import json
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -30,6 +31,7 @@ from fifty_agent_sdk.llm.types import (
     ChatRequest,
     ChatResponse,
     FinishReason,
+    ToolCall,
     Usage,
 )
 
@@ -44,6 +46,9 @@ _FINISH_REASON_MAP: dict[str, FinishReason] = {
     "function_call": "tool_calls",
     "error": "error",
 }
+
+_MAX_TOOL_CALL_ARG_EXCERPT: int = 200
+"""Maximum length of ``arguments_excerpt`` in the malformed-arguments context."""
 
 
 class OpenAICompatibleClient:
@@ -220,11 +225,63 @@ class OpenAICompatibleClient:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _build_body(request: ChatRequest, *, model: str, stream: bool) -> dict[str, Any]:
+    def _serialize_message(msg: ChatMessage) -> dict[str, Any]:
+        """Serialize a single :class:`ChatMessage` for the request wire.
+
+        For every message EXCEPT an assistant turn carrying native
+        ``tool_calls``, this is byte-for-byte ``msg.model_dump(exclude_none=True)``
+        (the pre-BR-008 behavior). For an assistant turn carrying
+        ``tool_calls`` (only set when native function-calling is on), the
+        message is translated into the OpenAI envelope:
+
+            {role:"assistant", content, tool_calls: [
+                {id, type:"function",
+                 function:{name, arguments: json.dumps(args)}}
+            ]}
+
+        The ``id`` is sourced PER ENTRY from the entry's own
+        :attr:`~fifty_agent_sdk.llm.types.ToolCall.id` (BR-006): the loop
+        mints a distinct id per dispatched call so a multi-call assistant
+        turn carries N DISTINCT ids, and each subsequent ``role="tool"``
+        reply pairs with exactly one entry (a strict OpenAI endpoint returns
+        400 otherwise). The fallback
+        ``tc.id if tc.id is not None else msg.tool_call_id`` preserves the
+        BR-008 single-call wire byte-for-byte: the single-call native path
+        sets ``ToolCall(id=None)`` and ``msg.tool_call_id=call_id``, so
+        ``tc.id is None`` falls back to ``msg.tool_call_id`` and emits the
+        same id BR-008 did. ``arguments`` is emitted as a JSON STRING (not an
+        object), per the OpenAI function-calling spec.
+
+        Flag-OFF proof: ``ChatMessage.tool_calls`` defaults to ``None`` and is
+        only populated on a native turn (which requires
+        ``native_tools_enabled=True`` to even reach the provider), so every
+        flag-OFF message takes the ``else`` branch — identical to today.
+        """
+        if msg.role == "assistant" and msg.tool_calls:
+            tool_calls_envelope = [
+                {
+                    "id": tc.id if tc.id is not None else msg.tool_call_id,
+                    "type": "function",
+                    "function": {
+                        "name": tc.name,
+                        "arguments": json.dumps(tc.args),
+                    },
+                }
+                for tc in msg.tool_calls
+            ]
+            return {
+                "role": "assistant",
+                "content": msg.content,
+                "tool_calls": tool_calls_envelope,
+            }
+        return msg.model_dump(exclude_none=True)
+
+    @classmethod
+    def _build_body(cls, request: ChatRequest, *, model: str, stream: bool) -> dict[str, Any]:
         """Build the kwargs passed to ``client.chat.completions.create``."""
         body: dict[str, Any] = {
             "model": model,
-            "messages": [m.model_dump(exclude_none=True) for m in request.messages],
+            "messages": [cls._serialize_message(m) for m in request.messages],
             "temperature": request.temperature,
             "stream": stream,
         }
@@ -232,6 +289,9 @@ class OpenAICompatibleClient:
             body["max_tokens"] = request.max_tokens
         if request.response_format is not None:
             body["response_format"] = request.response_format
+        if request.tools is not None:
+            body["tools"] = request.tools
+            body["tool_choice"] = request.tool_choice or "auto"
         return body
 
     @staticmethod
@@ -252,6 +312,15 @@ class OpenAICompatibleClient:
         Defensive: if any required field is missing or has the wrong shape,
         raise :class:`LLMError` rather than letting a ``KeyError`` /
         ``AttributeError`` leak.
+
+        When the upstream provider emits structured ``tool_calls`` (OpenAI
+        function-calling), each entry is normalized into the SDK's
+        :class:`~fifty_agent_sdk.llm.types.ToolCall` (``{name, args: dict}``)
+        by parsing the provider's JSON-string ``arguments``. Parse failure of
+        ``arguments`` raises :class:`LLMError` (``type="MalformedResponse"``)
+        with the offending ``tool_call_id`` and a bounded
+        ``arguments_excerpt`` — a provider sending malformed ``arguments`` is
+        an unrecoverable envelope error, not model drift.
         """
         try:
             choices = raw.choices
@@ -265,6 +334,7 @@ class OpenAICompatibleClient:
             content = sdk_message.content if sdk_message.content is not None else ""
             finish_reason = cls._normalize_finish_reason(choice.finish_reason)
             usage = cls._map_usage(raw.usage)
+            tool_calls = cls._map_tool_calls(getattr(sdk_message, "tool_calls", None), model=model)
         except LLMError:
             raise
         except (AttributeError, IndexError, TypeError) as e:
@@ -273,10 +343,70 @@ class OpenAICompatibleClient:
                 context={"model": model, "type": "MalformedResponse"},
             ) from e
         return ChatResponse(
-            message=ChatMessage(role="assistant", content=content),
+            message=ChatMessage(role="assistant", content=content, tool_calls=tool_calls),
             usage=usage,
             finish_reason=finish_reason,
         )
+
+    @classmethod
+    def _map_tool_calls(cls, raw: Any, *, model: str) -> list[ToolCall] | None:  # noqa: ANN401 - SDK shape is opaque
+        """Normalize upstream OpenAI ``tool_calls`` into SDK :class:`ToolCall`.
+
+        Each upstream entry has the OpenAI shape
+        ``{id, type, function: {name, arguments(JSON string)}}``. The SDK
+        :class:`ToolCall` is ``{name, args: dict}`` (no ``id`` — see BR-007
+        D7: the loop synthesizes the pairing ``call_id`` for history replay).
+        The provider's JSON-string ``arguments`` is parsed into ``args``;
+        parse failure raises :class:`LLMError` (``type="MalformedResponse"``).
+
+        Returns ``None`` (not ``[]``) when there are no upstream tool calls so
+        ``model_dump(exclude_none=True)`` in :meth:`_build_body` stays clean
+        on the request wire for every existing caller.
+
+        Args:
+            raw: The upstream ``message.tool_calls`` value, or ``None``.
+            model: Model identifier for the error context payload.
+
+        Returns:
+            A list of SDK :class:`ToolCall` values, or ``None`` when
+            ``raw`` is absent/empty.
+
+        Raises:
+            fifty_agent_sdk.errors.LLMError: When an entry's ``arguments``
+                is not valid JSON.
+        """
+        if not raw:
+            return None
+        mapped: list[ToolCall] = []
+        for tc in raw:
+            function = tc.function
+            arguments = function.arguments if function.arguments is not None else ""
+            try:
+                args = json.loads(arguments) if arguments else {}
+            except json.JSONDecodeError as e:
+                raise LLMError(
+                    "provider tool_call arguments is not valid JSON",
+                    context={
+                        "model": model,
+                        "type": "MalformedResponse",
+                        "tool_call_id": getattr(tc, "id", None),
+                        "arguments_excerpt": arguments[:_MAX_TOOL_CALL_ARG_EXCERPT],
+                    },
+                ) from e
+            if not isinstance(args, dict):
+                # The OpenAI spec requires `arguments` to be a JSON object;
+                # a non-object (e.g. a bare string or number) is malformed.
+                raise LLMError(
+                    "provider tool_call arguments is not a JSON object",
+                    context={
+                        "model": model,
+                        "type": "MalformedResponse",
+                        "tool_call_id": getattr(tc, "id", None),
+                        "arguments_excerpt": arguments[:_MAX_TOOL_CALL_ARG_EXCERPT],
+                    },
+                )
+            mapped.append(ToolCall(name=function.name, args=args))
+        return mapped
 
     @classmethod
     def _map_chunk(cls, raw: Any, *, model: str) -> ChatResponse:  # noqa: ANN401 - SDK shape is opaque
@@ -303,6 +433,10 @@ class OpenAICompatibleClient:
             choice = choices[0]
             delta = choice.delta
             content = ""
+            # NOTE: native tool_calls are intentionally NOT mapped here. A
+            # native tool-decision turn is non-streamed (BR-007 D5), and the
+            # loop's native precedence branch only fires when a real
+            # ChatResponse carries tool_calls — streamed turns never go native.
             if delta is not None and delta.content is not None:
                 content = delta.content
             upstream_finish = choice.finish_reason

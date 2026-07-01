@@ -16,7 +16,7 @@ from pytest_httpx import HTTPXMock
 from fifty_agent_sdk.errors import LLMError
 from fifty_agent_sdk.llm.openai_compat import OpenAICompatibleClient
 from fifty_agent_sdk.llm.protocol import LLMClient
-from fifty_agent_sdk.llm.types import ChatMessage, ChatRequest
+from fifty_agent_sdk.llm.types import ChatMessage, ChatRequest, ToolCall
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -34,7 +34,11 @@ def _canonical_response(
     completion_tokens: int = 3,
     total_tokens: int = 8,
     model: str = "gpt-4o",
+    tool_calls: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
+    message: dict[str, Any] = {"role": "assistant", "content": content}
+    if tool_calls is not None:
+        message["tool_calls"] = tool_calls
     return {
         "id": "cmpl-1",
         "object": "chat.completion",
@@ -43,7 +47,7 @@ def _canonical_response(
         "choices": [
             {
                 "index": 0,
-                "message": {"role": "assistant", "content": content},
+                "message": message,
                 "finish_reason": finish_reason,
             }
         ],
@@ -260,6 +264,310 @@ async def test_complete_handles_null_content(httpx_mock: HTTPXMock) -> None:
     resp = await client.complete(_basic_request())
     assert resp.message.content == ""
     assert resp.finish_reason == "tool_calls"
+
+
+# ---------------------------------------------------------------------------
+# Native tool_calls mapping (BR-007)
+# ---------------------------------------------------------------------------
+
+
+async def test_complete_maps_native_tool_calls(httpx_mock: HTTPXMock) -> None:
+    """OpenAI tool_calls (JSON-string arguments) map to SDK ToolCall list."""
+    payload = _canonical_response(
+        content="",
+        finish_reason="tool_calls",
+        tool_calls=[
+            {
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "search", "arguments": '{"q": "x"}'},
+            }
+        ],
+    )
+    httpx_mock.add_response(method="POST", url=ENDPOINT, json=payload)
+    client = _make_client()
+    resp = await client.complete(_basic_request())
+
+    assert resp.finish_reason == "tool_calls"
+    assert resp.message.tool_calls is not None
+    assert len(resp.message.tool_calls) == 1
+    mapped = resp.message.tool_calls[0]
+    assert isinstance(mapped, ToolCall)
+    assert mapped.name == "search"
+    # The JSON-string `arguments` is parsed into a dict.
+    assert mapped.args == {"q": "x"}
+
+
+async def test_complete_maps_native_tool_calls_empty_arguments(httpx_mock: HTTPXMock) -> None:
+    """An empty-arguments tool call maps to an empty args dict."""
+    payload = _canonical_response(
+        finish_reason="tool_calls",
+        tool_calls=[
+            {
+                "id": "call_2",
+                "type": "function",
+                "function": {"name": "ping", "arguments": ""},
+            }
+        ],
+    )
+    httpx_mock.add_response(method="POST", url=ENDPOINT, json=payload)
+    client = _make_client()
+    resp = await client.complete(_basic_request())
+
+    assert resp.message.tool_calls is not None
+    assert resp.message.tool_calls[0].name == "ping"
+    assert resp.message.tool_calls[0].args == {}
+
+
+async def test_complete_malformed_arguments_raises_llm_error(httpx_mock: HTTPXMock) -> None:
+    """Non-JSON `arguments` raises LLMError(MalformedResponse) with the call id."""
+    payload = _canonical_response(
+        finish_reason="tool_calls",
+        tool_calls=[
+            {
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "search", "arguments": "not json"},
+            }
+        ],
+    )
+    httpx_mock.add_response(method="POST", url=ENDPOINT, json=payload)
+    client = _make_client()
+    with pytest.raises(LLMError) as exc:
+        await client.complete(_basic_request())
+    assert exc.value.context["type"] == "MalformedResponse"
+    assert exc.value.context["tool_call_id"] == "call_1"
+    assert exc.value.context["model"] == "gpt-4o"
+    assert exc.value.context["arguments_excerpt"] == "not json"
+    assert exc.value.__cause__ is not None
+
+
+async def test_complete_non_object_arguments_raises_llm_error(httpx_mock: HTTPXMock) -> None:
+    """A non-object JSON `arguments` (e.g. a bare array) is rejected."""
+    payload = _canonical_response(
+        finish_reason="tool_calls",
+        tool_calls=[
+            {
+                "id": "call_3",
+                "type": "function",
+                "function": {"name": "search", "arguments": "[1, 2, 3]"},
+            }
+        ],
+    )
+    httpx_mock.add_response(method="POST", url=ENDPOINT, json=payload)
+    client = _make_client()
+    with pytest.raises(LLMError) as exc:
+        await client.complete(_basic_request())
+    assert exc.value.context["type"] == "MalformedResponse"
+    assert exc.value.context["tool_call_id"] == "call_3"
+
+
+async def test_complete_no_tool_calls_field_is_none(httpx_mock: HTTPXMock) -> None:
+    """The default response (no tool_calls) leaves `tool_calls` as None (additive)."""
+    httpx_mock.add_response(method="POST", url=ENDPOINT, json=_canonical_response())
+    client = _make_client()
+    resp = await client.complete(_basic_request())
+    assert resp.message.tool_calls is None
+    # Existing assertions on the additive path are unchanged.
+    assert resp.message.content == "hello"
+    assert resp.finish_reason == "stop"
+
+
+async def test_complete_native_tool_call_excluded_from_request_body(
+    httpx_mock: HTTPXMock,
+) -> None:
+    """A None tool_calls on request messages emits no `tool_calls` key on the wire."""
+    httpx_mock.add_response(method="POST", url=ENDPOINT, json=_canonical_response())
+    client = _make_client()
+    await client.complete(_basic_request())
+    raw = httpx_mock.get_request()
+    assert raw is not None
+    body = json.loads(raw.read())
+    for msg in body["messages"]:
+        assert "tool_calls" not in msg
+
+
+# ---------------------------------------------------------------------------
+# BR-008: tools/tool_choice declaration + assistant tool_calls wire envelope
+# ---------------------------------------------------------------------------
+
+
+async def test_build_body_no_tools_when_request_tools_unset(httpx_mock: HTTPXMock) -> None:
+    """Flag-OFF proof at the adapter level: no tools/tool_choice on the wire."""
+    httpx_mock.add_response(method="POST", url=ENDPOINT, json=_canonical_response())
+    client = _make_client()
+    await client.complete(_basic_request())
+    raw = httpx_mock.get_request()
+    assert raw is not None
+    body = json.loads(raw.read())
+    assert "tools" not in body
+    assert "tool_choice" not in body
+
+
+async def test_build_body_declares_tools_when_set(httpx_mock: HTTPXMock) -> None:
+    """A set `request.tools` is emitted verbatim with `tool_choice="auto"` default."""
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "search",
+                "description": "search the web",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"q": {"type": "string"}},
+                    "required": ["q"],
+                    "additionalProperties": False,
+                },
+            },
+        }
+    ]
+    httpx_mock.add_response(method="POST", url=ENDPOINT, json=_canonical_response())
+    client = _make_client()
+    await client.complete(_basic_request(tools=tools))
+    raw = httpx_mock.get_request()
+    assert raw is not None
+    body = json.loads(raw.read())
+    assert body["tools"] == tools
+    assert body["tool_choice"] == "auto"
+
+
+async def test_build_body_tool_choice_override(httpx_mock: HTTPXMock) -> None:
+    """A caller-supplied `tool_choice` passes through instead of defaulting to auto."""
+    httpx_mock.add_response(method="POST", url=ENDPOINT, json=_canonical_response())
+    client = _make_client()
+    await client.complete(
+        _basic_request(
+            tools=[{"type": "function", "function": {"name": "x"}}], tool_choice="required"
+        )
+    )
+    raw = httpx_mock.get_request()
+    assert raw is not None
+    body = json.loads(raw.read())
+    assert body["tool_choice"] == "required"
+
+
+async def test_assistant_tool_calls_envelope_on_wire(httpx_mock: HTTPXMock) -> None:
+    """An assistant turn carrying tool_calls serializes to the OpenAI envelope shape.
+
+    The `tool_calls[].id` is the message's `tool_call_id`, `type` is
+    "function", and `function.arguments` is a JSON STRING (not an object) that
+    round-trips back to the args dict.
+    """
+    assistant_msg = ChatMessage(
+        role="assistant",
+        content="",
+        tool_call_id="pairing-id-123",
+        tool_calls=[ToolCall(name="search", args={"q": "x"})],
+    )
+    httpx_mock.add_response(method="POST", url=ENDPOINT, json=_canonical_response())
+    client = _make_client()
+    await client.complete(_basic_request(messages=[assistant_msg]))
+    raw = httpx_mock.get_request()
+    assert raw is not None
+    body = json.loads(raw.read())
+    assistant_wire = body["messages"][0]
+    assert assistant_wire["role"] == "assistant"
+    assert assistant_wire["content"] == ""
+    assert len(assistant_wire["tool_calls"]) == 1
+    tc = assistant_wire["tool_calls"][0]
+    assert tc["id"] == "pairing-id-123"
+    assert tc["type"] == "function"
+    assert tc["function"]["name"] == "search"
+    # arguments MUST be a JSON string, not an object.
+    assert isinstance(tc["function"]["arguments"], str)
+    assert json.loads(tc["function"]["arguments"]) == {"q": "x"}
+
+
+async def test_id_pairing_assistant_id_matches_tool_reply(httpx_mock: HTTPXMock) -> None:
+    """The assistant tool_calls id and the tool reply tool_call_id pair on the wire."""
+    assistant_msg = ChatMessage(
+        role="assistant",
+        content="",
+        tool_call_id="X",
+        tool_calls=[ToolCall(name="search", args={"q": "x"})],
+    )
+    tool_reply = ChatMessage(role="tool", content="result", name="search", tool_call_id="X")
+    httpx_mock.add_response(method="POST", url=ENDPOINT, json=_canonical_response())
+    client = _make_client()
+    await client.complete(_basic_request(messages=[assistant_msg, tool_reply]))
+    raw = httpx_mock.get_request()
+    assert raw is not None
+    body = json.loads(raw.read())
+    assistant_wire = body["messages"][0]
+    tool_wire = body["messages"][1]
+    assistant_tc_id = assistant_wire["tool_calls"][0]["id"]
+    assert assistant_tc_id == "X"
+    assert tool_wire["role"] == "tool"
+    assert tool_wire["tool_call_id"] == "X"
+    # The pairing key matches across both messages.
+    assert assistant_tc_id == tool_wire["tool_call_id"]
+
+
+async def test_two_turn_native_no_400(httpx_mock: HTTPXMock) -> None:
+    """End-to-end: a two-turn native round-trip produces a well-formed wire envelope.
+
+    Turn 1 returns a native tool_call; turn 2 (after the assistant turn + tool
+    reply are appended) returns a final answer. The request the mock RECEIVES
+    on turn 2 MUST carry the OpenAI assistant envelope (tool_calls[].id
+    present) AND a paired role="tool" reply whose tool_call_id matches — the
+    shape a strict OpenAI endpoint requires to NOT return 400. This asserts
+    the request envelope SHAPE, not merely that no exception was raised.
+    """
+    tool_call_id = "call_abc"
+    turn1 = _canonical_response(
+        content="",
+        finish_reason="tool_calls",
+        tool_calls=[
+            {
+                "id": tool_call_id,
+                "type": "function",
+                "function": {"name": "search", "arguments": '{"q": "x"}'},
+            }
+        ],
+    )
+    turn2 = _canonical_response(content="the answer", finish_reason="stop")
+    httpx_mock.add_response(method="POST", url=ENDPOINT, json=turn1)
+    httpx_mock.add_response(method="POST", url=ENDPOINT, json=turn2)
+    client = _make_client()
+
+    # Turn 1: plain request; provider returns a native tool_call.
+    resp1 = await client.complete(_basic_request(messages=[ChatMessage(role="user", content="q")]))
+    assert resp1.finish_reason == "tool_calls"
+    assert resp1.message.tool_calls is not None
+    # Loop would now synthesize the assistant turn (carrying the pairing id)
+    # and the tool reply from the response.
+    assistant_msg = ChatMessage(
+        role="assistant",
+        content="",
+        tool_call_id=tool_call_id,
+        tool_calls=resp1.message.tool_calls,
+    )
+    tool_reply = ChatMessage(
+        role="tool", content="search results", name="search", tool_call_id=tool_call_id
+    )
+    # Turn 2: replay with the assistant + tool turns in history.
+    resp2 = await client.complete(
+        _basic_request(messages=[ChatMessage(role="user", content="q"), assistant_msg, tool_reply])
+    )
+    assert resp2.finish_reason == "stop"
+
+    # Assert the SECOND request's envelope shape (the turn that would 400 on a
+    # strict endpoint if the pairing were broken).
+    requests = httpx_mock.get_requests()
+    assert len(requests) == 2
+    body = json.loads(requests[1].read())
+    assistant_wire = next(
+        m for m in body["messages"] if m["role"] == "assistant" and "tool_calls" in m
+    )
+    tool_wire = next(m for m in body["messages"] if m["role"] == "tool")
+    assert assistant_wire["tool_calls"][0]["id"] == tool_call_id
+    assert assistant_wire["tool_calls"][0]["type"] == "function"
+    # arguments is a JSON STRING on the wire.
+    assert isinstance(assistant_wire["tool_calls"][0]["function"]["arguments"], str)
+    assert json.loads(assistant_wire["tool_calls"][0]["function"]["arguments"]) == {"q": "x"}
+    assert tool_wire["tool_call_id"] == tool_call_id
+    # THE pairing invariant: both sides carry the same id.
+    assert assistant_wire["tool_calls"][0]["id"] == tool_wire["tool_call_id"]
 
 
 # ---------------------------------------------------------------------------

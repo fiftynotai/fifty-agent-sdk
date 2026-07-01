@@ -2,8 +2,10 @@
 
 A parser converts an LLM completion string into a :data:`ParseResult` — a
 Pydantic discriminated union that is either a :class:`ThoughtAction` (the model
-chose to invoke a tool) or a :class:`FinalAnswer` (the model produced a
-terminal answer). Implementations are sync because parsing is pure-CPU work.
+chose to invoke a single tool), a :class:`MultiAction` (the model requested
+multiple tool calls in one turn, reachable only from the native-tools parser
+under BR-006), or a :class:`FinalAnswer` (the model produced a terminal
+answer). Implementations are sync because parsing is pure-CPU work.
 
 Implementations MUST raise :class:`fifty_agent_sdk.errors.ParserError` on malformed
 input. The error's ``context`` dict carries at minimum a ``parser`` name and an
@@ -63,16 +65,46 @@ class FinalAnswer(BaseModel):
     content: str
 
 
+class MultiAction(BaseModel):
+    """Parser output: the model requested MULTIPLE tool calls in one turn (BR-006).
+
+    Reachable ONLY from :class:`fifty_agent_sdk.parser.native_tools.
+    NativeToolsParser` when a provider-native response carries MORE THAN ONE
+    ``tool_calls`` entry. A single native call yields
+    :class:`ThoughtAction` (byte-identical to the pre-BR-006 path), and the
+    text/JSON parsers NEVER produce this type — so the multi-call dispatch
+    path is structurally unreachable from any text turn.
+
+    Attributes:
+        kind: Literal discriminator; always ``"multi_action"``.
+        thought: The model's reasoning that preceded the calls. Today the
+            native parser passes ``""`` (the provider's structured
+            ``tool_calls`` carries no prose-thought channel); the field exists
+            for future parsers and mirrors :class:`ThoughtAction.thought`.
+        tool_calls: The list of tool invocation requests, in CALL order
+            (the order the model emitted them). The loop dispatches them
+            concurrently and feeds observations back in THIS order regardless
+            of completion order, so replays are deterministic.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    kind: Literal["multi_action"] = "multi_action"
+    thought: str
+    tool_calls: list[ToolCall]
+
+
 ParseResult = Annotated[
-    ThoughtAction | FinalAnswer,
+    ThoughtAction | FinalAnswer | MultiAction,
     Field(discriminator="kind"),
 ]
 """Tagged union of parser outputs.
 
 The discriminator is the literal ``kind`` field. Consumers should branch on
-:func:`isinstance` against :class:`ThoughtAction` / :class:`FinalAnswer` for
-the simplest pattern match. The annotated form is suitable for use with
-:class:`pydantic.TypeAdapter` for programmatic validation / round-tripping.
+:func:`isinstance` against :class:`ThoughtAction` / :class:`FinalAnswer` /
+:class:`MultiAction` for the simplest pattern match. The annotated form is
+suitable for use with :class:`pydantic.TypeAdapter` for programmatic
+validation / round-tripping.
 """
 
 
@@ -112,6 +144,7 @@ class Parser(Protocol):
 
 __all__ = [
     "FinalAnswer",
+    "MultiAction",
     "ParseResult",
     "Parser",
     "ThoughtAction",

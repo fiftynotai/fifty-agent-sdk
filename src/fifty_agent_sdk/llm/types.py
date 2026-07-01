@@ -44,6 +44,15 @@ class ChatMessage(BaseModel):
         name: Optional name for a function/tool message or a named speaker.
         tool_call_id: Identifier echoed back on a ``role="tool"`` reply so
             the model can match it to the originating tool call.
+        tool_calls: Native (provider-structured) tool invocations carried on
+            an ``assistant`` turn. Populated by the LLM adapter when the
+            upstream provider returns structured ``tool_calls`` (OpenAI
+            function-calling); ``None`` on every text-only turn. When the
+            loop dispatches a native call, the assistant turn is replayed to
+            the provider WITH ``tool_calls`` set so the subsequent
+            ``role="tool"`` reply (keyed by ``tool_call_id``) pairs correctly.
+            An assistant turn carrying only tool calls may have
+            ``content=""``.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -52,6 +61,7 @@ class ChatMessage(BaseModel):
     content: str
     name: str | None = None
     tool_call_id: str | None = None
+    tool_calls: list[ToolCall] | None = None
 
 
 class ToolCall(BaseModel):
@@ -64,12 +74,25 @@ class ToolCall(BaseModel):
     Attributes:
         name: Name of the tool to invoke. Must match a registered tool.
         args: Arguments to pass to the tool. Defaults to an empty dict.
+        id: Optional provider-pairing key (BR-006). The ReACT loop mints a
+            per-call id for EVERY call it dispatches and embeds it on the
+            assistant turn's ``tool_calls[].id`` so the subsequent
+            ``role="tool"`` reply (keyed by ``ChatMessage.tool_call_id``)
+            pairs with the correct entry. ``None`` (the default) on a freshly
+            adapter-mapped provider response — the single-call native path
+            relies on the message-level ``tool_call_id`` instead (see
+            :meth:`fifty_agent_sdk.llm.openai_compat.OpenAICompatibleClient.
+            _serialize_message`'s fallback). The field is excluded from
+            ``model_dump(exclude_none=True)`` output when ``None``, so the
+            text/JSON request wire is byte-for-byte unchanged for every
+            pre-BR-006 caller.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     name: str
     args: dict[str, Any] = Field(default_factory=dict)
+    id: str | None = None
 
 
 class Usage(BaseModel):
@@ -103,6 +126,20 @@ class ChatRequest(BaseModel):
         response_format: Optional provider-format hint. Common values are
             ``{"type": "json_object"}`` or ``{"type": "text"}``. Adapters
             pass this through verbatim where supported.
+        tools: Optional OpenAI-style tool-declaration envelope for native
+            (provider-structured) function-calling. Each entry has the shape
+            ``{"type": "function", "function": {"name", "description",
+            "parameters": {...JSON Schema...}}}``. When set, the adapter
+            declares the tools to the provider via the ``tools`` request param
+            so the model may return native ``tool_calls``. ``None`` (the
+            default) means NO tools are declared and the request wire is
+            byte-for-byte the pre-BR-008 shape.
+        tool_choice: Optional steering for native tool-calling when
+            :attr:`tools` is set. Common values are ``"auto"`` (the default
+            the adapter emits when this is ``None``), ``"required"``,
+            ``"none"``, or a specific-tool object
+            ``{"type": "function", "function": {"name": ...}}``. Ignored when
+            :attr:`tools` is ``None``.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -112,6 +149,8 @@ class ChatRequest(BaseModel):
     temperature: float = Field(default=0.0, ge=0.0, le=2.0)
     max_tokens: int | None = Field(default=None, ge=1)
     response_format: dict[str, Any] | None = None
+    tools: list[dict[str, Any]] | None = None
+    tool_choice: str | None = None
 
 
 class ChatResponse(BaseModel):

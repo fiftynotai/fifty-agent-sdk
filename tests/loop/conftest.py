@@ -29,6 +29,7 @@ from fifty_agent_sdk.llm.types import (
     ChatRequest,
     ChatResponse,
     FinishReason,
+    ToolCall,
     Usage,
 )
 from fifty_agent_sdk.tools.protocol import ToolResult, ToolSchema
@@ -89,6 +90,30 @@ def make_response(content: str, finish_reason: FinishReason = "stop") -> ChatRes
         message=ChatMessage(role="assistant", content=content),
         usage=Usage(prompt_tokens=0, completion_tokens=0, total_tokens=0),
         finish_reason=finish_reason,
+    )
+
+
+def make_multi_tool_response(
+    calls: list[tuple[str, dict[str, Any]]],
+    *,
+    content: str = "",
+) -> ChatResponse:
+    """Build a non-streaming ChatResponse carrying N native tool_calls entries.
+
+    Mirrors :func:`make_response` but populates ``message.tool_calls`` with one
+    :class:`~fifty_agent_sdk.llm.types.ToolCall` per ``(name, args)`` tuple, in
+    the given (CALL) order. Used by the BR-006 multi-call dispatch tests to
+    model a provider-native function-calling reply that requests several tools
+    in a single turn.
+    """
+    return ChatResponse(
+        message=ChatMessage(
+            role="assistant",
+            content=content,
+            tool_calls=[ToolCall(name=name, args=dict(args)) for name, args in calls],
+        ),
+        usage=Usage(prompt_tokens=0, completion_tokens=0, total_tokens=0),
+        finish_reason="tool_calls",
     )
 
 
@@ -199,6 +224,7 @@ __all__ = [
     "DriftsOnceFakeLLM",
     "FakeLLMClient",
     "FakeTool",
+    "make_multi_tool_response",
     "make_response",
     "make_stream_chunks",
 ]
