@@ -33,7 +33,7 @@ dependencies = [
     # this is a core dependency, not an optional extra. Floor pinned at the
     # probed 1.27.0; <2.0.0 ceiling because FastMCP/transport surfaces drift
     # across minors (re-probe the live API before coding against new minors).
-    "mcp>=1.27.0,<2.0.0",
+    "mcp>=1.27.0,<3.0.0",
 ]
 
 [project.urls]
