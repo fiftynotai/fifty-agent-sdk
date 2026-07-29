@@ -133,11 +133,12 @@ an mcp client over streamable http, adapted into the same registry the in-proc t
 def screen(message: str, content: list[dict]) -> str:
     # `message` is the sdk's bounded default; `content` is the server's raw
     # error blocks (read-only). return the string the model should see.
-    if any("PII" in str(block) for block in content):   # your own predicate
+    if any("PII" in str(block) for block in content):  # your own predicate
         return "the upstream tool failed"
     return message
 
-client   = MCPClient(MCPClientConfig(base_url=...), auth=..., on_tool_error=screen)
+
+client = MCPClient(MCPClientConfig(base_url=...), auth=..., on_tool_error=screen)
 provider = MCPProvider(client)
 await provider.attach(registry)
 ```
@@ -207,7 +208,7 @@ editing a turn is a consumer-side fork-then-append, and the original line stays 
 # Edit a turn = fork the history before it, switch onto the new branch, then
 # append the edited message. `store` is any StateStore; import `ChatMessage`
 # from fifty_agent_sdk.
-branch = await store.fork(session_id, from_sequence=4)   # keep messages 1..4
+branch = await store.fork(session_id, from_sequence=4)  # keep messages 1..4
 await store.switch_branch(session_id, branch)
 await store.append(session_id, ChatMessage(role="user", content="...edited..."))
 await store.get_messages(session_id, branch_id="trunk")  # original line intact
