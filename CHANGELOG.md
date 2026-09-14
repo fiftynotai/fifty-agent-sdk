@@ -6,6 +6,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.6.0] - 2026-09-14
+
 ### Added
 - `OpenAICompatibleClient` gains `aclose()` and async context-manager support,
   so the underlying httpx client can be disposed deterministically.
