@@ -25,11 +25,13 @@ Branching model
     (:data:`fifty_agent_sdk.state.protocol.TRUNK_BRANCH_ID`).
 
 Memory characteristics
-    Unbounded: every unique ``session_id`` ever seen retains a (small)
-    lock entry until explicitly :meth:`MemoryStateStore.delete`'d. For
-    long-running processes with many sessions, use a durable backend
-    (BR-009 SQL / BR-010 Redis) which scopes locking to the backend
-    layer. Callers may also periodically :meth:`delete` stale sessions.
+    Sessions are bounded by default: inactive sessions expire after one
+    hour and the least-recently-used idle sessions are evicted above 1,000
+    live sessions. Retention is whole-session, including every branch, and
+    cleanup is lazy at operation boundaries. Reads refresh inactivity. Use
+    ``MemoryStateStore(ttl_seconds=None, max_sessions=None)`` only when the
+    former unbounded process-local behavior is intentional, or use a durable
+    backend (BR-009 SQL / BR-010 Redis) when state must survive process exit.
 
 :meth:`get_messages` returns a freshly-built list, so callers mutating it
 cannot affect future reads.
@@ -38,28 +40,30 @@ cannot affect future reads.
 from __future__ import annotations
 
 import asyncio
+import math
+import time
 import uuid
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Final
 
-import structlog
-
 from fifty_agent_sdk.llm.types import ChatMessage
 from fifty_agent_sdk.state.protocol import TRUNK_BRANCH_ID, BranchInfo
 
-_log: Final = structlog.get_logger(__name__)
-"""Module-level structured logger.
-
-Currently no events are emitted from the in-memory store (all operations
-are O(1)/O(history) in-process ops and not worth log noise). Reserved for
-future use if a TTL or eviction policy lands.
-"""
+_DEFAULT_TTL_SECONDS: Final = 3600.0
+_DEFAULT_MAX_SESSIONS: Final = 1_000
 
 
 def _now() -> datetime:
     """Return the current timezone-aware UTC time (branch creation stamp)."""
     return datetime.now(UTC)
+
+
+def _monotonic() -> float:
+    """Return monotonic seconds for inactivity and LRU bookkeeping."""
+    return time.monotonic()
 
 
 @dataclass
@@ -78,15 +82,29 @@ class _Session:
 
     active_branch_id: str
     created_at: datetime
+    last_activity: float
+    access_ordinal: int
     branches: dict[str, _Branch] = field(default_factory=dict)
 
 
 class MemoryStateStore:
-    """Pure in-memory implementation of :class:`StateStore` with branching.
+    """Bounded in-memory implementation of :class:`StateStore` with branching.
 
     Satisfies :class:`fifty_agent_sdk.state.protocol.StateStore` structurally
     (no explicit inheritance needed thanks to ``@runtime_checkable``).
-    Thread- and asyncio-safe per session via :class:`asyncio.Lock`.
+    Asyncio-safe per session via :class:`asyncio.Lock`.
+
+    By default, a whole session expires after 3,600 seconds of inactivity and
+    the store retains at most 1,000 sessions, evicting the least recently used
+    idle session first. Every successful operation on an existing session,
+    including a read, refreshes activity. Cleanup is lazy at operation
+    boundaries; no background task is created. Sessions with active or queued
+    operations are protected, so the cap may be exceeded transiently until an
+    operation boundary makes an idle victim available.
+
+    Disable either policy independently with ``None``. Construct with
+    ``MemoryStateStore(ttl_seconds=None, max_sessions=None)`` for the former
+    unbounded process-local behavior. This backend is never durable.
 
     Failure model:
         Dict operations have no plausible backend failure mode, so this
@@ -96,18 +114,64 @@ class MemoryStateStore:
         :class:`ValueError` per the protocol.
     """
 
-    def __init__(self) -> None:
-        """Construct an empty in-memory store."""
+    def __init__(
+        self,
+        *,
+        ttl_seconds: float | None = _DEFAULT_TTL_SECONDS,
+        max_sessions: int | None = _DEFAULT_MAX_SESSIONS,
+    ) -> None:
+        """Construct an empty store with validated retention policy.
+
+        Args:
+            ttl_seconds: Positive finite inactivity window, or ``None`` to
+                disable time-based expiration.
+            max_sessions: Positive whole-session LRU cap, or ``None`` to
+                disable capacity eviction.
+
+        Raises:
+            TypeError: A value has the wrong type.
+            ValueError: A numeric value is not finite and strictly positive.
+        """
+        self._ttl_seconds = self._validate_ttl_seconds(ttl_seconds)
+        self._max_sessions = self._validate_max_sessions(max_sessions)
         self._sessions: dict[str, _Session] = {}
         self._locks: dict[str, asyncio.Lock] = {}
+        self._reservations: dict[str, int] = {}
         self._registry_lock = asyncio.Lock()
+        self._access_counter = 0
+
+    @staticmethod
+    def _validate_ttl_seconds(ttl_seconds: float | None) -> float | None:
+        """Validate and normalize the inactivity window."""
+        if ttl_seconds is None:
+            return None
+        if isinstance(ttl_seconds, bool) or not isinstance(ttl_seconds, (int, float)):
+            raise TypeError("ttl_seconds must be a finite positive int or float, or None")
+        try:
+            normalized = float(ttl_seconds)
+        except OverflowError as exc:
+            raise ValueError("ttl_seconds must be finite and strictly greater than zero") from exc
+        if not math.isfinite(normalized) or normalized <= 0:
+            raise ValueError("ttl_seconds must be finite and strictly greater than zero")
+        return normalized
+
+    @staticmethod
+    def _validate_max_sessions(max_sessions: int | None) -> int | None:
+        """Validate the whole-session capacity."""
+        if max_sessions is None:
+            return None
+        if isinstance(max_sessions, bool) or not isinstance(max_sessions, int):
+            raise TypeError("max_sessions must be a positive int or None")
+        if max_sessions <= 0:
+            raise ValueError("max_sessions must be strictly greater than zero")
+        return max_sessions
 
     async def _get_lock(self, session_id: str) -> asyncio.Lock:
-        """Return the per-session lock, creating it if necessary.
+        """Return the per-session lock identity, creating it if necessary.
 
-        Hot path: an already-existing lock is returned without acquiring
-        ``self._registry_lock``. Cold path: under the registry lock we
-        re-check existence (double-checked locking) and create if absent.
+        Public operations use :meth:`_session_guard`, which reserves the lock
+        before awaiting it. This identity helper remains for focused tests and
+        diagnostics; callers must not use it as an operation guard.
         """
         existing = self._locks.get(session_id)
         if existing is not None:
@@ -119,6 +183,102 @@ class MemoryStateStore:
             lock = asyncio.Lock()
             self._locks[session_id] = lock
             return lock
+
+    @asynccontextmanager
+    async def _session_guard(self, session_id: str) -> AsyncIterator[None]:
+        """Reserve and acquire one session lock, then perform lazy cleanup.
+
+        Reservations include both active holders and queued waiters. Eviction
+        can therefore never remove a lock after an operation has captured its
+        identity but before that operation acquires it.
+        """
+        async with self._registry_lock:
+            lock = self._locks.get(session_id)
+            if lock is None:
+                lock = asyncio.Lock()
+                self._locks[session_id] = lock
+            self._reservations[session_id] = self._reservations.get(session_id, 0) + 1
+
+        acquired = False
+        try:
+            await lock.acquire()
+            acquired = True
+            yield
+        finally:
+            if acquired:
+                lock.release()
+            async with self._registry_lock:
+                reservations = self._reservations[session_id] - 1
+                if reservations:
+                    self._reservations[session_id] = reservations
+                else:
+                    self._reservations.pop(session_id, None)
+                self._evict_idle_sessions(_monotonic())
+
+    def _is_expired(self, session: _Session, now: float) -> bool:
+        """Return whether ``session`` reached the inactivity boundary."""
+        return self._ttl_seconds is not None and now - session.last_activity >= self._ttl_seconds
+
+    def _expire_current_session(self, session_id: str, now: float) -> _Session | None:
+        """Return a live session, dropping expired data under its own lock."""
+        session = self._sessions.get(session_id)
+        if session is not None and self._is_expired(session, now):
+            self._sessions.pop(session_id)
+            return None
+        return session
+
+    def _touch(self, session: _Session) -> None:
+        """Refresh inactivity and deterministic LRU metadata."""
+        self._access_counter += 1
+        session.last_activity = _monotonic()
+        session.access_ordinal = self._access_counter
+
+    def _is_evictable(self, session_id: str) -> bool:
+        """Return whether no active or queued operation protects a session."""
+        lock = self._locks.get(session_id)
+        return self._reservations.get(session_id, 0) == 0 and (lock is None or not lock.locked())
+
+    def _drop_session(self, session_id: str) -> None:
+        """Remove one idle session and all of its lock bookkeeping."""
+        self._sessions.pop(session_id, None)
+        self._locks.pop(session_id, None)
+        self._reservations.pop(session_id, None)
+
+    def _evict_idle_sessions(self, now: float) -> None:
+        """Expire inactive sessions and enforce LRU capacity.
+
+        Called only while ``self._registry_lock`` is held and only after the
+        current operation released its per-session lock. It never waits for a
+        protected session; a later operation boundary retries cleanup.
+        """
+        expired = [
+            session_id
+            for session_id, session in self._sessions.items()
+            if self._is_expired(session, now) and self._is_evictable(session_id)
+        ]
+        for session_id in expired:
+            self._drop_session(session_id)
+
+        if self._max_sessions is not None and len(self._sessions) > self._max_sessions:
+            candidates = sorted(
+                (
+                    (session.last_activity, session.access_ordinal, session_id)
+                    for session_id, session in self._sessions.items()
+                    if self._is_evictable(session_id)
+                ),
+            )
+            overflow = len(self._sessions) - self._max_sessions
+            for _, _, session_id in candidates[:overflow]:
+                self._drop_session(session_id)
+
+        orphaned_locks = [
+            session_id
+            for session_id in self._locks
+            if session_id not in self._sessions and self._is_evictable(session_id)
+        ]
+        for session_id in orphaned_locks:
+            self._locks.pop(session_id, None)
+            self._reservations.pop(session_id, None)
 
     @staticmethod
     def _materialize(session: _Session, branch_id: str) -> list[ChatMessage]:
@@ -177,6 +337,8 @@ class MemoryStateStore:
             session = _Session(
                 active_branch_id=TRUNK_BRANCH_ID,
                 created_at=now,
+                last_activity=_monotonic(),
+                access_ordinal=0,
                 branches={TRUNK_BRANCH_ID: _Branch(None, None, now)},
             )
             self._sessions[session_id] = session
@@ -191,9 +353,8 @@ class MemoryStateStore:
         ``branch_id=None`` yields ``[]``; an explicit unknown ``branch_id``
         raises :class:`ValueError`.
         """
-        lock = await self._get_lock(session_id)
-        async with lock:
-            session = self._sessions.get(session_id)
+        async with self._session_guard(session_id):
+            session = self._expire_current_session(session_id, _monotonic())
             if session is None:
                 if branch_id is not None:
                     raise ValueError(
@@ -203,29 +364,30 @@ class MemoryStateStore:
             target = branch_id if branch_id is not None else session.active_branch_id
             if target not in session.branches:
                 raise ValueError(f"branch_id={target!r} does not exist for session {session_id!r}")
-            return self._materialize(session, target)
+            messages = self._materialize(session, target)
+            self._touch(session)
+            return messages
 
     async def append(self, session_id: str, message: ChatMessage) -> None:
         """Append ``message`` to the session's active branch.
 
         Creates the session (on an empty ``"trunk"``) if it is new.
         """
-        lock = await self._get_lock(session_id)
-        async with lock:
+        async with self._session_guard(session_id):
+            self._expire_current_session(session_id, _monotonic())
             session = self._ensure_session(session_id)
             session.branches[session.active_branch_id].messages.append(message)
+            self._touch(session)
 
     async def delete(self, session_id: str) -> None:
         """Remove all persisted state for ``session_id`` (every branch).
 
-        Idempotent. Holds ONLY the registry lock (not the per-session lock)
-        so it cannot deadlock with an in-flight op on the same session; the
-        resulting "last write wins on data, best-effort lock eviction" race
-        is acceptable for ephemeral in-memory state.
+        Idempotent. Serializes with every operation on the same session via the
+        reservation-aware session guard. Data and lock bookkeeping are removed
+        together when the guard exits.
         """
-        async with self._registry_lock:
+        async with self._session_guard(session_id):
             self._sessions.pop(session_id, None)
-            self._locks.pop(session_id, None)
 
     async def fork(self, session_id: str, from_sequence: int) -> str:
         """Fork the active branch at ``from_sequence`` into a new branch.
@@ -234,9 +396,8 @@ class MemoryStateStore:
         ``from_sequence``; the original branch is untouched. Does NOT switch
         the active head.
         """
-        lock = await self._get_lock(session_id)
-        async with lock:
-            session = self._sessions.get(session_id)
+        async with self._session_guard(session_id):
+            session = self._expire_current_session(session_id, _monotonic())
             if session is None:
                 raise ValueError(f"cannot fork unknown session {session_id!r}")
             active = session.active_branch_id
@@ -252,13 +413,13 @@ class MemoryStateStore:
                 forked_from_sequence=from_sequence,
                 created_at=_now(),
             )
+            self._touch(session)
             return new_id
 
     async def list_branches(self, session_id: str) -> list[BranchInfo]:
         """Enumerate all branches of ``session_id`` (trunk first, then by age)."""
-        lock = await self._get_lock(session_id)
-        async with lock:
-            session = self._sessions.get(session_id)
+        async with self._session_guard(session_id):
+            session = self._expire_current_session(session_id, _monotonic())
             if session is None:
                 return []
 
@@ -267,7 +428,7 @@ class MemoryStateStore:
                 # Trunk first, then by creation time, then id for determinism.
                 return (0 if bid == TRUNK_BRANCH_ID else 1, branch.created_at, bid)
 
-            return [
+            branches = [
                 BranchInfo(
                     branch_id=bid,
                     parent_branch_id=branch.parent_branch_id,
@@ -278,17 +439,19 @@ class MemoryStateStore:
                 )
                 for bid, branch in sorted(session.branches.items(), key=sort_key)
             ]
+            self._touch(session)
+            return branches
 
     async def switch_branch(self, session_id: str, branch_id: str) -> None:
         """Set the session's active head to ``branch_id``."""
-        lock = await self._get_lock(session_id)
-        async with lock:
-            session = self._sessions.get(session_id)
+        async with self._session_guard(session_id):
+            session = self._expire_current_session(session_id, _monotonic())
             if session is None or branch_id not in session.branches:
                 raise ValueError(
                     f"branch_id={branch_id!r} does not exist for session {session_id!r}"
                 )
             session.active_branch_id = branch_id
+            self._touch(session)
 
     async def truncate_after(
         self, session_id: str, sequence: int, *, branch_id: str | None = None
@@ -299,14 +462,14 @@ class MemoryStateStore:
         Only the branch's own messages are removed — a fork's inherited prefix
         is never touched. Idempotent; a no-op on an unknown session or branch.
         """
-        lock = await self._get_lock(session_id)
-        async with lock:
-            session = self._sessions.get(session_id)
+        async with self._session_guard(session_id):
+            session = self._expire_current_session(session_id, _monotonic())
             if session is None:
                 return
             target = branch_id if branch_id is not None else session.active_branch_id
             branch = session.branches.get(target)
             if branch is None:
+                self._touch(session)
                 return
             anchor = branch.forked_from_sequence or 0
             # Own message at index i has materialized sequence anchor + 1 + i;
@@ -314,6 +477,7 @@ class MemoryStateStore:
             # rest. Slicing clamps naturally for out-of-range N.
             keep = sequence - anchor
             del branch.messages[max(keep, 0) :]
+            self._touch(session)
 
 
 __all__ = ["MemoryStateStore"]

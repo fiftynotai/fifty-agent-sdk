@@ -571,7 +571,7 @@ class SqlStateStore:
         # within this process. The DB-level row lock
         # (`SELECT ... FOR UPDATE`) is still the cross-process correctness
         # mechanism on Postgres; the in-process lock is an additional
-        # guarantee that mirrors :class:`MemoryStateStore` and avoids
+        # guarantee that complements the DB row lock and avoids
         # relying on `with_for_update` being honoured (which it is not on
         # SQLite). Different sessions never block each other.
         self._session_locks: dict[str, asyncio.Lock] = {}
@@ -580,9 +580,10 @@ class SqlStateStore:
     async def _get_session_lock(self, session_id: str) -> asyncio.Lock:
         """Return the per-session :class:`asyncio.Lock`, creating it lazily.
 
-        Same double-checked-locking pattern as
-        :class:`MemoryStateStore` — the hot path is lock-free; only
-        first-time creation takes the registry lock.
+        The hot path is lock-free; first-time creation uses this SQL store's
+        own double-checked registry lock. Its locks live for the store's
+        lifetime because durable rows, unlike MemoryStateStore sessions, are
+        not subject to process-local TTL/LRU eviction.
 
         Args:
             session_id: Opaque session identifier.

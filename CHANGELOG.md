@@ -6,6 +6,15 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.6.1] - 2026-09-14
+
+### Changed
+- **Source-compatible in-memory retention change:** `MemoryStateStore()` now lazily expires
+  whole sessions after 3,600 seconds of inactivity and applies a 1,000-session LRU cap.
+  Reads refresh inactivity; active and queued session operations are never evicted. Callers
+  that intentionally require the former unbounded process-local behavior can construct
+  `MemoryStateStore(ttl_seconds=None, max_sessions=None)`. (BR-012)
+
 ## [1.6.0] - 2026-09-14
 
 ### Added
