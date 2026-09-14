@@ -6,6 +6,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.6.1] - 2026-09-14
+
 ### Changed
 - **Source-compatible in-memory retention change:** `MemoryStateStore()` now lazily expires
   whole sessions after 3,600 seconds of inactivity and applies a 1,000-session LRU cap.
