@@ -82,6 +82,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   fan-out from exhausting memory; MCP fallback logs contain only stable
   reason/type metadata, never remote schema text. (BR-016)
 
+### Changed
+- Release tag validation now reads the package version through `tomllib`, with
+  executable matching- and mismatched-tag regression coverage.
+
 ## [1.5.0] - 2026-07-30
 
 ### Added
