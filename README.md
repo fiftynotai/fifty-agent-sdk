@@ -111,7 +111,7 @@ the llm client. a protocol plus an openai-compatible adapter, so the loop talks 
 
 ### state
 
-the state stores. where conversation state persists between turns, with branching built in: fork a session, switch between branches, truncate back to an earlier point. `MemoryStateStore` needs no infrastructure; `SqlStateStore` and `RedisStateStore` are durable backends behind the extras.
+the state stores. where conversation state persists between turns, with branching built in: fork a session, switch between branches, truncate back to an earlier point. `MemoryStateStore` needs no infrastructure, but it is process-local and non-durable: by default it lazily expires whole sessions when monotonic inactivity reaches 3,600 seconds and retains at most 1,000 sessions using LRU eviction. successful reads refresh inactivity. `SqlStateStore` and `RedisStateStore` are durable backends behind the extras.
 
 a runner hands back the store it was built with as `runner.state`, so the branching calls above are reachable from a runner you already have:
 
@@ -122,6 +122,14 @@ runner = AgentRunner(loop=..., state=store)
 runner.state is store  # True — the exact instance, never a copy or a wrapper
 branch = await runner.state.fork(session_id, from_sequence=4)
 ```
+
+configure either in-memory bound independently when an ephemeral workload needs different limits:
+
+```python
+store = MemoryStateStore(ttl_seconds=900, max_sessions=250)
+```
+
+the former unbounded behavior remains available as an explicit opt-in with `MemoryStateStore(ttl_seconds=None, max_sessions=None)`. prefer a durable backend instead when conversation state must survive process restarts.
 
 identity is the point rather than convenience: a second store constructed over the same engine carries its own lock registry, so two writers could interleave on one session. sharing `runner.state` shares the serialization too.
 
