@@ -147,6 +147,9 @@ class ChatRequest(BaseModel):
             ``0.0`` (NOT ``None``) so existing callers' wire behavior is
             unchanged: the key is sent unless explicitly set to ``None``.
         max_tokens: Optional cap on completion tokens. Must be ``>= 1`` if set.
+            :class:`~fifty_agent_sdk.llm.openai_compat.OpenAICompatibleClient`
+            sends it as ``max_completion_tokens`` for models that reject
+            ``max_tokens`` (see its ``max_tokens_param`` option).
         response_format: Optional provider-format hint. Common values are
             ``{"type": "json_object"}`` or ``{"type": "text"}``. Adapters
             pass this through verbatim where supported.

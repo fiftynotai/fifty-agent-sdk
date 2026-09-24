@@ -107,7 +107,7 @@ the registry of functions the agent can call. each tool is a side-effecting acti
 
 ### llm
 
-the llm client. a protocol plus an openai-compatible adapter, so the loop talks to any chat-completions endpoint by changing one base_url.
+the llm client. a protocol plus an openai-compatible adapter, so the loop talks to any chat-completions endpoint by changing one base_url. a `max_tokens` cap is sent as `max_completion_tokens` for gpt-5.x and o-series models, which reject `max_tokens`; `max_tokens_param=` overrides that choice per client.
 
 ### state
 

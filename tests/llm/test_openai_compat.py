@@ -255,6 +255,136 @@ async def test_build_body_omits_temperature_when_none(httpx_mock: HTTPXMock) -> 
     assert "temperature" not in body
 
 
+def _sent_body(httpx_mock: HTTPXMock) -> dict[str, Any]:
+    raw = httpx_mock.get_request()
+    assert raw is not None
+    body: dict[str, Any] = json.loads(raw.read())
+    return body
+
+
+@pytest.mark.parametrize(
+    "model",
+    ["gpt-4o", "gpt-4.1-mini", "gpt-3.5-turbo", "llama-3.1-70b", "gemini-2.5-pro", "gpt-50"],
+)
+async def test_build_body_sends_max_tokens_for_legacy_models(
+    httpx_mock: HTTPXMock, model: str
+) -> None:
+    """Models that accept ``max_tokens`` keep the pre-existing wire shape."""
+    httpx_mock.add_response(method="POST", url=ENDPOINT, json=_canonical_response())
+    client = _make_client()
+    await client.complete(_basic_request(model=model, max_tokens=64))
+    body = _sent_body(httpx_mock)
+    assert body["max_tokens"] == 64
+    assert "max_completion_tokens" not in body
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        "gpt-5",
+        "gpt-5.1",
+        "gpt-5-mini",
+        "GPT-5.1",
+        "openai/gpt-5.1",
+        "o1",
+        "o3-mini",
+        "o4-mini",
+        "ft:o4-mini:org::abc",
+    ],
+)
+async def test_build_body_sends_max_completion_tokens_for_reasoning_models(
+    httpx_mock: HTTPXMock, model: str
+) -> None:
+    """gpt-5.x / o-series reject ``max_tokens`` with HTTP 400; send the successor key."""
+    httpx_mock.add_response(method="POST", url=ENDPOINT, json=_canonical_response())
+    client = _make_client()
+    await client.complete(_basic_request(model=model, max_tokens=64))
+    body = _sent_body(httpx_mock)
+    assert body["max_completion_tokens"] == 64
+    assert "max_tokens" not in body
+
+
+async def test_build_body_reasoning_model_uses_client_default_model(
+    httpx_mock: HTTPXMock,
+) -> None:
+    """The rule applies to the resolved model, including the client default."""
+    httpx_mock.add_response(method="POST", url=ENDPOINT, json=_canonical_response())
+    client = _make_client(model="gpt-5.1")
+    req = ChatRequest.model_construct(
+        messages=[ChatMessage(role="user", content="hi")],
+        model="",
+        temperature=0.0,
+        max_tokens=32,
+        response_format=None,
+        tools=None,
+        tool_choice=None,
+    )
+    await client.complete(req)
+    body = _sent_body(httpx_mock)
+    assert body["model"] == "gpt-5.1"
+    assert body["max_completion_tokens"] == 32
+    assert "max_tokens" not in body
+
+
+async def test_build_body_reasoning_model_stream_uses_max_completion_tokens(
+    httpx_mock: HTTPXMock,
+) -> None:
+    sse = _sse(_chunk(delta_content="hi", finish_reason="stop", model="gpt-5.1")) + (
+        b"data: [DONE]\n\n"
+    )
+    httpx_mock.add_response(method="POST", url=ENDPOINT, content=sse)
+    client = _make_client()
+    async for _ in client.stream(_basic_request(model="gpt-5.1", max_tokens=16)):
+        pass
+    body = _sent_body(httpx_mock)
+    assert body["stream"] is True
+    assert body["max_completion_tokens"] == 16
+    assert "max_tokens" not in body
+
+
+async def test_build_body_reasoning_model_omits_both_keys_when_unset(
+    httpx_mock: HTTPXMock,
+) -> None:
+    httpx_mock.add_response(method="POST", url=ENDPOINT, json=_canonical_response())
+    client = _make_client()
+    await client.complete(_basic_request(model="gpt-5.1"))
+    body = _sent_body(httpx_mock)
+    assert "max_tokens" not in body
+    assert "max_completion_tokens" not in body
+
+
+@pytest.mark.parametrize(
+    "param,model",
+    [
+        # Forcing the successor key for a model the rule cannot recognize
+        # (an Azure-style deployment name).
+        ("max_completion_tokens", "my-reasoning-deployment"),
+        # Forcing the legacy key for a gateway that only understands it.
+        ("max_tokens", "gpt-5.1"),
+    ],
+)
+async def test_max_tokens_param_option_overrides_model_rule(
+    httpx_mock: HTTPXMock, param: str, model: str
+) -> None:
+    httpx_mock.add_response(method="POST", url=ENDPOINT, json=_canonical_response())
+    client = OpenAICompatibleClient(
+        api_key="test-key",
+        base_url=BASE_URL,
+        max_retries=0,
+        max_tokens_param=param,  # type: ignore[arg-type]
+    )
+    await client.complete(_basic_request(model=model, max_tokens=64))
+    body = _sent_body(httpx_mock)
+    other = "max_tokens" if param == "max_completion_tokens" else "max_completion_tokens"
+    assert body[param] == 64
+    assert other not in body
+
+
+def test_max_tokens_param_rejects_unknown_value() -> None:
+    with pytest.raises(ValueError, match="max_tokens_param"):
+        OpenAICompatibleClient(api_key="test-key", max_tokens_param="max_output_tokens")  # type: ignore[arg-type]
+
+
 @pytest.mark.parametrize(
     "upstream,expected",
     [
