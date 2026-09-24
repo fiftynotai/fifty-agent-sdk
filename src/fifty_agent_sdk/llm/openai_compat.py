@@ -13,9 +13,10 @@ at the public method boundary, in line with the
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import AsyncIterator
 from types import TracebackType
-from typing import Any
+from typing import Any, Literal, get_args
 
 import httpx
 from openai import (
@@ -51,6 +52,20 @@ _FINISH_REASON_MAP: dict[str, FinishReason] = {
 _MAX_TOOL_CALL_ARG_EXCERPT: int = 200
 """Maximum length of ``arguments_excerpt`` in the malformed-arguments context."""
 
+_MaxTokensParam = Literal["max_tokens", "max_completion_tokens"]
+"""Request-body key that carries :attr:`ChatRequest.max_tokens` on the wire."""
+
+# OpenAI's reasoning-model families (o1 / o3 / o4 and gpt-5.x) reject
+# ``max_tokens`` with HTTP 400 ("Unsupported parameter ... Use
+# 'max_completion_tokens' instead"), including when served through
+# OpenAI-compatible gateways. Matches the bare family name or a family name
+# followed by a non-alphanumeric suffix (``gpt-5.1``, ``o3-mini``), optionally
+# behind a routing/fine-tune prefix (``openai/gpt-5``, ``ft:o4-mini:...``).
+_MAX_COMPLETION_TOKENS_MODEL_RE = re.compile(
+    r"^(?:.*[/:])?(?:gpt-5|o[134])(?![0-9a-z])",
+    re.IGNORECASE,
+)
+
 
 class OpenAICompatibleClient:
     """:class:`LLMClient` implementation backed by the ``openai`` Python SDK.
@@ -84,6 +99,17 @@ class OpenAICompatibleClient:
             :meth:`aclose` — its lifecycle belongs to the caller. This
             owned-vs-injected discipline mirrors
             :class:`fifty_agent_sdk.mcp.client.MCPClient`.
+        max_tokens_param: Which request-body key carries
+            :attr:`ChatRequest.max_tokens`. ``None`` (the default) picks per
+            request from the model name: ``"max_completion_tokens"`` for
+            OpenAI reasoning-model families (``o1`` / ``o3`` / ``o4`` /
+            ``gpt-5*``, which reject ``max_tokens``), ``"max_tokens"`` for
+            everything else. Set it explicitly when the model name does not
+            reveal the family — e.g. an Azure deployment name — or to force
+            ``"max_tokens"`` for a server that does not understand
+            ``max_completion_tokens``. Has no effect when ``max_tokens`` is
+            unset. On reasoning models the cap includes reasoning tokens, so
+            a small cap can exhaust the budget before any visible output.
     """
 
     def __init__(
@@ -95,7 +121,13 @@ class OpenAICompatibleClient:
         timeout: float = 60.0,
         max_retries: int = 2,
         http_client: httpx.AsyncClient | None = None,
+        max_tokens_param: _MaxTokensParam | None = None,
     ) -> None:
+        if max_tokens_param is not None and max_tokens_param not in get_args(_MaxTokensParam):
+            raise ValueError(
+                f"max_tokens_param must be one of {get_args(_MaxTokensParam)} or None; "
+                f"got {max_tokens_param!r}"
+            )
         kwargs: dict[str, Any] = {
             "api_key": api_key,
             "timeout": timeout,
@@ -107,6 +139,7 @@ class OpenAICompatibleClient:
             kwargs["http_client"] = http_client
         self._client = AsyncOpenAI(**kwargs)
         self._default_model = model
+        self._max_tokens_param = max_tokens_param
         # Ownership discipline mirrors MCPClient: an injected http_client is
         # the caller's to close; only the client built here is closed by
         # aclose(). (`AsyncOpenAI.close()` closes the underlying httpx client
@@ -321,24 +354,35 @@ class OpenAICompatibleClient:
             }
         return msg.model_dump(exclude_none=True)
 
-    @classmethod
-    def _build_body(cls, request: ChatRequest, *, model: str, stream: bool) -> dict[str, Any]:
+    def _max_tokens_key(self, model: str) -> _MaxTokensParam:
+        """Resolve the body key for ``max_tokens`` (see ``max_tokens_param``)."""
+        if self._max_tokens_param is not None:
+            return self._max_tokens_param
+        if _MAX_COMPLETION_TOKENS_MODEL_RE.match(model):
+            return "max_completion_tokens"
+        return "max_tokens"
+
+    def _build_body(self, request: ChatRequest, *, model: str, stream: bool) -> dict[str, Any]:
         """Build the kwargs passed to ``client.chat.completions.create``.
 
         ``temperature`` is omitted entirely when :attr:`ChatRequest.temperature`
         is ``None`` (the opt-out for providers that reject a non-default
         temperature); at the ``0.0`` default it is sent, preserving the
         pre-existing wire shape for every caller that does not opt out.
+
+        :attr:`ChatRequest.max_tokens` is sent under the key chosen by
+        :meth:`_max_tokens_key` — ``max_tokens`` unless the client option or
+        the model-name rule selects ``max_completion_tokens``.
         """
         body: dict[str, Any] = {
             "model": model,
-            "messages": [cls._serialize_message(m) for m in request.messages],
+            "messages": [self._serialize_message(m) for m in request.messages],
             "stream": stream,
         }
         if request.temperature is not None:
             body["temperature"] = request.temperature
         if request.max_tokens is not None:
-            body["max_tokens"] = request.max_tokens
+            body[self._max_tokens_key(model)] = request.max_tokens
         if request.response_format is not None:
             body["response_format"] = request.response_format
         if request.tools is not None:

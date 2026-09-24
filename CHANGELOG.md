@@ -6,6 +6,24 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.7.0] - 2026-09-25
+
+### Added
+- `OpenAICompatibleClient(max_tokens_param=...)` chooses the request-body key that carries
+  `ChatRequest.max_tokens`: `"max_tokens"` or `"max_completion_tokens"`. The default,
+  `None`, picks the key from the model name (see Fixed). Set it explicitly when the model
+  name does not reveal the family (for example an Azure deployment name), or to force
+  `"max_tokens"` for a gateway that does not understand `max_completion_tokens`.
+
+### Fixed
+- `OpenAICompatibleClient` now sends `ChatRequest.max_tokens` as `max_completion_tokens`
+  for OpenAI reasoning-model families (`gpt-5*`, `o1`, `o3`, `o4`, including behind
+  a `provider/` or `ft:` prefix). Before this change it always sent `max_tokens`, which
+  these models reject with HTTP 400 ("Unsupported parameter: 'max_tokens' ... Use
+  'max_completion_tokens' instead"), including through OpenAI-compatible gateways. Every
+  other model keeps the `max_tokens` wire shape. On reasoning models the cap also counts
+  reasoning tokens, so a small cap can use up the budget before any visible output.
+
 ## [1.6.1] - 2026-09-14
 
 ### Changed
