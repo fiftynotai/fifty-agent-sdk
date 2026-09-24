@@ -6,6 +6,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.7.0] - 2026-09-25
+
 ### Added
 - `OpenAICompatibleClient(max_tokens_param=...)` chooses the request-body key that carries
   `ChatRequest.max_tokens`: `"max_tokens"` or `"max_completion_tokens"`. The default,
