@@ -43,15 +43,14 @@ import asyncio
 from typing import Any
 
 from fifty_agent_sdk import (
-    JSON_MODE_OUTPUT_FORMAT,
     AgentLoop,
     AgentRunner,
-    JsonModeParser,
     MemoryStateStore,
     OpenAICompatibleClient,
     PromptSections,
     Registry,
     SafetyConfig,
+    ToolMode,
     tool,
 )
 
@@ -71,17 +70,17 @@ async def main() -> None:
     registry = Registry()
     registry.register(get_weather)
 
-    # 3. The ReACT loop — LLM + registry + parser + prompts + safety.
-    #    `output_format` shows the model the JSON envelope the parser
-    #    expects; without it JsonModeParser raises ParserError on every turn.
+    # 3. The ReACT loop — LLM + registry + prompts + safety + tool mode.
+    #    `tool_mode` picks how the model calls tools. ToolMode.JSON supplies
+    #    the JSON parser and teaches the model its envelope; switch to
+    #    ToolMode.NATIVE for provider function calling (see "tool modes").
     loop = AgentLoop(
         llm=llm,
         registry=registry,
-        parser=JsonModeParser(),
         prompts=PromptSections(persona="You are helpful."),
         safety=SafetyConfig(),
         model="gpt-4o",
-        output_format=JSON_MODE_OUTPUT_FORMAT,
+        tool_mode=ToolMode.JSON,
     )
 
     # 4. The runner — wraps the loop with conversation-state persistence.
@@ -104,6 +103,32 @@ asyncio.run(main())
 ### tools
 
 the registry of functions the agent can call. each tool is a side-effecting action exposed to the loop, so the model can do something in the world and not just talk about it.
+
+### tool modes
+
+how the model calls tools, set with one value: `AgentLoop(tool_mode=ToolMode.JSON | ToolMode.PROSE | ToolMode.NATIVE)`. the mode sets the parser, the output format, the role tool results go back in, how tools are declared, and the retry reminder, all together. switching protocol means changing one value.
+
+| | `JSON` | `PROSE` | `NATIVE` |
+|---|---|---|---|
+| tools declared via `tools` param | no | no | yes, `tool_choice="auto"` |
+| prompt tool block | rendered | rendered | suppressed |
+| text parser | `JsonModeParser` | `ProseModeParser` | final-only: text without `tool_calls` is the answer |
+| output format | `JSON_MODE_OUTPUT_FORMAT` | `PROSE_MODE_OUTPUT_FORMAT` | none (plain-text final) |
+| tool-result role | `"assistant"` (`"user"` allowed) | same as JSON | always `"tool"`, paired by `tool_call_id` |
+| `stream=True` | allowed | allowed | rejected at construction |
+
+`NATIVE` follows the openai-compatible function-calling protocol. a response with `tool_calls` is a tool turn, and any other text is the final answer, word for word. a text-shaped tool call (a json `{"action": "tool", ...}` envelope, a prose `Action:` block) is never run, so a `role="tool"` message always follows an assistant turn that carries its id. an empty response gets one retry with a native reminder; if that fails too, the run ends with a `ParserError` event and the fallback answer. with an empty registry, `tools` is left out of the request.
+
+a mode owns its knobs. you can still pass one when it fits the mode, such as a custom parser that wraps `JsonModeParser` under `JSON`, `tool_message_role="user"` for chat templates that need strict user/assistant alternation, or an output format like "answer in markdown" under `NATIVE`. a value that belongs to another mode raises `ValueError` when the loop is built. the sdk never silently picks one:
+
+```python
+AgentLoop(..., tool_mode=ToolMode.NATIVE, parser=JsonModeParser())
+# ValueError: tool_mode=ToolMode.NATIVE conflicts with parser=JsonModeParser(): under NATIVE
+# a tool call is only ever a structured tool_calls entry, and a text parser could dispatch a
+# text tool call. Drop parser=; NATIVE supplies its own final-only text parser.
+```
+
+omit `tool_mode` and the loop sends the same request bodies and system prompt as 1.7.0 (same keys, values and JSON types). the one event-level change is `ThoughtEvent.text` on native tool turns, which can now be non-empty (see CHANGELOG). `parser=` is required, `tool_message_role` defaults to `"tool"`, and `SafetyConfig(native_tools_enabled=True)` declares tools natively without changing the parser. that flag still works and is not deprecated, but on its own it leaves a text tool call dispatchable. to migrate, drop `parser=`, `output_format=` and `native_tools_enabled`, and pass `tool_mode=ToolMode.NATIVE`. the final answer is then plain text in `FinalEvent.text`, not a json envelope.
 
 ### llm
 

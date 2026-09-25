@@ -70,7 +70,7 @@ def test_native_parser_single_call_returns_thought_action() -> None:
     result = parser.parse(_make_response(tool_calls=[call]))
 
     assert isinstance(result, ThoughtAction)
-    # Native calls carry no preceding reasoning text — thought is empty.
+    # Empty content gives an empty thought (FR-001 AC-5).
     assert result.thought == ""
     assert result.tool_call.name == "search"
     assert result.tool_call.args == {"q": "x"}
@@ -190,3 +190,48 @@ def test_native_parser_multi_call_validates_every_entry() -> None:
         parser.parse(response)
 
     assert excinfo.value.context["error_phase"] == "schema_validation"
+
+
+# ---------------------------------------------------------------------------
+# FR-001 AC-5: assistant content alongside tool_calls becomes the thought
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("content", "expected"),
+    [
+        ("let me check", "let me check"),
+        ("  let me check\n", "let me check"),
+        ("  \n", ""),
+        ("", ""),
+    ],
+)
+def test_native_parser_content_becomes_thought_single(content: str, expected: str) -> None:
+    """A single-call turn carries non-blank content, stripped, as its thought (FR-001 AC-5)."""
+    call = ToolCall(name="search", args={"q": "x"})
+
+    result = NativeToolsParser().parse(_make_response(tool_calls=[call], content=content))
+
+    assert isinstance(result, ThoughtAction)
+    assert result.thought == expected
+    assert result.tool_call == call
+
+
+@pytest.mark.parametrize(
+    ("content", "expected"),
+    [
+        ("let me check both", "let me check both"),
+        ("\tlet me check both  ", "let me check both"),
+        ("  \n", ""),
+        ("", ""),
+    ],
+)
+def test_native_parser_content_becomes_thought_multi(content: str, expected: str) -> None:
+    """A multi-call turn carries non-blank content, stripped, as its thought (FR-001 AC-5)."""
+    calls = [ToolCall(name="search", args={"q": "a"}), ToolCall(name="lookup", args={"id": 1})]
+
+    result = NativeToolsParser().parse(_make_response(tool_calls=calls, content=content))
+
+    assert isinstance(result, MultiAction)
+    assert result.thought == expected
+    assert result.tool_calls == calls

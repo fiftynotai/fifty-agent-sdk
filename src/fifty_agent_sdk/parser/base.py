@@ -77,10 +77,11 @@ class MultiAction(BaseModel):
 
     Attributes:
         kind: Literal discriminator; always ``"multi_action"``.
-        thought: The model's reasoning that preceded the calls. Today the
-            native parser passes ``""`` (the provider's structured
-            ``tool_calls`` carries no prose-thought channel); the field exists
-            for future parsers and mirrors :class:`ThoughtAction.thought`.
+        thought: The model's reasoning that preceded the calls. The native
+            parser derives it from the assistant ``content`` the provider sent
+            alongside ``tool_calls`` (stripped), and passes ``""`` when that
+            content is blank (FR-001 AC-5). Mirrors
+            :class:`ThoughtAction.thought`.
         tool_calls: The list of tool invocation requests, in CALL order
             (the order the model emitted them). The loop dispatches them
             concurrently and feeds observations back in THIS order regardless

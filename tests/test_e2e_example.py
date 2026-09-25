@@ -25,13 +25,13 @@ from fifty_agent_sdk import (
     AgentLoop,
     AgentRunner,
     FinalEvent,
-    JsonModeParser,
     MemoryStateStore,
     ObservationEvent,
     PromptSections,
     Registry,
     SafetyConfig,
     ThoughtEvent,
+    ToolMode,
     ToolStartedEvent,
     tool,
 )
@@ -74,8 +74,8 @@ async def test_e2e_define_tool_wire_registry_run_stream() -> None:
     # The fake LLM replays two scripted JSON envelopes in order:
     #   reply 1 — a tool call asking for get_weather(city="Paris")
     #   reply 2 — a final answer
-    # `tool_json` / `final_json` render the exact JSON the JsonModeParser
-    # expects, so the loop parses them into a ThoughtAction then a
+    # `tool_json` / `final_json` render the exact JSON envelope that
+    # ToolMode.JSON parses, so the loop turns them into a ThoughtAction then a
     # FinalAnswer respectively.
     llm = FakeLLMClient(
         replies=[
@@ -83,13 +83,17 @@ async def test_e2e_define_tool_wire_registry_run_stream() -> None:
             make_response(final_json("It is 21°C in Paris.")),
         ]
     )
+    # `tool_mode=ToolMode.JSON` (FR-001) supplies the JSON parser and teaches
+    # the model its envelope in the system prompt, so no `parser=` or
+    # `output_format=` is needed. The registry must be filled BEFORE this
+    # call: the loop snapshots tool descriptions at construction.
     loop = AgentLoop(
         llm=llm,
         registry=registry,
-        parser=JsonModeParser(),
         prompts=PromptSections(persona="You are a helpful weather assistant."),
         safety=SafetyConfig(),
         model="test-model",
+        tool_mode=ToolMode.JSON,
     )
     # The runner wraps the loop with conversation-state persistence. A
     # MemoryStateStore is enough for an in-process run; durable backends

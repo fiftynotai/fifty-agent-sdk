@@ -7,7 +7,7 @@ chose a single tool), :class:`MultiAction` (the model requested multiple
 tool calls in one turn, BR-006), or :class:`FinalAnswer` (the model produced
 a terminal answer).
 
-Four concrete parsers ship today:
+Three public concrete parsers ship today:
 
 * :class:`JsonModeParser` — strict JSON envelope, the default when the loop
   uses :func:`fifty_agent_sdk.prompts.json_mode_template`.
@@ -17,6 +17,12 @@ Four concrete parsers ship today:
   structured ``tool_calls`` on a :class:`fifty_agent_sdk.llm.types.ChatResponse`
   (dispatched with precedence over text parsing when the adapter populates it).
   Satisfies the runtime-checkable :class:`NativeToolsParserProtocol`.
+
+A fourth, private parser, ``parser/final_only.py``'s ``_FinalOnlyParser``,
+backs ``AgentLoop(tool_mode=ToolMode.NATIVE)``: it turns any non-blank text
+completion into a :class:`FinalAnswer` and never returns a tool call (FR-001).
+It is deliberately NOT exported. Native mode is selected with ``tool_mode``,
+not by hand-wiring a parser.
 """
 
 from fifty_agent_sdk.parser.base import (
