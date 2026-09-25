@@ -6,6 +6,43 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.9.0] - 2026-09-26
+
+### Added
+- `ChatRequest.reasoning_effort` and `AgentLoop(reasoning_effort=...)`. The loop sets it
+  on every request it builds (tool steps, parser-retry and require-tool-before-final
+  re-asks, native and streamed turns). `OpenAICompatibleClient` sends it as a top-level
+  `reasoning_effort` for any model when it is set. There is no model-name filter, so a
+  provider or model that rejects it surfaces as `LLMError` (in the loop: `ErrorEvent`
+  and the fallback `FinalEvent` on the first call). The value must be a lowercase token
+  such as `"low"`, `"medium"` or `"high"`; other levels are passed through verbatim for
+  the provider to judge. The string `"none"` is a level and is sent; Python `None`
+  (the default) omits it. An invalid value raises at construction: `ValueError` from
+  `AgentLoop`, pydantic `ValidationError` from `ChatRequest`. (FR-002)
+- `AgentLoop(temperature=...)`. Omitted, the loop keeps sending `temperature` `0.0` as
+  before. A number in `[0.0, 2.0]` is sent on every request the loop builds. `None`
+  omits `temperature` from every request, for models that reject sampling parameters.
+  For example, OpenAI documents that gpt-5.1 accepts `temperature` only with
+  `reasoning_effort="none"`; this SDK has not verified that behaviour against any live
+  provider. It is independent of `reasoning_effort`: the loop never drops `temperature`
+  on its own, so pass `temperature=None` yourself if your provider needs it. Invalid
+  values (out of range, NaN, `bool`, strings) raise `ValueError` at construction.
+  (FR-002)
+
+### Notes
+- With both kwargs omitted, and `reasoning_effort` unset on a direct `ChatRequest`,
+  request bodies keep their 1.8.0 content: the same keys, values and JSON types. This is
+  pinned by the 1.7.0 legacy golden and a new golden captured from 1.8.0 that covers the
+  explicit `tool_mode` shapes and direct-client shapes. Key order holds by construction;
+  the HTTP bytes the `openai` SDK sends were not measured.
+- Custom `LLMClient` implementations receive the new `ChatRequest.reasoning_effort` field
+  and must forward it themselves. One that ignores it drops the value silently.
+- `ChatRequest.model_dump()` now includes `reasoning_effort: None`, so a snapshot of a
+  request dump (for example in an `on_llm_call` hook) sees one new key.
+- `reasoning_effort` is sent through the `openai` SDK's `extra_body`, because the typed
+  `create(reasoning_effort=...)` parameter only exists from `openai` 1.58.0. The
+  dependency floor stays `openai>=1.30.0`.
+
 ## [1.8.0] - 2026-09-25
 
 ### Added
