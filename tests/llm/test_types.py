@@ -223,6 +223,44 @@ def test_chat_request_forbids_extra_fields() -> None:
         )
 
 
+def test_chat_request_reasoning_effort_defaults_none() -> None:
+    """Unset ``reasoning_effort`` is ``None`` and not in ``model_fields_set`` (FR-002 AC-1)."""
+    req = ChatRequest(messages=[ChatMessage(role="user", content="hi")], model="gpt-5.1")
+    assert req.reasoning_effort is None
+    assert "reasoning_effort" not in req.model_fields_set
+
+
+@pytest.mark.parametrize("level", ["none", "minimal", "low", "medium", "high", "xhigh"])
+def test_chat_request_accepts_reasoning_effort_levels(level: str) -> None:
+    """Every current provider level, the string ``"none"`` included, is kept verbatim (FR-002 D4)."""
+    req = ChatRequest(
+        messages=[ChatMessage(role="user", content="hi")], model="gpt-5.1", reasoning_effort=level
+    )
+    assert req.reasoning_effort == level
+
+
+@pytest.mark.parametrize("bad", ["", " low", "low ", "low\n", "High", "LOW", "lo w", "1low"])
+def test_chat_request_rejects_malformed_reasoning_effort(bad: str) -> None:
+    """A value that is not a lowercase token fails at construction (FR-002 D4)."""
+    with pytest.raises(ValidationError):
+        ChatRequest(
+            messages=[ChatMessage(role="user", content="hi")], model="gpt-5.1", reasoning_effort=bad
+        )
+
+
+def test_chat_request_reasoning_effort_round_trips() -> None:
+    """``reasoning_effort`` survives ``model_dump`` → ``model_validate`` (FR-002)."""
+    req = ChatRequest(
+        messages=[ChatMessage(role="user", content="hi")],
+        model="gpt-5.1",
+        temperature=None,
+        reasoning_effort="medium",
+    )
+    same = ChatRequest.model_validate(req.model_dump())
+    assert same == req
+    assert same.reasoning_effort == "medium"
+
+
 # ---------------------------------------------------------------------------
 # ChatResponse
 # ---------------------------------------------------------------------------

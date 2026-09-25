@@ -353,6 +353,136 @@ async def test_build_body_reasoning_model_omits_both_keys_when_unset(
     assert "max_completion_tokens" not in body
 
 
+# ---------------------------------------------------------------------------
+# FR-002: reasoning_effort on the wire
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        "gpt-5.1",
+        "gpt-5",
+        "o3-mini",
+        "openai/gpt-5.1",
+        "gpt-4o",
+        "llama-3.1-70b",
+        "my-azure-deployment",
+    ],
+)
+async def test_build_body_sends_reasoning_effort_for_any_model(
+    httpx_mock: HTTPXMock, model: str
+) -> None:
+    """A set ``reasoning_effort`` reaches the HTTP body for every model name (FR-002 AC-2, D3).
+
+    The non-reasoning names (``gpt-4o``, ``llama-3.1-70b``, an Azure-style
+    deployment) pin the decision that there is no model-name filter: the value
+    is sent and a provider that rejects it answers with an error.
+    """
+    httpx_mock.add_response(method="POST", url=ENDPOINT, json=_canonical_response())
+    client = _make_client()
+    await client.complete(_basic_request(model=model, reasoning_effort="medium"))
+    body = _sent_body(httpx_mock)
+    assert body["reasoning_effort"] == "medium"
+    assert "extra_body" not in body
+
+
+@pytest.mark.parametrize("model", ["gpt-5.1", "o3-mini", "gpt-4o", "llama-3.1-70b"])
+async def test_build_body_omits_reasoning_effort_when_unset(
+    httpx_mock: HTTPXMock, model: str
+) -> None:
+    """Unset ``reasoning_effort`` adds no key to the HTTP body or the built dict (FR-002 AC-1)."""
+    httpx_mock.add_response(method="POST", url=ENDPOINT, json=_canonical_response())
+    client = _make_client()
+    request = _basic_request(model=model)
+    await client.complete(request)
+    body = _sent_body(httpx_mock)
+    assert "reasoning_effort" not in body
+    assert "extra_body" not in client._build_body(request, model=model, stream=False)
+
+
+async def test_build_body_sends_string_none_reasoning_effort(httpx_mock: HTTPXMock) -> None:
+    """The STRING ``"none"`` is a provider level and is sent; Python ``None`` is not (FR-002 D4)."""
+    httpx_mock.add_response(method="POST", url=ENDPOINT, json=_canonical_response())
+    client = _make_client()
+    await client.complete(_basic_request(model="gpt-5.1", reasoning_effort="none"))
+    body = _sent_body(httpx_mock)
+    assert body["reasoning_effort"] == "none"
+
+
+@pytest.mark.parametrize("level", ["xhigh", "ultra"])
+async def test_build_body_passes_unknown_lowercase_reasoning_effort_verbatim(
+    httpx_mock: HTTPXMock, level: str
+) -> None:
+    """A lowercase level the SDK does not know is sent unchanged; the provider decides (FR-002 D4)."""
+    httpx_mock.add_response(method="POST", url=ENDPOINT, json=_canonical_response())
+    client = _make_client()
+    await client.complete(_basic_request(model="gpt-5.1", reasoning_effort=level))
+    body = _sent_body(httpx_mock)
+    assert body["reasoning_effort"] == level
+
+
+async def test_stream_sends_reasoning_effort(httpx_mock: HTTPXMock) -> None:
+    """The streaming path sends ``reasoning_effort`` too (FR-002 AC-2)."""
+    sse = _sse(_chunk(finish_reason="stop")) + b"data: [DONE]\n\n"
+    httpx_mock.add_response(
+        method="POST",
+        url=ENDPOINT,
+        content=sse,
+        headers={"content-type": "text/event-stream"},
+    )
+    client = _make_client()
+    async for _ in client.stream(_basic_request(model="gpt-5.1", reasoning_effort="low")):
+        pass
+    body = _sent_body(httpx_mock)
+    assert body["stream"] is True
+    assert body["reasoning_effort"] == "low"
+    assert "extra_body" not in body
+
+
+async def test_build_body_reasoning_effort_coexists_with_max_completion_tokens_and_tools(
+    httpx_mock: HTTPXMock,
+) -> None:
+    """``reasoning_effort`` does not disturb BR-018's key choice or the tools block (FR-002)."""
+    httpx_mock.add_response(method="POST", url=ENDPOINT, json=_canonical_response())
+    client = _make_client()
+    tools = [{"type": "function", "function": {"name": "search", "parameters": {}}}]
+    await client.complete(
+        _basic_request(model="gpt-5.1", max_tokens=32, tools=tools, reasoning_effort="high")
+    )
+    body = _sent_body(httpx_mock)
+    assert body["reasoning_effort"] == "high"
+    assert body["max_completion_tokens"] == 32
+    assert body["tools"] == tools
+    assert body["tool_choice"] == "auto"
+    assert "max_tokens" not in body
+
+
+async def test_build_body_reasoning_effort_via_extra_body() -> None:
+    """The built kwargs carry ``reasoning_effort`` under ``extra_body``, not top level (FR-002 D5).
+
+    Deliberate: the typed ``create(reasoning_effort=)`` kwarg does not exist on
+    every ``openai`` release in the declared range (floor 1.30.0), where it
+    would raise an unwrapped ``TypeError``. ``extra_body`` works across the
+    range. Switching to the typed kwarg is a dependency-floor decision, not a
+    cleanup.
+    """
+    client = _make_client()
+    try:
+        request = _basic_request(model="gpt-5.1", reasoning_effort="low")
+        built = client._build_body(request, model="gpt-5.1", stream=False)
+    finally:
+        await client.aclose()
+    assert built == {
+        "model": "gpt-5.1",
+        "messages": [{"role": "user", "content": "hi"}],
+        "stream": False,
+        "temperature": 0.0,
+        "extra_body": {"reasoning_effort": "low"},
+    }
+    assert "reasoning_effort" not in built
+
+
 @pytest.mark.parametrize(
     "param,model",
     [

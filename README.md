@@ -134,6 +134,19 @@ omit `tool_mode` and the loop sends the same request bodies and system prompt as
 
 the llm client. a protocol plus an openai-compatible adapter, so the loop talks to any chat-completions endpoint by changing one base_url. a `max_tokens` cap is sent as `max_completion_tokens` for gpt-5.x and o-series models, which reject `max_tokens`; `max_tokens_param=` overrides that choice per client.
 
+for reasoning models, `AgentLoop(reasoning_effort="medium")` sets `reasoning_effort` on every request the loop builds, including retries, re-asks, native and streamed turns. it is sent for any model name, with no filtering, so a provider that rejects it fails the run loudly on the first call. the string `"none"` is a level and is sent; `None`, the default, leaves it out. `AgentLoop(temperature=...)` works the same way: omit it and the loop keeps sending `0.0`, pass a number to send that, or pass `None` to leave `temperature` out of every request. `None` means leave it out, not use the default. the loop never couples the two, so if your model rejects `temperature` alongside `reasoning_effort` (openai documents this for gpt-5.1; the sdk has not verified it), set `temperature=None` yourself:
+
+```python
+loop = AgentLoop(
+    ...,
+    model="gpt-5.1",
+    reasoning_effort="medium",
+    temperature=None,
+)
+```
+
+to vary either value per request, build a `ChatRequest(..., reasoning_effort=..., temperature=...)` and call the client directly. a custom `LLMClient` has to forward `reasoning_effort` itself.
+
 ### state
 
 the state stores. where conversation state persists between turns, with branching built in: fork a session, switch between branches, truncate back to an earlier point. `MemoryStateStore` needs no infrastructure, but it is process-local and non-durable: by default it lazily expires whole sessions when monotonic inactivity reaches 3,600 seconds and retains at most 1,000 sessions using LRU eviction. successful reads refresh inactivity. `SqlStateStore` and `RedisStateStore` are durable backends behind the extras.

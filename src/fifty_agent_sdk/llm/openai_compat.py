@@ -373,6 +373,13 @@ class OpenAICompatibleClient:
         :attr:`ChatRequest.max_tokens` is sent under the key chosen by
         :meth:`_max_tokens_key` — ``max_tokens`` unless the client option or
         the model-name rule selects ``max_completion_tokens``.
+
+        :attr:`ChatRequest.reasoning_effort` (FR-002) is omitted when ``None``,
+        so the returned dict gains no key. When set, it is placed under
+        ``extra_body``, which the ``openai`` SDK merges into the top level of
+        the JSON request, so the provider receives a top-level
+        ``reasoning_effort``. It is sent for every model name; there is no
+        model-name filter.
         """
         body: dict[str, Any] = {
             "model": model,
@@ -388,6 +395,20 @@ class OpenAICompatibleClient:
         if request.tools is not None:
             body["tools"] = request.tools
             body["tool_choice"] = request.tool_choice or "auto"
+        if request.reasoning_effort is not None:
+            # FR-002 D5: `extra_body`, NOT the typed `reasoning_effort=` kwarg
+            # of `chat.completions.create`. The declared floor `openai>=1.30.0`
+            # predates that kwarg, and generated `create()` methods take no
+            # **kwargs, so on an older in-range `openai` the typed kwarg raises
+            # a TypeError that the APIError arms in complete()/stream() never
+            # wrap into LLMError. `extra_body` exists across the whole declared
+            # range and merges at the top level of the JSON body.
+            # FR-002 D3: no model-name gate (unlike BR-018's max_tokens key).
+            # That rule TRANSLATES a portable field; a gate here would only
+            # FILTER out an explicit consumer instruction on a guess from the
+            # model name, which is silent when wrong. Sent whenever set; a
+            # provider that rejects it fails loudly with LLMError.
+            body["extra_body"] = {"reasoning_effort": request.reasoning_effort}
         return body
 
     @staticmethod

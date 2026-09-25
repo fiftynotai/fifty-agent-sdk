@@ -20,6 +20,15 @@ Tool modes (FR-001)
     event-level change is ``ThoughtEvent.text`` on native tool turns (see
     CHANGELOG).
 
+Request options (FR-002)
+    ``AgentLoop(reasoning_effort=..., temperature=...)`` set request parameters
+    on EVERY request the loop builds. All of them go through the single
+    ``_build_request`` call site: tool steps, parser-retry and
+    require-tool-before-final re-asks, native and streamed turns. With both
+    kwargs omitted the loop sends the same request bodies as 1.8.0 (same keys,
+    values and JSON types). The two are independent: setting
+    ``reasoning_effort`` never drops or changes ``temperature``.
+
 Statelessness
     Every :meth:`AgentLoop.run` call is its own scoped iteration. The
     loop holds no state across calls — conversation persistence and
@@ -63,7 +72,9 @@ Streaming semantics
 from __future__ import annotations
 
 import asyncio
+import enum
 import json
+import re
 import time
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
@@ -71,6 +82,7 @@ from typing import Any, Final, Literal, TypeVar
 from uuid import uuid4
 
 import structlog
+from pydantic import ValidationError
 
 from fifty_agent_sdk.errors import (
     AgentSdkError,
@@ -80,7 +92,14 @@ from fifty_agent_sdk.errors import (
     ToolTimeout,
 )
 from fifty_agent_sdk.llm.protocol import LLMClient
-from fifty_agent_sdk.llm.types import ChatMessage, ChatRequest, ChatResponse, ToolCall, Usage
+from fifty_agent_sdk.llm.types import (
+    _REASONING_EFFORT_PATTERN,
+    ChatMessage,
+    ChatRequest,
+    ChatResponse,
+    ToolCall,
+    Usage,
+)
 from fifty_agent_sdk.observability import Hooks
 from fifty_agent_sdk.observability.hooks import invoke_hook
 from fifty_agent_sdk.parser.base import FinalAnswer, MultiAction, Parser, ParseResult
@@ -104,6 +123,23 @@ from fifty_agent_sdk.tools.registry import Registry
 
 _log: Final = structlog.get_logger(__name__)
 """Module-level structured logger. INFO at iteration boundaries; DEBUG per sub-event."""
+
+
+class _Unset(enum.Enum):
+    """Private "not passed" marker for ``AgentLoop(temperature=...)`` (FR-002 D9).
+
+    ``temperature=None`` is a real instruction (omit the key from every
+    request), so ``None`` cannot also mean "not passed". A single-member enum
+    lets mypy narrow ``is _UNSET`` / ``is not _UNSET`` exactly, which a bare
+    ``object()`` sentinel does not. Consumers never pass it: they omit the
+    kwarg. Not exported and not part of the public API.
+    """
+
+    UNSET = "UNSET"
+
+
+_UNSET: Final = _Unset.UNSET
+"""The single :class:`_Unset` member, the default of ``AgentLoop(temperature=)``."""
 
 _AgentEventT = TypeVar(
     "_AgentEventT",
@@ -279,6 +315,59 @@ def _synthesize_stream_response(completion: str) -> ChatResponse:
     )
 
 
+def _validate_reasoning_effort(reasoning_effort: object) -> str | None:
+    """Check ``AgentLoop(reasoning_effort=)`` at construction (FR-002 D4).
+
+    Uses the same lexical guard as :attr:`ChatRequest.reasoning_effort`.
+    Validating here, rather than letting the first ``_build_request`` raise a
+    pydantic ``ValidationError`` inside :meth:`AgentLoop.run`, keeps the
+    "every run ends with a FinalEvent" guarantee: a bad value never reaches
+    the generator.
+
+    Raises:
+        ValueError: When the value is neither ``None`` nor a lowercase token.
+    """
+    if reasoning_effort is None:
+        return None
+    if not isinstance(reasoning_effort, str) or not re.fullmatch(
+        _REASONING_EFFORT_PATTERN, reasoning_effort
+    ):
+        raise ValueError(
+            "reasoning_effort must be a lowercase provider level such as 'low', "
+            f"'medium' or 'high', or None to omit it; got {reasoning_effort!r}"
+        )
+    return reasoning_effort
+
+
+def _validate_temperature(temperature: float | None | _Unset) -> float | None | _Unset:
+    """Check ``AgentLoop(temperature=)`` at construction (FR-002 D10).
+
+    The omitted marker and ``None`` pass through unchanged. Any other value
+    must be an ``int`` or ``float`` (``bool`` excluded; a numeric ``str`` is
+    rejected rather than coerced) and is then validated through the real
+    :attr:`ChatRequest.temperature` field, so the ``[0.0, 2.0]`` range has a
+    single source of truth. The VALIDATED value is returned, so an ``int``
+    such as ``1`` is stamped as the float ``1.0``, the value a direct
+    ``ChatRequest(temperature=1)`` carries.
+
+    Raises:
+        ValueError: When the value is not a number in ``[0.0, 2.0]`` (NaN and
+            infinities included) and is not ``None``.
+    """
+    if temperature is _UNSET or temperature is None:
+        return temperature
+    message = f"temperature must be a number in [0.0, 2.0], or None to omit it; got {temperature!r}"
+    if isinstance(temperature, bool) or not isinstance(temperature, (int, float)):
+        raise ValueError(message)
+    try:
+        validated = ChatRequest.model_validate(
+            {"messages": [], "model": "_", "temperature": temperature}
+        ).temperature
+    except ValidationError as exc:
+        raise ValueError(message) from exc
+    return validated
+
+
 class AgentLoop:
     """Production ReACT loop.
 
@@ -370,10 +459,40 @@ class AgentLoop:
             prompt as 1.7.0 (same keys, values and JSON types); the one
             event-level change is ``ThoughtEvent.text`` on native tool
             turns (see CHANGELOG).
+        reasoning_effort: FR-002. A provider reasoning level such as
+            ``"low"``, ``"medium"`` or ``"high"`` (a lowercase token; which
+            levels a model accepts is up to the provider). Set as
+            :attr:`ChatRequest.reasoning_effort` on EVERY request this loop
+            builds: tool steps, parser-retry and require-tool-before-final
+            re-asks, native and streamed turns. It is sent for every model
+            name, with no model-name filter, so a provider that rejects it
+            ends the run on the first call with an ``ErrorEvent`` and the
+            fallback ``FinalEvent``. The string ``"none"`` is a level and is
+            sent; ``None`` (default) omits it and sends the same request
+            bodies as 1.8.0 (same keys, values and JSON types). There is no
+            per-run override: use a direct ``ChatRequest`` or an
+            :class:`~fifty_agent_sdk.llm.protocol.LLMClient` wrapper for
+            per-request values. Independent of ``tool_mode``.
+        temperature: FR-002. Omitted (the default), the loop keeps sending
+            ``temperature`` ``0.0`` as in 1.8.0 (the same request bodies:
+            same keys, values and JSON types). A
+            number in ``[0.0, 2.0]`` is sent on every request this loop
+            builds. ``None`` OMITS the key from every request, for providers
+            or models that reject sampling parameters; it means "leave it
+            out", not "use the default". Independent of ``reasoning_effort``
+            and ``tool_mode``: the loop never drops ``temperature`` because
+            ``reasoning_effort`` is set. If your provider rejects
+            ``temperature`` alongside ``reasoning_effort`` (OpenAI documents
+            this for gpt-5.1 with a level other than ``"none"``; not verified
+            by this SDK), pass ``temperature=None`` yourself. Omit the kwarg
+            rather than passing the private default marker.
 
     Raises:
         TypeError: When both ``parser`` and ``tool_mode`` are omitted.
-        ValueError: When ``tool_mode`` is not a valid :class:`ToolMode`; when
+        ValueError: When ``reasoning_effort`` is neither ``None`` nor a
+            lowercase token; when ``temperature`` is neither ``None`` nor a
+            number in ``[0.0, 2.0]`` (``bool`` and numeric strings are
+            rejected); when ``tool_mode`` is not a valid :class:`ToolMode`; when
             ``tool_mode`` conflicts with an owned knob (see ``tool_mode``);
             when ``tool_mode=ToolMode.NATIVE`` is combined with
             ``stream=True``; and when ``stream=True`` is combined with
@@ -402,7 +521,14 @@ class AgentLoop:
         tool_message_role: Literal["tool", "user", "assistant"] | None = None,
         hooks: Hooks | None = None,
         tool_mode: ToolMode | None = None,
+        reasoning_effort: str | None = None,
+        temperature: float | None | _Unset = _UNSET,
     ) -> None:
+        # FR-002: validate the request options first, before the tool-mode
+        # resolver, so a bad value fails cheaply at construction and never as
+        # a pydantic ValidationError inside run().
+        reasoning_effort = _validate_reasoning_effort(reasoning_effort)
+        temperature = _validate_temperature(temperature)
         # FR-001: resolve every tool-calling knob together. `tool_mode=None`
         # is the frozen legacy path — each resolved value equals what 1.7.0
         # read directly (parser required, role "tool", native behaviour keyed
@@ -441,6 +567,20 @@ class AgentLoop:
         self._omit_empty_tools = resolved.omit_empty_tools
         self._parser_retry_reminder = resolved.parser_retry_reminder
         self._echo_blank_retry = resolved.echo_blank_retry
+        # FR-002 D7: request options, composed ONCE and spread into every
+        # ChatRequest in `_build_request`. A key is present only when the
+        # consumer passed the kwarg (`temperature=None` included, which is a
+        # real "omit the key" instruction), so a loop with both omitted builds
+        # requests whose values for 1.8.0's fields, and `model_fields_set`,
+        # match 1.8.0 (the new `reasoning_effort` field stays None). The two
+        # options are never coupled (D9).
+        self._reasoning_effort = reasoning_effort
+        self._temperature = temperature
+        self._request_options: dict[str, Any] = {}
+        if reasoning_effort is not None:
+            self._request_options["reasoning_effort"] = reasoning_effort
+        if temperature is not _UNSET:
+            self._request_options["temperature"] = temperature
         # Snapshot tool descriptions ONCE; subsequent registry mutations are
         # invisible to this loop instance. Documented behavior.
         self._system_prompt = self._build_system_prompt(prompts, resolved.output_format)
@@ -481,25 +621,37 @@ class AgentLoop:
         :attr:`SafetyConfig.native_tools_enabled` on the legacy path), the
         request carries the registry's tools as the OpenAI ``tools`` param
         (built via :func:`_render_openai_tools`) plus ``tool_choice="auto"``.
-        Otherwise the request is exactly
-        ``ChatRequest(messages=..., model=...)`` — byte-for-byte pre-BR-008.
+        Otherwise the request is ``ChatRequest(messages=..., model=...)``
+        plus the request options described below.
 
         Under ``ToolMode.NATIVE`` an EMPTY registry sends neither ``tools`` nor
         ``tool_choice`` (OpenAI rejects an empty ``tools`` array); the registry
         is re-read every iteration, so a later registration is declared on the
         next turn. The legacy flag keeps sending ``tools=[]`` (FR-001 D10).
+
+        Every request, on all three branches, also carries the loop's request
+        options (FR-002): ``reasoning_effort`` when set, and ``temperature``
+        when passed (``None`` included, which omits the key on the wire). This
+        method is the one place every loop request is built, so tool steps,
+        re-asks, native and streamed turns all get them. With both options
+        omitted nothing extra is passed to ``ChatRequest``, so each request's
+        values for 1.8.0's fields, and its ``model_fields_set``, match 1.8.0's
+        (the new ``reasoning_effort`` field stays ``None``).
         """
         if self._declare_native_tools:
             tools = _render_openai_tools(self._registry.list())
             if not tools and self._omit_empty_tools:
-                return ChatRequest(messages=list(messages), model=self._model)
+                return ChatRequest(
+                    messages=list(messages), model=self._model, **self._request_options
+                )
             return ChatRequest(
                 messages=list(messages),
                 model=self._model,
                 tools=tools,
                 tool_choice="auto",
+                **self._request_options,
             )
-        return ChatRequest(messages=list(messages), model=self._model)
+        return ChatRequest(messages=list(messages), model=self._model, **self._request_options)
 
     async def run(
         self, messages: list[ChatMessage], *, session_id: str | None = None

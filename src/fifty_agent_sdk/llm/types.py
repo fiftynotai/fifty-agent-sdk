@@ -13,10 +13,23 @@ ride along to consumers.
 
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Any, Final, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 from typing_extensions import TypedDict
+
+_REASONING_EFFORT_PATTERN: Final = r"^[a-z][a-z0-9_-]*$"
+"""Lexical guard for :attr:`ChatRequest.reasoning_effort` (FR-002 D4).
+
+A non-empty lowercase token, NOT a closed set of levels. Providers keep adding
+levels (``"none"`` and ``"minimal"`` are recent, ``"xhigh"`` is newer still)
+and OpenAI-compatible gateways differ, so a ``Literal`` would need an SDK
+release for every new level. The guard only catches construction-time typos
+(``""``, surrounding whitespace, ``"High"``) that would otherwise surface as a
+provider error mid-run. Shared with :class:`fifty_agent_sdk.loop.AgentLoop`,
+which validates its ``reasoning_effort`` kwarg against the same pattern.
+Loosening it later is non-breaking; tightening it would be breaking.
+"""
 
 Role = Literal["system", "user", "assistant", "tool"]
 """Discriminator for the speaker of a :class:`ChatMessage`."""
@@ -168,6 +181,23 @@ class ChatRequest(BaseModel):
             object ``{"type": "function", "function": {"name": ...}}`` that
             forces the model to call the named function. Ignored when
             :attr:`tools` is ``None``.
+        reasoning_effort: Optional provider reasoning level for reasoning
+            models (FR-002), for example ``"none"``, ``"minimal"``, ``"low"``,
+            ``"medium"``, ``"high"`` or ``"xhigh"``. Which levels a model
+            accepts is up to the provider. ``None`` (the default) omits it:
+            the adapter adds no key, so the request body has the same keys,
+            values and JSON types as in 1.8.0. The STRING ``"none"`` is a
+            real provider level and IS sent.
+            When set, :class:`~fifty_agent_sdk.llm.openai_compat.
+            OpenAICompatibleClient` sends it verbatim as a top-level
+            ``reasoning_effort`` for every model: there is no model-name
+            filter, so a provider or model that rejects it returns an error,
+            raised as :class:`~fifty_agent_sdk.errors.LLMError`. The value
+            must be a lowercase token (``^[a-z][a-z0-9_-]*$``); anything else
+            fails validation at construction. A custom
+            :class:`~fifty_agent_sdk.llm.protocol.LLMClient` receives the
+            field and must forward it itself; one that ignores it drops the
+            value silently.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -179,6 +209,7 @@ class ChatRequest(BaseModel):
     response_format: dict[str, Any] | None = None
     tools: list[dict[str, Any]] | None = None
     tool_choice: str | ToolChoiceFunction | None = None
+    reasoning_effort: str | None = Field(default=None, pattern=_REASONING_EFFORT_PATTERN)
 
 
 class ChatResponse(BaseModel):
