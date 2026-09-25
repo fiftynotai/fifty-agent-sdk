@@ -6,6 +6,96 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.8.0] - 2026-09-25
+
+### Added
+- `ToolMode` (`JSON`, `PROSE`, `NATIVE`) and `AgentLoop(tool_mode=...)`. One value now
+  sets the text parser, output format, tool-result role, tool declaration and
+  parser-retry reminder together, so a loop can no longer be half native and half text.
+  A `StrEnum`, so `tool_mode="native"` from configuration also works. (FR-001)
+
+  | | `JSON` | `PROSE` | `NATIVE` |
+  |---|---|---|---|
+  | tools declared via `tools` param | no | no | yes, `tool_choice="auto"` |
+  | prompt tool block | rendered | rendered | suppressed |
+  | text parser | `JsonModeParser` | `ProseModeParser` | final-only: text without `tool_calls` is the answer |
+  | output format | `JSON_MODE_OUTPUT_FORMAT` | `PROSE_MODE_OUTPUT_FORMAT` | none (plain-text final) |
+  | tool-result role | `"assistant"` (`"user"` allowed) | same as JSON | always `"tool"`, paired by `tool_call_id` |
+  | `stream=True` | allowed | allowed | rejected at construction |
+
+- Passing `tool_mode` together with a knob it owns (`parser`, `output_format` or
+  `prompts.output_format`, `tool_message_role`, `SafetyConfig.native_tools_enabled`)
+  whose value belongs to another mode raises `ValueError` at construction, naming the
+  mode, the knob and the fix. The loop never silently picks one side. Compatible values
+  are honoured, for example a custom parser wrapping `JsonModeParser` under `JSON`, or a
+  custom output format such as "answer in markdown" under `NATIVE`.
+- Under `ToolMode.NATIVE` a text completion is never dispatched as a tool call: a JSON
+  `{"action": "tool", ...}` envelope or a prose `Action:` block without `tool_calls` is
+  the final answer, verbatim. A `role="tool"` reply is therefore only ever sent after an
+  assistant turn whose `tool_calls` carry its id. An empty completion triggers the
+  existing one-shot parser retry with a native reminder; when no retry is left the run
+  ends with `ErrorEvent(error_type="ParserError")` and the fallback `FinalEvent`.
+- `ToolMode.NATIVE` with an empty registry sends neither `tools` nor `tool_choice`
+  (OpenAI rejects an empty `tools` array). A tool registered later is declared on the
+  next request.
+- Mode-appropriate parser-retry reminders: when `SafetyConfig.parser_retry_reminder` is
+  left at its default, `PROSE` and `NATIVE` loops no longer tell the model to emit JSON.
+  A reminder you set explicitly is used verbatim in every mode.
+- An explicit `JSON` or `PROSE` loop ignores native `tool_calls` it never asked for,
+  parses the text instead, and logs a `native_tool_calls_ignored` warning carrying the
+  call count only. Under an explicit mode a blank completion is also not echoed back as
+  an empty assistant turn before the retry reminder.
+
+### Changed
+- `NativeToolsParser` returns non-blank assistant `content` sent alongside `tool_calls`
+  (stripped) as the turn's `thought`, for single- and multi-call turns; it was always
+  `""` before. **Consumer-visible:** `ThoughtEvent.text` on a native tool turn may now be
+  non-empty, including on the `native_tools_enabled=True` path. Requests are unchanged:
+  the replayed assistant turn still carries the verbatim `content`.
+- `AgentLoop(parser=...)` is optional when `tool_mode` is given. Without `tool_mode` it
+  is still required and omitting it still raises `TypeError`.
+- `AgentLoop(tool_message_role=...)` now defaults to `None`, meaning "not set". With
+  `tool_mode` omitted it still resolves to `"tool"`, so existing callers see no change.
+
+### Migration
+Omitting `tool_mode` sends the same request bodies as 1.7.0, with the same keys, values
+and JSON types (pinned by golden request bodies captured from 1.7.0), so no existing
+constructor call needs to change.
+`SafetyConfig.native_tools_enabled` is not deprecated at runtime. It stays the legacy
+knob, and it keeps the 1.7.0 behaviour of leaving a text tool call dispatchable. To get
+a consistent native loop:
+
+```python
+# Before (1.7.0): native declaration, but a text tool call can still be dispatched.
+loop = AgentLoop(
+    llm=llm,
+    registry=registry,
+    parser=JsonModeParser(),
+    prompts=PromptSections(persona="..."),
+    safety=SafetyConfig(native_tools_enabled=True),
+    model="gpt-5.1",
+    output_format=JSON_MODE_OUTPUT_FORMAT,
+)
+
+# After (1.8.0): drop parser=, output_format= and native_tools_enabled.
+loop = AgentLoop(
+    llm=llm,
+    registry=registry,
+    prompts=PromptSections(persona="..."),
+    safety=SafetyConfig(),
+    model="gpt-5.1",
+    tool_mode=ToolMode.NATIVE,
+)
+```
+
+Keeping `parser=JsonModeParser()` or `output_format=JSON_MODE_OUTPUT_FORMAT` next to
+`tool_mode=ToolMode.NATIVE` raises `ValueError`, as does an explicitly set
+`native_tools_enabled=False`. The final answer is plain text, so a consumer that read the
+`answer` field of a JSON envelope now reads `FinalEvent.text` directly. Under an explicit
+`JSON` or `PROSE` mode, tool results default to `role="assistant"`; pass
+`tool_message_role="user"` for chat templates that require strict user/assistant
+alternation.
+
 ## [1.7.0] - 2026-09-25
 
 ### Added

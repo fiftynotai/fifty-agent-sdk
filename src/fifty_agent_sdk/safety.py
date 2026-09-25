@@ -81,8 +81,18 @@ class SafetyConfig(BaseModel):
             a single parse failure terminates the run with the existing
             ``ErrorEvent`` + fallback ``FinalEvent`` pair.
         parser_retry_reminder: ``user``-role message body injected on the
-            retry to remind the model of the JSON envelope schema. Must
-            be non-empty.
+            retry to remind the model of the expected output format. Must
+            be non-empty. A value you SET explicitly is used verbatim in
+            every mode. Left at the default, the loop picks a
+            mode-appropriate reminder under an explicit
+            ``AgentLoop(tool_mode=...)`` (FR-001 AC-6): this JSON-envelope
+            text under ``ToolMode.JSON``, a Thought/Action reminder under
+            ``ToolMode.PROSE``, and an "empty response" reminder under
+            ``ToolMode.NATIVE``. With ``tool_mode`` omitted this default is
+            used unchanged, whatever parser is in use (the 1.7.0 behaviour).
+            "Set" means present in ``model_fields_set``: passed to the
+            constructor, to ``model_validate``, or via
+            ``model_copy(update=...)``.
         require_tool_before_final: BR-036 opt-in force-reconsider knob.
             When ``True``, the loop refuses to accept the FIRST ``final``
             answer of a run if no tool has been invoked yet that run,
@@ -112,6 +122,19 @@ class SafetyConfig(BaseModel):
             translation runs, and the prompt-side tool block renders exactly
             as before — byte-for-byte the pre-BR-008 path, so existing
             JSON-mode text-tool consumers are unaffected.
+
+            This is the LEGACY native knob. It is still supported and not
+            deprecated at runtime, but it only changes how tools are
+            declared: combined with a text parser it leaves a text tool
+            call dispatchable, whose result then goes back as
+            ``role="tool"`` after an assistant turn with no ``tool_calls``
+            (strict endpoints reject that with HTTP 400). Prefer
+            ``AgentLoop(tool_mode=ToolMode.NATIVE)``, which sets the parser,
+            output format and result role consistently (FR-001). Under an
+            explicit ``tool_mode`` this field is owned by the mode: ``True``
+            conflicts with ``JSON`` / ``PROSE``, and an explicitly set
+            ``False`` conflicts with ``NATIVE`` (the default ``False`` counts
+            as unset).
         max_concurrent_tool_calls: BR-006 concurrency cap for the multi-call
             dispatch path. Bounds how many tool invocations within a single
             native multi-call iteration run in-flight at once via an

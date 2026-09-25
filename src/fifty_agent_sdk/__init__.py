@@ -97,6 +97,7 @@ from fifty_agent_sdk.streaming import (
     ToolProgressEvent,
     ToolStartedEvent,
 )
+from fifty_agent_sdk.tool_mode import ToolMode
 from fifty_agent_sdk.tools import (
     InProcProvider,
     MCPProvider,
@@ -178,6 +179,7 @@ __all__ = [
     "Tool",
     "ToolCall",
     "ToolFailedEvent",
+    "ToolMode",
     "ToolNotFound",
     "ToolProgressEvent",
     "ToolResult",

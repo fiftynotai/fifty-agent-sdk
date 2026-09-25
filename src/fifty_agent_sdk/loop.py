@@ -6,6 +6,20 @@ the bridge that turns the four foundation layers (BR-003 prompts, BR-004
 tools, BR-005 parser, BR-003 LLM) into a single async iterator of typed
 :class:`fifty_agent_sdk.streaming.AgentEvent` values.
 
+Tool modes (FR-001)
+    ``AgentLoop(tool_mode=...)`` takes a :class:`fifty_agent_sdk.tool_mode.
+    ToolMode` (``JSON``, ``PROSE`` or ``NATIVE``) that sets the text parser,
+    output format, tool-result role, tool declaration and parser-retry
+    reminder together; see :mod:`fifty_agent_sdk.tool_mode` for the table and
+    the conflict rule. Under ``NATIVE`` a tool call is only ever a structured
+    ``tool_calls`` entry: text is always the final answer, so a
+    ``role="tool"`` reply always follows an assistant turn whose
+    ``tool_calls`` carry its id. When ``tool_mode`` is omitted the loop
+    sends the same request bodies (same keys, values and JSON types) and
+    system prompt as 1.7.0, including the four independent knobs; the one
+    event-level change is ``ThoughtEvent.text`` on native tool turns (see
+    CHANGELOG).
+
 Statelessness
     Every :meth:`AgentLoop.run` call is its own scoped iteration. The
     loop holds no state across calls — conversation persistence and
@@ -14,11 +28,12 @@ Statelessness
 System prompt snapshot
     The system prompt is constructed ONCE at ``AgentLoop.__init__``
     from a snapshot of :meth:`fifty_agent_sdk.tools.registry.Registry.list`.
-    In the default text/JSON mode, tools registered AFTER construction are
-    NOT visible to the model. Dynamic-tool consumers must rebuild the loop.
-    Under native-tools mode
-    (:attr:`fifty_agent_sdk.safety.SafetyConfig.native_tools_enabled`) the
-    prompt-side tool block is suppressed and the OpenAI ``tools`` request
+    In the text modes (``ToolMode.JSON`` / ``ToolMode.PROSE``, or the legacy
+    default), tools registered AFTER construction are NOT visible to the
+    model. Dynamic-tool consumers must rebuild the loop.
+    Under native-tools mode (``ToolMode.NATIVE``, or
+    :attr:`fifty_agent_sdk.safety.SafetyConfig.native_tools_enabled` on the
+    legacy path) the prompt-side tool block is suppressed and the OpenAI ``tools`` request
     param is rebuilt from the registry on EVERY iteration, so late
     registrations ARE declared to the provider on subsequent turns.
 
@@ -41,7 +56,8 @@ Streaming semantics
     streamed tool-call deltas), so a ``stream=True`` +
     ``native_tools_enabled=True`` loop would parse empty completions and
     terminate on the fallback. ``AgentLoop(...)`` raises ``ValueError``
-    at construction when both are enabled.
+    at construction when both are enabled, and likewise for
+    ``stream=True`` + ``tool_mode=ToolMode.NATIVE``.
 """
 
 from __future__ import annotations
@@ -82,6 +98,7 @@ from fifty_agent_sdk.streaming import (
     ToolFailedEvent,
     ToolStartedEvent,
 )
+from fifty_agent_sdk.tool_mode import ToolMode, _resolve_tool_mode
 from fifty_agent_sdk.tools.protocol import Tool, ToolResult
 from fifty_agent_sdk.tools.registry import Registry
 
@@ -149,9 +166,10 @@ def _render_openai_tools(tools: list[Tool]) -> list[dict[str, Any]]:
 
     The ``parameters`` sub-object mirrors the four fields on
     :class:`fifty_agent_sdk.tools.protocol.ToolSchema` exactly. This is only
-    called when :attr:`SafetyConfig.native_tools_enabled` is on — the default
-    flag-OFF path never builds this envelope, so no tool declaration reaches
-    the wire and the request is byte-for-byte pre-BR-008.
+    called when native tools are declared — ``tool_mode=ToolMode.NATIVE``, or
+    :attr:`SafetyConfig.native_tools_enabled` on the legacy path. Every other
+    path never builds this envelope, so no tool declaration reaches the wire
+    and the request is byte-for-byte pre-BR-008.
 
     Args:
         tools: Snapshot of registered tools from
@@ -159,7 +177,8 @@ def _render_openai_tools(tools: list[Tool]) -> list[dict[str, Any]]:
 
     Returns:
         A list of OpenAI ``tools`` entries, one per tool. Empty list for an
-        empty tool set (the consumer can decide whether to omit the param).
+        empty tool set (the caller decides whether to omit the param —
+        ``ToolMode.NATIVE`` omits it, the legacy flag sends ``[]``).
     """
     return [
         {
@@ -281,7 +300,12 @@ class AgentLoop:
             tools. A snapshot of :meth:`Registry.list` is taken at
             construction and embedded in the system prompt.
         parser: :class:`fifty_agent_sdk.parser.base.Parser` matching the LLM's
-            output format.
+            output format. REQUIRED when ``tool_mode`` is omitted (a
+            :class:`TypeError` otherwise, as in 1.7.0). Optional under
+            ``ToolMode.JSON`` / ``ToolMode.PROSE``, where the mode supplies
+            its parser and a compatible custom parser (for example a wrapper
+            around :class:`JsonModeParser`) is honoured. Must be omitted under
+            ``ToolMode.NATIVE``.
         prompts: :class:`fifty_agent_sdk.prompts.PromptSections` slots. The
             loop OWNS the ``tool_descriptions`` slot (it is rebuilt from
             the registry snapshot); the caller supplies the rest. If
@@ -296,17 +320,27 @@ class AgentLoop:
             :class:`fifty_agent_sdk.streaming.TokenEvent` for the FINAL answer
             only. Default ``False`` — uses :meth:`LLMClient.complete`,
             no token events. MUST NOT be combined with
-            ``SafetyConfig(native_tools_enabled=True)`` — streamed responses
-            carry no structured ``tool_calls``, so that combination is
-            rejected at construction (see Raises).
+            ``SafetyConfig(native_tools_enabled=True)`` or
+            ``tool_mode=ToolMode.NATIVE`` — streamed responses carry no
+            structured ``tool_calls``, so those combinations are rejected at
+            construction (see Raises).
         output_format: Optional override for the system prompt's
             ``output_format`` slot. When non-empty, replaces whatever is
             in ``prompts.output_format``. Useful for callers that want
             to pin the parser-aligned format without rebuilding
-            ``prompts``.
+            ``prompts``. Under an explicit ``tool_mode`` an empty value (in
+            both slots) takes the mode's own format, and a shipped format
+            constant belonging to a different mode raises
+            :class:`ValueError`.
         tool_message_role: Wire-format role used for the synthetic message
-            the loop appends after a tool invocation. The default
-            ``"tool"`` preserves the OpenAI tool-role wire format and is
+            the loop appends after a tool invocation. ``None`` (the default)
+            means "not set": it resolves to ``"tool"`` when ``tool_mode`` is
+            omitted (the 1.7.0 default), to ``"assistant"`` under
+            ``ToolMode.JSON`` / ``ToolMode.PROSE`` (``"user"`` allowed,
+            ``"tool"`` rejected — a text tool call has no id to pair with),
+            and to ``"tool"`` under ``ToolMode.NATIVE`` (the only allowed
+            value). On the legacy path, ``"tool"`` preserves the OpenAI
+            tool-role wire format and is
             correct for any provider whose chat-message schema accepts
             ``role="tool"`` with ``tool_call_id`` and ``name`` fields. Set
             to ``"user"`` or ``"assistant"`` for providers whose
@@ -325,9 +359,24 @@ class AgentLoop:
             receive ``hooks`` from a Runner — the two are wired
             independently by the consumer). A raising hook never aborts the
             loop. When ``None`` (default), hook dispatch is zero-overhead.
+        tool_mode: FR-001. A :class:`fifty_agent_sdk.tool_mode.ToolMode` (or
+            its string value) that configures the parser, output format,
+            tool-result role, tool declaration and parser-retry reminder
+            together, so switching protocol is a one-value change. Passing
+            it together with an owned knob (``parser``, ``output_format``,
+            ``tool_message_role``, ``SafetyConfig.native_tools_enabled``)
+            whose value belongs to another mode raises :class:`ValueError`.
+            ``None`` (default) sends the same request bodies and system
+            prompt as 1.7.0 (same keys, values and JSON types); the one
+            event-level change is ``ThoughtEvent.text`` on native tool
+            turns (see CHANGELOG).
 
     Raises:
-        ValueError: When ``stream=True`` is combined with
+        TypeError: When both ``parser`` and ``tool_mode`` are omitted.
+        ValueError: When ``tool_mode`` is not a valid :class:`ToolMode`; when
+            ``tool_mode`` conflicts with an owned knob (see ``tool_mode``);
+            when ``tool_mode=ToolMode.NATIVE`` is combined with
+            ``stream=True``; and when ``stream=True`` is combined with
             ``SafetyConfig(native_tools_enabled=True)``. A streamed
             completion carries no structured ``tool_calls`` (the LLM
             adapter deliberately drops streamed tool-call deltas), so the
@@ -344,53 +393,75 @@ class AgentLoop:
         # TODO(BR-008+): Widen `registry` to a RegistryProtocol once non-in-process
         # providers (MCP, RPC) land — current type pins us to the concrete class.
         registry: Registry,
-        parser: Parser,
+        parser: Parser | None = None,
         prompts: PromptSections,
         safety: SafetyConfig,
         model: str,
         stream: bool = False,
         output_format: str = "",
-        tool_message_role: Literal["tool", "user", "assistant"] = "tool",
+        tool_message_role: Literal["tool", "user", "assistant"] | None = None,
         hooks: Hooks | None = None,
+        tool_mode: ToolMode | None = None,
     ) -> None:
-        if stream and safety.native_tools_enabled:
-            raise ValueError(
-                "stream=True is incompatible with "
-                "SafetyConfig(native_tools_enabled=True): a streamed "
-                "completion carries no structured tool_calls, so native "
-                "tool dispatch can never fire. Disable streaming or turn "
-                "native_tools_enabled off."
-            )
+        # FR-001: resolve every tool-calling knob together. `tool_mode=None`
+        # is the frozen legacy path — each resolved value equals what 1.7.0
+        # read directly (parser required, role "tool", native behaviour keyed
+        # on `safety.native_tools_enabled`, the stream/native ValueError
+        # verbatim) — so omitting it sends the same request bodies as 1.7.0
+        # (AC-3: content pinned by tests/loop/test_legacy_golden.py; key order
+        # by the unchanged _build_body).
+        resolved = _resolve_tool_mode(
+            tool_mode=tool_mode,
+            parser=parser,
+            prompts=prompts,
+            output_format=output_format,
+            tool_message_role=tool_message_role,
+            safety=safety,
+            stream=stream,
+        )
         self._llm = llm
         self._registry = registry
-        self._parser = parser
+        self._parser = resolved.parser
         # BR-007: native (provider-structured) tool-call parser. Constructed
         # here (no constructor arg — concrete class) so the precedence branch
         # in `run()` can dispatch a populated `response.message.tool_calls`
         # through it. Independent of the text `Parser`; does not participate
         # in prompt building (the system-prompt snapshot below is unchanged).
         self._native_parser = NativeToolsParser()
+        # The consumer's own frozen SafetyConfig, never copied or mutated.
+        # Values derived from the tool mode live in the attributes below.
         self._safety = safety
         self._model = model
         self._stream = stream
-        self._tool_message_role: Literal["tool", "user", "assistant"] = tool_message_role
+        self._tool_message_role: Literal["tool", "user", "assistant"] = resolved.tool_message_role
         self._hooks = hooks
+        self._tool_mode: ToolMode | None = resolved.mode
+        self._declare_native_tools = resolved.declare_native_tools
+        self._native_precedence = resolved.native_precedence
+        self._omit_empty_tools = resolved.omit_empty_tools
+        self._parser_retry_reminder = resolved.parser_retry_reminder
+        self._echo_blank_retry = resolved.echo_blank_retry
         # Snapshot tool descriptions ONCE; subsequent registry mutations are
         # invisible to this loop instance. Documented behavior.
-        self._system_prompt = self._build_system_prompt(prompts, output_format)
+        self._system_prompt = self._build_system_prompt(prompts, resolved.output_format)
 
     def _build_system_prompt(self, prompts: PromptSections, output_format: str) -> str:
         """Render the system prompt from a registry snapshot and the provided slots.
 
-        When :attr:`SafetyConfig.native_tools_enabled` is on, the prompt-side
-        tool-description block is SUPPRESSED (left empty) so tools are declared
-        to the model ONLY via the OpenAI ``tools`` request param. Declaring
-        them in both places risks the model emitting text-mode JSON tool calls
-        instead of native ``tool_calls`` — the structured ``tools`` param is
-        the sole source of truth under native mode. When the flag is off (the
-        default), the renderer runs exactly as before — byte-for-byte.
+        When native tools are declared (``ToolMode.NATIVE``, or
+        :attr:`SafetyConfig.native_tools_enabled` on the legacy path), the
+        prompt-side tool-description block is SUPPRESSED (left empty) so tools
+        are declared to the model ONLY via the OpenAI ``tools`` request param.
+        Declaring them in both places risks the model emitting text-mode JSON
+        tool calls instead of native ``tool_calls`` — the structured ``tools``
+        param is the sole source of truth under native mode. Otherwise the
+        renderer runs exactly as before — byte-for-byte.
+
+        ``output_format`` is the resolved value from the tool-mode resolver:
+        the raw kwarg on the legacy path, the mode's effective format under an
+        explicit ``tool_mode`` (FR-001).
         """
-        if self._safety.native_tools_enabled:
+        if self._declare_native_tools:
             tool_block = ""
         else:
             tool_block = _render_tool_descriptions(self._registry.list())
@@ -406,14 +477,22 @@ class AgentLoop:
     def _build_request(self, messages: list[ChatMessage]) -> ChatRequest:
         """Wrap the working message list in a :class:`ChatRequest` for this loop's model.
 
-        When :attr:`SafetyConfig.native_tools_enabled` is on, the request
-        carries the registry's tools as the OpenAI ``tools`` param (built via
-        :func:`_render_openai_tools`) plus ``tool_choice="auto"``. When the
-        flag is off (the default), the request is exactly
+        When native tools are declared (``ToolMode.NATIVE``, or
+        :attr:`SafetyConfig.native_tools_enabled` on the legacy path), the
+        request carries the registry's tools as the OpenAI ``tools`` param
+        (built via :func:`_render_openai_tools`) plus ``tool_choice="auto"``.
+        Otherwise the request is exactly
         ``ChatRequest(messages=..., model=...)`` — byte-for-byte pre-BR-008.
+
+        Under ``ToolMode.NATIVE`` an EMPTY registry sends neither ``tools`` nor
+        ``tool_choice`` (OpenAI rejects an empty ``tools`` array); the registry
+        is re-read every iteration, so a later registration is declared on the
+        next turn. The legacy flag keeps sending ``tools=[]`` (FR-001 D10).
         """
-        if self._safety.native_tools_enabled:
+        if self._declare_native_tools:
             tools = _render_openai_tools(self._registry.list())
+            if not tools and self._omit_empty_tools:
+                return ChatRequest(messages=list(messages), model=self._model)
             return ChatRequest(
                 messages=list(messages),
                 model=self._model,
@@ -570,7 +649,9 @@ class AgentLoop:
                 # return. In stream mode `response is None` (a stream has no
                 # single response object), so a streamed turn CANNOT go
                 # native (D5) and falls through to the text path unchanged.
-                if response is not None and response.message.tool_calls:
+                # FR-001 D9: the precedence is mode-gated. Legacy and NATIVE
+                # keep it; an explicit JSON/PROSE loop turns it off (below).
+                if self._native_precedence and response is not None and response.message.tool_calls:
                     try:
                         parsed = self._native_parser.parse(response)
                     except ParserError as exc:
@@ -597,6 +678,23 @@ class AgentLoop:
                     # Native parse does not retry — leave the inner loop and
                     # continue with the unchanged branching logic below.
                     break
+                if (
+                    not self._native_precedence
+                    and response is not None
+                    and response.message.tool_calls
+                ):
+                    # FR-001 D9: an explicit JSON/PROSE loop never declared
+                    # tools, so structured tool_calls are unrequested. Running
+                    # them would put a native assistant turn before a
+                    # role="assistant"/"user" result — the mirror image of the
+                    # half-native 400. Ignore them and parse the text instead.
+                    # Log the count only, never content (§10). Unreachable on
+                    # the legacy path, where `_native_precedence` is True.
+                    _log.warning(
+                        "native_tool_calls_ignored",
+                        count=len(response.message.tool_calls),
+                        run_id=run_id,
+                    )
                 native_turn = False
                 try:
                     parsed = self._parser.parse(completion)
@@ -615,11 +713,18 @@ class AgentLoop:
                             error_phase=exc.context.get("error_phase"),
                             run_id=run_id,
                         )
-                        working.append(ChatMessage(role="assistant", content=completion))
+                        # FR-001 D6: under an explicit tool_mode a BLANK
+                        # completion is not echoed (it carries no information
+                        # and some backends reject an empty assistant
+                        # message). Legacy always echoes, as in 1.7.0.
+                        if self._echo_blank_retry or completion.strip():
+                            working.append(ChatMessage(role="assistant", content=completion))
+                        # FR-001 D11 (AC-6): the mode-appropriate reminder.
+                        # Legacy resolves this to `safety.parser_retry_reminder`.
                         working.append(
                             ChatMessage(
                                 role="user",
-                                content=self._safety.parser_retry_reminder,
+                                content=self._parser_retry_reminder,
                             )
                         )
                         parser_retries_this_iteration += 1

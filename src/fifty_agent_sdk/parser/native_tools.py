@@ -30,9 +30,16 @@ Scope note (BR-006): a native response carrying MULTIPLE tool calls is parsed
 into a :class:`~fifty_agent_sdk.parser.base.MultiAction` carrying the FULL
 list; the loop dispatches them concurrently under a bounded gather. A
 single-call response yields a :class:`~fifty_agent_sdk.parser.base.
-ThoughtAction` byte-identical to the pre-BR-006 path (and to a text-parsed
-call). Multi-call dispatch is net-new (today's text path is strictly
+ThoughtAction`, the same shape as a text-parsed call, so the loop's
+single-call dispatch runs unchanged. Multi-call dispatch is net-new (today's text path is strictly
 single-call), so this is not a regression.
+
+Thought channel (FR-001 AC-5): a provider may send assistant prose in
+``content`` alongside ``tool_calls``. That prose is carried as the result's
+``thought`` (stripped) for both single- and multi-call turns; blank or
+whitespace-only content yields ``thought=""``. Only the parse RESULT changes —
+the loop still replays the verbatim ``content`` on the assistant turn, so the
+wire is unchanged.
 """
 
 from __future__ import annotations
@@ -87,13 +94,15 @@ class NativeToolsParser:
     :data:`ParseResult`:
 
     * ONE call → :class:`~fifty_agent_sdk.parser.base.ThoughtAction`
-      carrying the single call — byte-identical to the pre-BR-006 path and
-      to a text-parsed call, so the loop's single-call dispatch block runs
-      verbatim.
+      carrying the single call — the same shape as a text-parsed call, so
+      the loop's single-call dispatch block runs verbatim.
     * MORE THAN ONE call → :class:`~fifty_agent_sdk.parser.base.MultiAction`
       carrying the FULL list (in CALL order), which the loop dispatches
       concurrently under a bounded gather (BR-006). The truncation the
       pre-BR-006 parser applied to multi-call responses is removed.
+
+    Both result types carry the response's non-blank ``content`` (stripped)
+    as ``thought`` (FR-001 AC-5); blank content gives ``thought=""``.
 
     The class satisfies :class:`NativeToolsParserProtocol`.
 
@@ -122,11 +131,13 @@ class NativeToolsParser:
         """Convert a provider-native tool-call response into a parse result.
 
         A response carrying exactly ONE ``tool_calls`` entry yields a
-        :class:`~fifty_agent_sdk.parser.base.ThoughtAction` (byte-identical to
+        :class:`~fifty_agent_sdk.parser.base.ThoughtAction` (the same shape as
         the pre-BR-006 single-call path). A response carrying MORE THAN ONE
         entry yields a :class:`~fifty_agent_sdk.parser.base.MultiAction`
         carrying the full list in CALL order; the loop dispatches them
-        concurrently (BR-006).
+        concurrently (BR-006). Either result carries the response's
+        non-blank ``content``, stripped, as its ``thought`` (FR-001 AC-5);
+        blank or whitespace-only content gives ``thought=""``.
 
         Args:
             response: The chat response carrying native ``tool_calls``.
@@ -163,13 +174,19 @@ class NativeToolsParser:
                         "completion_excerpt": (response.message.content or "")[:_MAX_EXCERPT],
                     },
                 )
+        # FR-001 AC-5: prose the provider sent next to `tool_calls` is the
+        # turn's thought. Previously discarded (thought was always ""). Only
+        # the parse result changes; the loop replays the verbatim `content`
+        # on the assistant turn, so requests are unchanged.
+        content = response.message.content or ""
+        thought = content.strip()
         if len(calls) == 1:
-            # Single call: byte-identical to the pre-BR-006 path. The loop's
-            # unchanged single-call ThoughtAction dispatch block runs verbatim.
-            return ThoughtAction(thought="", tool_call=calls[0])
+            # Single call: the loop's unchanged single-call ThoughtAction
+            # dispatch block runs verbatim.
+            return ThoughtAction(thought=thought, tool_call=calls[0])
         # Multi-call: carry the full list. The loop's MultiAction branch
         # dispatches them concurrently under a bounded gather.
-        return MultiAction(thought="", tool_calls=list(calls))
+        return MultiAction(thought=thought, tool_calls=list(calls))
 
 
 __all__ = ["NativeToolsParser", "NativeToolsParserProtocol"]
