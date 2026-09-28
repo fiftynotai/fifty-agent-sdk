@@ -108,6 +108,11 @@ row the moment one acquires a real consumer.
   covered by the MCP row instead.
 - `Registry` (`src/fifty_agent_sdk/tools/registry.py`) — a concrete class, not a
   protocol; consumers construct it but do not substitute it.
+- `Interventions` (`src/fifty_agent_sdk/interventions.py`) — the FR-003
+  intervention hooks, new in 1.10.0. No consumer has adopted them as of
+  2026-09-28. Add a Runtime Contracts row, and consider a stability pin, when
+  one does; the positional hook signatures, the decision types and the
+  `BeforeToolFallback` values are what that row will cover.
 
 ## Known limitations
 

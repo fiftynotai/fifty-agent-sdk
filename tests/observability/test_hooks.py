@@ -13,6 +13,10 @@ Covers BR-012's model + dispatch-helper surface:
 * :func:`invoke_hook` swallows a raising hook and logs a ``hook.invoke_failed``
   WARNING.
 * :func:`invoke_hook` re-raises :class:`asyncio.CancelledError` untouched.
+
+And FR-003's shared primitive: the private :func:`_call_hook` returns the
+hook's value, awaited when the result is awaitable, for a sync hook, an async
+hook and a sync hook returning a coroutine.
 """
 
 from __future__ import annotations
@@ -25,7 +29,7 @@ import structlog
 
 from fifty_agent_sdk import Hooks as TopLevelHooks
 from fifty_agent_sdk.observability import Hooks
-from fifty_agent_sdk.observability.hooks import invoke_hook
+from fifty_agent_sdk.observability.hooks import _call_hook, invoke_hook
 
 # ---------------------------------------------------------------------------
 # The Hooks model
@@ -234,3 +238,48 @@ async def test_invoke_hook_does_not_log_for_cancelled_error() -> None:
             await invoke_hook(hook, "on_run_end")
 
     assert [e for e in logs if e.get("event") == "hook.invoke_failed"] == []
+
+
+# ---------------------------------------------------------------------------
+# _call_hook — the shared awaitable-inspection primitive (FR-003 D4)
+# ---------------------------------------------------------------------------
+
+
+async def test_call_hook_returns_sync_hook_value() -> None:
+    """A plain ``def`` hook is called once and its value is returned as-is (FR-003 D4)."""
+    calls: list[tuple[object, ...]] = []
+
+    def hook(*args: object) -> str:
+        calls.append(args)
+        return "note"
+
+    assert await _call_hook(hook, "s1", "call-1") == "note"
+    assert calls == [("s1", "call-1")]
+
+
+async def test_call_hook_awaits_async_hook_value() -> None:
+    """An ``async def`` hook is awaited once and the awaited value is returned (FR-003 AC-5)."""
+    calls: list[tuple[object, ...]] = []
+
+    async def hook(*args: object) -> str:
+        calls.append(args)
+        return "awaited note"
+
+    assert await _call_hook(hook, "s1") == "awaited note"
+    assert calls == [("s1",)]
+
+
+async def test_call_hook_awaits_result_of_sync_hook_returning_coroutine() -> None:
+    """A sync function returning a coroutine has its RESULT awaited and returned (FR-003 AC-5).
+
+    ``inspect.iscoroutinefunction(hook)`` is ``False`` here, so this case tells
+    result inspection apart from a function-kind guess.
+    """
+
+    async def _inner() -> str:
+        return "from coroutine"
+
+    def hook() -> object:
+        return _inner()
+
+    assert await _call_hook(hook) == "from coroutine"
