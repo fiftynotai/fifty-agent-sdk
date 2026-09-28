@@ -78,7 +78,7 @@ Wiring
     job.
 
 Argument copies
-    Each hook gets its own ``copy.deepcopy`` of the arguments. ``before_tool``
+    Each hook gets its own deep copy of the arguments. ``before_tool``
     copies the model's arguments before dispatch. ``after_tool`` copies the
     dispatched arguments after the tool returns; the tool itself received a
     one-level copy, as in 1.9.0, so nested values may carry in-place edits the
@@ -86,18 +86,31 @@ Argument copies
     depth, reaches the dispatch, the events, the model's assistant turn or the
     other hook. The ``ToolResult`` is not copied.
 
-    The shipped parsers and LLM client produce JSON-decoded arguments, which
-    copy unless they are nested deeply enough to exhaust the recursion limit.
-    When ``copy.deepcopy`` raises (that nesting, or an object a custom parser
-    or a custom ``LLMClient`` put into ``ToolCall.args``), that hook gets a
-    shallow ``dict(args)`` instead, isolated at the top level only, and one
-    WARNING ``intervention.args_not_copyable`` is logged. That is not a hook
-    failure: the hook still runs and no fallback applies.
+    The copy walks exact ``dict`` and ``list`` containers without recursion,
+    however deeply they nest, when each is reached from the arguments through
+    other exact dicts and lists. Exact ``str``, ``int``, ``float``, ``bool``
+    and ``None`` values are kept as they are, since they are immutable. Any
+    other value (a ``dict`` or ``list`` subclass, a tuple, any object) is
+    copied with ``copy.deepcopy``, together with everything inside it, and
+    shared references and cycles come out as ``copy.deepcopy`` makes them. The
+    shipped parsers and LLM client decode arguments with ``json.loads``, which
+    builds only exact dicts, lists and those scalars, so for them how deeply
+    the model nests its arguments does not matter to the copy. Apart from
+    running out of memory, only a non-JSON value that cannot be copied falls
+    back, and only host code supplies one: a custom parser or a custom
+    ``LLMClient`` that puts it into ``ToolCall.args``, or, for
+    ``after_tool``'s copy, also a :class:`ReplaceToolArgs` replacement, a tool
+    that stores one into its own nested arguments, or other code that stores
+    one into the arguments' nested values (an event consumer writing into
+    ``ActionEvent.args``, say). That hook then gets a shallow ``dict(args)``
+    instead, isolated at the top level only, and one WARNING
+    ``intervention.args_not_copyable`` is logged. That is not a hook failure:
+    the hook still runs and no fallback applies.
 
-    The model controls how deeply its arguments nest, so it can cause this
-    fallback. Never rely on an in-place edit staying private: change arguments
-    with :class:`ReplaceToolArgs`, and alert on
-    ``intervention.args_not_copyable``.
+    Change arguments with :class:`ReplaceToolArgs`, never by editing them in
+    place, and alert on ``intervention.args_not_copyable``: it means host code
+    supplied a value that cannot be copied, or the copy ran out of memory, so
+    that hook's nested edits were not isolated.
 
 Failure policy
     ``after_tool`` always fails soft: if it raises or returns something other
@@ -197,7 +210,7 @@ import copy
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Any, Final, TypeAlias
+from typing import Any, Final, TypeAlias, TypeVar, cast
 
 import structlog
 from pydantic import BaseModel, ConfigDict, field_validator
@@ -320,9 +333,9 @@ model tool call, before dispatch:
 * ``tool_name``: the name the model asked for. It may not be registered.
 * ``args``: the hook's own deep copy of the model's arguments, taken before
   dispatch. Nothing the hook does to it, at any depth, reaches the dispatch,
-  the events, the model's turn or ``after_tool`` (top-level only when the
-  arguments cannot be deep-copied; see the module docstring, "Argument
-  copies").
+  the events, the model's turn or ``after_tool`` (top-level only when a
+  non-JSON value in them cannot be copied or the copy runs out of memory; see
+  the module docstring, "Argument copies").
 
 Returns ``None`` (proceed), a :class:`ReplaceToolArgs` or a
 :class:`DenyToolCall`, or an awaitable of one of those. The RETURN VALUE is
@@ -346,8 +359,8 @@ protocol.ToolResult`, after that call's terminal event:
 * ``tool_name``: the registered tool that ran.
 * ``args``: the hook's own deep copy of the dispatched arguments, taken after
   the tool returns, so nested values may carry in-place edits the tool made to
-  its own arguments. Changing it affects nothing else (one level only when the
-  arguments cannot be deep-copied).
+  its own arguments. Changing it affects nothing else (one level only when a
+  non-JSON value in them cannot be copied or the copy runs out of memory).
 * ``result``: the registry's ``ToolResult`` by identity (the object the
   ``ObservationEvent`` carries). READ-ONLY; the SDK neither copies it nor
   writes to it.
@@ -456,18 +469,141 @@ def _fallback_label(outcome: _BeforeToolOutcome) -> str:
     return "call_denied" if outcome.denial is not None else "call_allowed"
 
 
+_T = TypeVar("_T")
+
+_JSON_SCALAR_TYPES: Final[frozenset[type[object]]] = frozenset({str, int, float, bool, type(None)})
+"""The exact types of the five JSON scalars, which :func:`_iterative_deepcopy` keeps as they are (TD-010).
+
+Matched by exact type, as ``copy.deepcopy`` matches its atomic types: an
+instance of a subclass (a ``str`` subclass with instance attributes, say) can
+carry mutable state, so it is copied like any other value.
+"""
+
+
+def _iterative_deepcopy(value: _T) -> _T:
+    """Return a deep copy of ``value`` that walks exact ``dict`` and ``list`` nesting without recursion (TD-010).
+
+    ``copy.deepcopy`` recurses for every nesting level, so JSON nested 500
+    levels deep, which ``json.loads`` decodes, already exhausts the default
+    recursion limit (measured on Python 3.14.3). This copy never recurses for
+    the containers ``json.loads`` builds:
+
+    * A container whose type is exactly ``dict`` or exactly ``list``, reached
+      from ``value`` through such containers, is copied on an explicit stack,
+      so its nesting depth is limited by memory, not by the recursion limit.
+      As in ``copy.deepcopy``, each copy starts empty, gets its memo entry
+      before any child and is filled in order. Unlike ``copy.deepcopy``, a
+      nested container is filled only after the rest of its parent, so a
+      non-JSON value whose copy reads another container of the tree (from
+      ``__deepcopy__`` or ``__setstate__``) may see that container's copy
+      still empty.
+    * A value whose type is exactly ``str``, ``int``, ``float``, ``bool`` or
+      ``NoneType`` is returned as it is, because it is immutable.
+    * Every other value, including a key of any other type and a ``dict`` or
+      ``list`` subclass, is copied with ``copy.deepcopy`` and the walk's memo,
+      together with everything inside it: a ``dict`` inside a tuple is copied
+      by ``copy.deepcopy``, with recursion. Shared references and cycles come
+      out as ``copy.deepcopy`` makes them: an object that gets a copy gets
+      exactly one, whether the walk or ``copy.deepcopy`` meets it first.
+
+    The walk's own work and output are linear in what it walks: each
+    distinct exact dict and list is processed once and each reference in it
+    followed once, so a diamond of any width built from them costs one copy
+    per container, and ``json.loads`` builds only trees of them. A value
+    handed to ``copy.deepcopy`` costs what ``copy.deepcopy`` costs, which is
+    not always linear: it never memoizes a value that copies to itself, such
+    as a tuple of immutables, so a diamond of such tuples takes time
+    exponential in its depth (measured on Python 3.14.3: about four times as
+    long for every two more levels), as in 1.10.0; only host code can supply
+    one. There is deliberately no node budget: the walk's output never
+    outgrows an input the producer has already built, a budget would only
+    add a fallback that wide but valid input could trigger, and it could not
+    see the work done inside ``copy.deepcopy``.
+
+    Args:
+        value: The value to copy. Never modified: the walk only reads it.
+
+    Returns:
+        The copy.
+
+    Raises:
+        Exception: Whatever ``copy.deepcopy`` raises for a value that is not
+            JSON, including ``RecursionError`` when that value, or JSON inside
+            it, nests past the recursion limit (a 5000-level ``OrderedDict``
+            chain, or a tuple holding a 5000-level dict). Never
+            ``RecursionError`` for ``dict`` or ``list`` nesting reached from
+            ``value`` through exact dicts and lists, however deep. Nothing is
+            caught here: the fallback for a copy that fails belongs to the
+            caller, :func:`_hook_args`.
+        RuntimeError: When a non-JSON value's copy resizes a dict that the
+            walk is iterating, as ``copy.deepcopy`` raised in 1.10.0.
+        MemoryError: When the copy runs out of memory.
+    """
+    scalar_types = _JSON_SCALAR_TYPES
+    value_type = type(value)
+    if value_type in scalar_types:
+        return value
+    # One memo for the whole copy, shared with every copy.deepcopy call below.
+    memo: dict[int, Any] = {}
+    if value_type is not dict and value_type is not list:
+        return copy.deepcopy(value, memo)
+    root: dict[Any, Any] | list[Any] = {} if value_type is dict else []
+    memo[id(value)] = root
+    stack: list[tuple[Any, Any]] = [(value, root)]
+    while stack:
+        source, target = stack.pop()
+        is_dict = type(source) is dict
+        for key, child in source.items() if is_dict else enumerate(source):
+            child_type = type(child)
+            if child_type in scalar_types:
+                child_copy = child
+            elif child_type is dict or child_type is list:
+                # TD-010: the memo entry is made when a container is first
+                # met, before its children, as copy.deepcopy does. A second
+                # reference or a cycle back to it resolves to this one copy,
+                # so each container is pushed once: that keeps the walk
+                # linear for a cycle and for a diamond of any width.
+                child_id = id(child)
+                if child_id in memo:
+                    child_copy = memo[child_id]
+                else:
+                    child_copy = {} if child_type is dict else []
+                    memo[child_id] = child_copy
+                    stack.append((child, child_copy))
+            else:
+                # The same memo, so a non-JSON value that references a
+                # container of this tree gets that container's copy (and
+                # copy.deepcopy keeps its own temporaries alive in it).
+                child_copy = copy.deepcopy(child, memo)
+            if is_dict:
+                # The value is copied before the key, as copy.deepcopy does.
+                new_key = key if type(key) in scalar_types else copy.deepcopy(key, memo)
+                target[new_key] = child_copy
+            else:
+                target.append(child_copy)
+    return cast(_T, root)
+
+
 def _hook_args(args: dict[str, Any], *, hook_name: str, call_id: str) -> dict[str, Any]:
     """The hook's own copy of ``args``: a deep copy, so nothing it does reaches the SDK.
 
     FR-003 review round 1: a shallow copy left nested values shared, so a hook
     editing ``args["filters"]`` in place changed what the tool received,
-    ``ActionEvent.args`` and the model's replayed turn. The shipped parsers
-    and LLM client produce JSON-decoded arguments, which deep-copy unless they
-    are nested deeply enough to exhaust the interpreter's recursion limit, a
-    depth the model controls. When ``copy.deepcopy`` raises (that nesting, or
-    an object a custom parser or a custom ``LLMClient`` put into
-    ``ToolCall.args``), the hook gets a shallow ``dict(args)`` instead, so
-    its isolation is top-level only, and one WARNING
+    ``ActionEvent.args`` and the model's replayed turn. TD-010: the copy is
+    :func:`_iterative_deepcopy`, which walks exact ``dict`` and ``list``
+    nesting reached from ``args`` through exact dicts and lists without
+    recursion, so no JSON nesting depth reaches the fallback below. (1.10.0
+    called ``copy.deepcopy``, which raised ``RecursionError`` for JSON nested
+    500 levels deep on Python 3.14.3.) The shipped parsers and LLM client
+    decode arguments with ``json.loads``, which builds nothing else. Apart
+    from a ``MemoryError`` while copying, which nesting depth does not cause,
+    the fallback covers only a non-JSON value that cannot be copied, and only
+    host code supplies one: an object a custom parser or a custom
+    ``LLMClient`` put into ``ToolCall.args``, or, for ``after_tool``'s copy,
+    one in a ``ReplaceToolArgs`` replacement or one that a tool or other code
+    (an event consumer writing into ``ActionEvent.args``, say) stored into the
+    arguments' nested values. Then the hook gets a shallow ``dict(args)``
+    instead, so its isolation is top-level only, and one WARNING
     ``intervention.args_not_copyable`` is logged. That is NOT a hook failure:
     the caller computes this outside the hook's ``try``, the hook still runs,
     and no fallback applies.
@@ -478,10 +614,12 @@ def _hook_args(args: dict[str, Any], *, hook_name: str, call_id: str) -> dict[st
         call_id: The call's id, for the log line.
 
     Returns:
-        A deep copy of ``args``, or a shallow one when that is impossible.
+        A deep copy of ``args``, or a one-level one when a non-JSON value in
+        it cannot be copied or the copy runs out of memory.
     """
     try:
-        return copy.deepcopy(args)
+        # A module global looked up at call time, so a test can spy on it.
+        return _iterative_deepcopy(args)
     except Exception as exc:
         # Type only, never str(exc): the message may quote the arguments.
         _log.warning(

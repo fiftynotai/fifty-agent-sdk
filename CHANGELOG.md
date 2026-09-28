@@ -6,6 +6,29 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.10.1] - 2026-09-28
+
+### Fixed
+- Intervention hooks now get a complete copy of the arguments the shipped parsers and LLM
+  client decode, however deeply the model nests them. In 1.10.0, JSON nested 500 levels
+  deep, which they decode, made `copy.deepcopy` raise `RecursionError` on Python 3.14.3,
+  so a model could cut each hook's copy down to one level (a `before_tool` edit to a
+  nested value then reached the dispatched arguments) and trigger the
+  `intervention.args_not_copyable` WARNING. Values of the exact types `json.loads` builds,
+  reached from the arguments through exact dicts and lists, are now handled without
+  recursion: dicts and lists are walked on an explicit stack (tested at 5000 levels), and
+  strings, numbers, booleans and `None` are kept as they are. Any other value, with
+  everything inside it, still goes through `copy.deepcopy`, and the copied structure,
+  shared references and cycles included, comes out as before. The fill order did change:
+  a non-JSON value whose `__deepcopy__` or `__setstate__` reads another dict or list of
+  the arguments during the copy may now see that container's copy still empty. Apart from
+  running out of memory, only a non-JSON value that cannot be copied can still take the
+  one-level fallback with its WARNING, and only host code supplies one: a custom parser
+  or `LLMClient`, or, for `after_tool`'s copy, a `ReplaceToolArgs` replacement or code
+  that stores one into the arguments' nested values (a tool, or an event consumer writing
+  into `ActionEvent.args`). No public API changes, and with no hook set no extra argument
+  copy is made, as before. (TD-010)
+
 ## [1.10.0] - 2026-09-28
 
 ### Added

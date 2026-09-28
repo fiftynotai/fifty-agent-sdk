@@ -25,11 +25,16 @@ What these pin:
 * AC-7: deny keeps the ToolNotFound event shape and skips dispatch; replace
   dispatches the replacement without rewriting the model's turn.
 * AC-4 companion: configured-but-passive interventions change nothing, and
-  without a hook no deep copy is made.
+  without a hook no extra argument copy is made (TD-010 adds a spy on the
+  copier, with a hook as its positive control, beside the ``copy.deepcopy``
+  spy, and an effect check that catches a deep copy on the dispatch and
+  replayed-turn path whatever name makes it: a tool's nested edit still
+  reaches the replayed native turn, as in 1.9.0).
 * Argument flow: ``after_tool`` sees each call's dispatched args (the
   replacement or the model's), never a tool's later top-level edits; hook
-  edits at any depth never leak; uncopyable args take the one-level fallback
-  without ever being treated as a hook failure.
+  edits at any depth never leak, also in args nested 5000 levels deep
+  (TD-010); uncopyable args take the one-level fallback without ever being
+  treated as a hook failure.
 * Dispatch log lines: ``tool_invoked`` per call as in 1.9.0, ``tool_denied``
   for a denied call.
 
@@ -74,6 +79,7 @@ from fifty_agent_sdk import (
     ToolResult,
     ToolStartedEvent,
 )
+from fifty_agent_sdk import interventions as interventions_module
 from tests.loop.conftest import (
     FakeLLMClient,
     FakeTool,
@@ -242,6 +248,15 @@ class _TopLevelArgEditingTool(FakeTool):
         return result
 
 
+class _NestedArgEditingTool(FakeTool):
+    """A :class:`FakeTool` that appends to ``args["filters"]["tags"]`` in place after running."""
+
+    async def invoke(self, args: dict[str, Any]) -> ToolResult:
+        result = await super().invoke(args)
+        args["filters"]["tags"].append(f"edited-by-{self.name}")
+        return result
+
+
 class _Uncopyable:
     """An argument value ``copy.deepcopy`` rejects, as a custom parser might produce."""
 
@@ -330,6 +345,94 @@ def _nested_args_loop(
     llm = FakeLLMClient(
         [
             make_multi_tool_response([(name, copy.deepcopy(_NESTED_ARGS)) for name in names]),
+            make_response("done"),
+        ]
+    )
+    loop = _loop(llm, _NATIVE, tools, interventions=interventions, max_concurrent_tool_calls=2)
+    return loop, llm, tools, names
+
+
+# TD-010 deep arguments. Built fresh for every call, without recursion, and
+# never passed to ``==``, ``repr``, ``json.dumps``, ``model_dump`` or the
+# golden harness helpers (``_drive``): all of them recurse.
+
+_DEEP_LEVELS = 5000
+"""How deeply the TD-010 arguments nest: five times the default recursion limit."""
+
+_MID_LEVEL = 2500
+"""The level halfway down, where the TD-010 hooks edit their copies."""
+
+
+def _deep_json_args() -> dict[str, Any]:
+    """Fresh model arguments whose ``deep`` value alternates dicts and lists 5000 levels deep.
+
+    Every level also holds scalars. The child is under key ``"a"`` of a dict
+    and at index 0 of a list; the innermost container is an empty dict.
+    """
+    deep: Any = {}
+    for level in range(_DEEP_LEVELS):
+        deep = {"a": deep, "n": level} if level % 2 else [deep, "s", 1.5, True, None]
+    return {"q": "open", "deep": deep}
+
+
+def _descend(value: Any, levels: int) -> Any:
+    """The container ``levels`` below ``value``: through key ``"a"`` of a dict, index 0 of a list."""
+    for _ in range(levels):
+        value = value["a"] if type(value) is dict else value[0]
+    return value
+
+
+def _edit_at_three_depths(args: dict[str, Any], marker: str) -> None:
+    """Edit :func:`_deep_json_args` args in place at the top level, level 2500 and the innermost container."""
+    args["q"] = marker
+    for level in (_MID_LEVEL, _DEEP_LEVELS):
+        container = _descend(args["deep"], level)
+        if type(container) is dict:
+            container[marker] = True
+        else:
+            container.append(marker)
+
+
+def _json_tree_difference(actual: Any, expected: Any) -> str | None:
+    """The first difference between two JSON trees, found by a lockstep walk without recursion, or ``None``.
+
+    At every node: the same exact type; for a ``dict`` the same keys in the
+    same order, for a ``list`` the same length, for a scalar an equal value.
+    ``==`` is applied to keys and scalars only, never to a container, so this
+    works at depths where ``==`` raises ``RecursionError`` (TD-010).
+    """
+    stack: list[tuple[Any, Any, int]] = [(actual, expected, 0)]
+    while stack:
+        got, want, depth = stack.pop()
+        if type(got) is not type(want):
+            return f"depth {depth}: {type(got).__name__} instead of {type(want).__name__}"
+        if type(want) is dict:
+            if list(got) != list(want):
+                return f"depth {depth}: different keys"
+            stack.extend((got[key], want[key], depth + 1) for key in want)
+        elif type(want) is list:
+            if len(got) != len(want):
+                return f"depth {depth}: length {len(got)} instead of {len(want)}"
+            stack.extend((g, w, depth + 1) for g, w in zip(got, want, strict=True))
+        elif got != want:
+            return f"depth {depth}: {got!r} instead of {want!r}"
+    return None
+
+
+def _deep_args_loop(
+    batch: bool, interventions: Interventions
+) -> tuple[AgentLoop, FakeLLMClient, dict[str, FakeTool], list[str]]:
+    """A NATIVE loop whose model calls ``ok`` (and ``ok2``, as a batch), each with fresh :func:`_deep_json_args`.
+
+    Mirrors :func:`_nested_args_loop` for TD-010.
+    """
+    tools = {
+        name: FakeTool(name, result=ToolResult(output=f"out-{name}")) for name in ("ok", "ok2")
+    }
+    names = ["ok", "ok2"] if batch else ["ok"]
+    llm = FakeLLMClient(
+        [
+            make_multi_tool_response([(name, _deep_json_args()) for name in names]),
             make_response("done"),
         ]
     )
@@ -1482,15 +1585,18 @@ def test_agent_loop_rejects_a_non_interventions_value(value: object) -> None:
 async def test_no_hook_runs_make_no_deep_copy(
     batch: bool, interventions: Interventions | None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """With no hook set a run deep-copies nothing; the hook argument copies exist only when a hook does (FR-003 review round 1, m3).
+    """With no hook set a run makes no ``copy.deepcopy`` call; the hook argument copies exist only when a hook does (FR-003 review round 1, m3).
 
     The spy replaces the ``copy.deepcopy`` attribute, so it records (and still
     performs) every call that looks the attribute up at call time. A deep copy
     made through a name bound at import time (``from copy import deepcopy``)
-    escapes it, so this test does not pin that (review round 2, N2). This pins
-    the deep-copy half of "no extra argument copy". An extra SHALLOW copy of
-    the args is not observable from outside the loop, because every consumer
-    already receives its own copy, so it is not pinned.
+    escapes it, so this test does not pin that (review round 2, N2). Since
+    TD-010 a hook's copy of JSON args makes no ``copy.deepcopy`` call either,
+    so this spy cannot see one: ``test_no_hook_runs_make_no_argument_copy``
+    and ``test_no_hook_runs_share_nested_args_with_the_replayed_turn_as_in_1_9_0``
+    pin that the no-hook path makes none. An extra SHALLOW copy of the args is
+    not observable from outside the loop, because every consumer already
+    receives its own copy, so it is not pinned.
     """
     loop, _llm, tools, names = _nested_args_loop(batch, interventions)
     real_deepcopy = copy.deepcopy
@@ -1507,6 +1613,94 @@ async def test_no_hook_runs_make_no_deep_copy(
     assert deep_copied == []
     assert isinstance(events[-1], FinalEvent)
     assert [tools[name].last_args for name in names] == [_NESTED_ARGS] * len(names)
+
+
+@pytest.mark.parametrize(
+    "interventions",
+    [
+        pytest.param(None, id="no_interventions"),
+        pytest.param(Interventions(), id="passive"),
+        pytest.param(Interventions(before_tool=_constant(None)), id="before_tool_control"),
+    ],
+)
+@pytest.mark.parametrize("batch", [False, True], ids=["native_single", "native_batch"])
+async def test_no_hook_runs_make_no_argument_copy(
+    batch: bool, interventions: Interventions | None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With no hook set a run never calls the hook-argument copier; with ``before_tool`` it calls it exactly once per model tool call (TD-010 AC-3).
+
+    The spy replaces the ``interventions._iterative_deepcopy`` attribute, the
+    copier ``_hook_args`` looks up at call time, and records every call while
+    still performing it. It exists because the ``copy.deepcopy`` spy in
+    ``test_no_hook_runs_make_no_deep_copy`` cannot see a copy of JSON args
+    since TD-010: the walk calls ``copy.deepcopy`` only for non-JSON values.
+    ``before_tool_control`` (a hook returning ``None``) is the positive
+    control: this spy must see one copy per call there, so a spy that sees
+    nothing fails. Like the other spy, it sees only calls that look the
+    attribute up at call time: a copy made through a name bound at import
+    time (``from fifty_agent_sdk.interventions import _iterative_deepcopy``)
+    escapes it, and
+    ``test_no_hook_runs_share_nested_args_with_the_replayed_turn_as_in_1_9_0``
+    catches such a copy on the dispatch and replayed-turn path by its effect
+    instead.
+    """
+    loop, _llm, tools, names = _nested_args_loop(batch, interventions)
+    real_copier = interventions_module._iterative_deepcopy
+    copied: list[object] = []
+
+    def recording_copier(value: Any) -> Any:
+        copied.append(value)
+        return real_copier(value)
+
+    monkeypatch.setattr(interventions_module, "_iterative_deepcopy", recording_copier)
+    events = [event async for event in loop.run(list(_USER))]
+    monkeypatch.undo()
+
+    has_hook = interventions is not None and interventions.before_tool is not None
+    assert copied == [_NESTED_ARGS] * (len(names) if has_hook else 0)
+    assert isinstance(events[-1], FinalEvent)
+    assert [tools[name].last_args for name in names] == [_NESTED_ARGS] * len(names)
+
+
+@pytest.mark.parametrize(
+    "interventions",
+    [pytest.param(None, id="no_interventions"), pytest.param(Interventions(), id="passive")],
+)
+@pytest.mark.parametrize("batch", [False, True], ids=["native_single", "native_batch"])
+async def test_no_hook_runs_share_nested_args_with_the_replayed_turn_as_in_1_9_0(
+    batch: bool, interventions: Interventions | None
+) -> None:
+    """With no hook set, a tool's in-place edit to a nested value of its args shows in the next request's replayed native turn, as in 1.9.0 (TD-010 AC-3).
+
+    This pins 1.9.0's no-hook sharing only as the observable proof that the
+    no-hook path makes no copy; it does not endorse that sharing. The tool
+    gets a one-level copy of the model's args and the replayed assistant turn
+    another, so both share the model's nested values. Any deeper copy on that
+    path breaks the sharing, whatever name it is made through, so this also
+    catches what both call-time spies miss: a copy through a name bound at
+    import time (``from copy import deepcopy``, or ``_iterative_deepcopy``
+    imported into ``loop.py``).
+    """
+    tools = {
+        name: _NestedArgEditingTool(name, result=ToolResult(output=f"out-{name}"))
+        for name in ("ok", "ok2")
+    }
+    names = ["ok", "ok2"] if batch else ["ok"]
+    llm = FakeLLMClient(
+        [
+            make_multi_tool_response([(name, copy.deepcopy(_NESTED_ARGS)) for name in names]),
+            make_response("done"),
+        ]
+    )
+    loop = _loop(llm, _NATIVE, tools, interventions=interventions, max_concurrent_tool_calls=2)
+    events = [event async for event in loop.run(list(_USER))]
+
+    replayed = llm.calls[1].messages[2].tool_calls or []
+    assert isinstance(events[-1], FinalEvent)
+    assert [tools[name].call_count for name in names] == [1] * len(names)
+    assert [tc.args["filters"]["tags"] for tc in replayed] == [
+        ["a", "b", f"edited-by-{name}"] for name in names
+    ]
 
 
 def _two_call_loop(batch: bool, interventions: Interventions | None) -> AgentLoop:
@@ -1702,3 +1896,72 @@ async def test_uncopyable_args_take_the_one_level_fallback_in_the_loop(batch: bo
     ]
     tool_messages = [m.content for m in llm.calls[-1].messages if m.role == "tool"]
     assert tool_messages == [f"out-{name}\n\nnote:{name}" for name in names]
+
+
+# --- Argument copies of deeply nested args (TD-010) ---------------------------------------
+
+
+@pytest.mark.parametrize("kind", ["proceed", "raise_allow"])
+@pytest.mark.parametrize("batch", [False, True], ids=["native_single", "native_batch"])
+async def test_hooks_isolate_nested_edits_in_args_nested_5000_levels_in_the_loop(
+    batch: bool, kind: str
+) -> None:
+    """With args nested 5000 levels deep, no hook edit at any depth reaches the tool, ``ActionEvent.args``, the model's replayed turn or the other hook, and no ``args_not_copyable`` is logged (TD-010 AC-1).
+
+    ``before_tool`` checks its copy against fresh args, edits it at the top
+    level, level 2500 and the innermost container, then returns ``None``
+    (``proceed``) or raises under ``ALLOW`` (``raise_allow``, so the call falls
+    open). Both dispatch the model's own args object, whose nested values the
+    tool's, the event's and the replayed turn's one-level copies share, so a
+    shallow hook copy would leak into all three. ``after_tool`` checks its copy
+    the same way, which pins that no ``before_tool`` edit reached it, then
+    edits it too. Every structure is compared with fresh args by a lockstep
+    walk (:func:`_json_tree_difference`), so each check covers every level.
+    Not observable, so not pinned: an ``after_tool`` edit reaching
+    ``before_tool``, because every ``before_tool`` of a turn runs before its
+    tools do. The decoder path is not tested here either: how deeply
+    ``json.loads`` decodes differs across Python minors (TD-010 evidence).
+    """
+    before_differences: list[str | None] = []
+    after_differences: list[str | None] = []
+
+    def before_tool(_sid: object, _cid: object, _name: object, args: dict[str, Any]) -> None:
+        before_differences.append(_json_tree_difference(args, _deep_json_args()))
+        _edit_at_three_depths(args, "BEFORE-TOOL-EDIT")
+        if kind == "raise_allow":
+            raise RuntimeError("guard crashed after editing its copy")
+
+    def after_tool(
+        _sid: object, _cid: object, _name: object, args: dict[str, Any], _r: object
+    ) -> None:
+        after_differences.append(_json_tree_difference(args, _deep_json_args()))
+        _edit_at_three_depths(args, "AFTER-TOOL-EDIT")
+
+    fallback = BeforeToolFallback.ALLOW if kind == "raise_allow" else BeforeToolFallback.DENY
+    interventions = Interventions(
+        before_tool=before_tool, after_tool=after_tool, before_tool_fallback=fallback
+    )
+    loop, llm, tools, names = _deep_args_loop(batch, interventions)
+    with structlog.testing.capture_logs() as logs:
+        events = [event async for event in loop.run(list(_USER))]
+
+    # Only scalars and short strings reach an assertion: pytest would repr
+    # the deep args if an assertion on them failed.
+    warnings = [(w["event"], w.get("fallback")) for w in _warnings(logs)]
+    finished = isinstance(events[-1], FinalEvent)
+    dispatched = [_json_tree_difference(tools[name].last_args, _deep_json_args()) for name in names]
+    shown = [
+        _json_tree_difference(event.args, _deep_json_args()) for event in _of(events, ActionEvent)
+    ]
+    replayed_calls = llm.calls[1].messages[2].tool_calls or []
+    replayed = [_json_tree_difference(tc.args, _deep_json_args()) for tc in replayed_calls]
+
+    hook_failures = [("intervention.hook_failed", "call_allowed")] * len(names)
+    assert warnings == (hook_failures if kind == "raise_allow" else [])
+    assert finished
+    assert [tools[name].call_count for name in names] == [1] * len(names)
+    assert before_differences == [None] * len(names)
+    assert after_differences == [None] * len(names)
+    assert dispatched == [None] * len(names)
+    assert shown == [None] * len(names)
+    assert replayed == [None] * len(names)
