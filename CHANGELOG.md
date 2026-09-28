@@ -6,6 +6,82 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.10.0] - 2026-09-28
+
+### Added
+- `Interventions` and `AgentLoop(interventions=...)`: hooks whose return values the loop
+  honours. They are separate from the observability `Hooks`, whose contract is unchanged,
+  and they are wired on the loop only (`AgentRunner` takes none; it already passes its
+  `session_id` down, and the loop forwards it). A value that is not an `Interventions`
+  raises `TypeError` at construction. (FR-003)
+- `after_tool(session_id, call_id, tool_name, args, result)`. It runs once for each
+  dispatched call that returned a `ToolResult`, a success or `is_error=True`, and never
+  for `ToolNotFound`, `ToolTimeout`, a denied call or a fatal error. It runs after that
+  call's terminal event has been yielded: under a runner, after the consumer handled the
+  event and `on_tool_end` fired; in a native batch, one call at a time in call order. A
+  non-blank string it returns is appended verbatim, after a blank line, to that call's
+  model-facing observation, in every tool mode and tool-result role; `None` or a blank
+  string adds nothing. The SDK never writes to the `ToolResult` (passed by identity,
+  read-only), and the events are the ones the run emits without the hook. It fails soft:
+  if it raises or returns anything other than a string or `None`, no note is added and a
+  WARNING is logged (`intervention.hook_failed` / `intervention.hook_invalid`, type only,
+  never the exception's text).
+- `before_tool(session_id, call_id, tool_name, args)`, with the decisions `DenyToolCall`
+  and `ReplaceToolArgs`. It runs before each tool call's `ActionEvent`, including calls
+  to unregistered names; `None` proceeds. A denied call is not run and keeps the event
+  shape an unregistered name has: `ActionEvent`, `ToolStartedEvent`, then
+  `ToolFailedEvent(error="Tool call denied: <reason>")`, and the model reads the same
+  text. A replacement is dispatched, and `ActionEvent.args`, `on_tool_start` and the
+  `tool_invocation` audit payload carry it; it is never written into the model's own
+  assistant turn.
+- Each hook gets its own deep copy of the arguments: `before_tool` of the model's, taken
+  before dispatch; `after_tool` of the dispatched ones, taken after the tool returns. The
+  tool itself still gets a one-level copy, as in 1.9.0, so nested values in `after_tool`'s
+  copy may carry in-place edits the tool made to its own arguments. Nothing a hook does to
+  its copy, even to a nested value, reaches the dispatch, the events, the model's turn or
+  the other hook; to change arguments, return `ReplaceToolArgs`. Arguments that cannot be
+  deep-copied (an object a custom parser or a custom `LLMClient` put into `ToolCall.args`,
+  or extreme nesting) are copied one level deep instead, and a WARNING
+  `intervention.args_not_copyable` is logged; the hook still runs. The model controls how
+  deeply its arguments nest, so it can cause this fallback. Never rely on an in-place edit
+  staying private: change arguments with `ReplaceToolArgs`, and alert on that WARNING.
+- `Interventions(before_tool_fallback=...)` and `BeforeToolFallback`. The consumer
+  chooses what happens when `before_tool` raises or returns something unusable:
+  - `BeforeToolFallback.DENY`, the default, fails closed: the call is denied with the
+    SDK's own reason.
+  - `BeforeToolFallback.ALLOW` fails open: the call runs with the model's original
+    arguments, never the hook's copy and never an invalid replacement.
+
+  Either way a returned `DenyToolCall` is honoured, and a WARNING is logged with
+  `fallback="call_denied"` or `"call_allowed"`. Use `DENY` for guards and for
+  argument-scoping hooks: a scoping hook (inject the tenant, clamp a limit) that fails
+  open dispatches the model's unscoped arguments. Use `ALLOW` only for advisory hooks,
+  where availability matters more than the check, and alert on `"call_allowed"`. The
+  plain strings `"deny"` and `"allow"` are accepted; an unknown value raises `ValueError`
+  at construction.
+- `BeforeToolHook` and `AfterToolHook`, the public types of the two callables. Both may
+  be sync or async, including callable objects and `functools.partial`.
+
+### Notes
+- With `interventions` omitted, the loop sends the same request bodies (same keys,
+  values and JSON types) and emits the same event stream as 1.9.0. This is pinned by the
+  1.7.0 and 1.8.0 goldens plus a new golden captured from 1.9.0, before any change, that
+  also records the event stream (types, order, `sequence` and payloads; timestamps
+  excluded, call ids normalised) and covers native batches with unregistered and timed-out
+  members. The same capture run against the published 1.9.0 wheel produced an identical
+  file. Key order holds by construction; the HTTP bytes the `openai` SDK sends were not
+  measured.
+- Persistence: a note or a denial text is part of that call's observation for the rest of
+  the run, so later requests in the same run carry it. It is never written to the state
+  store, like every tool observation; a later turn sees only the final answer.
+- `ActionEvent.args` now means the arguments a call is dispatched with. Only a host that
+  returns `ReplaceToolArgs` sees a difference.
+- There is no `before_llm_call` hook. To change a request, wrap the `LLMClient`.
+- `MCPClient(on_tool_error=...)` remains the way to replace MCP `isError` text:
+  `after_tool` only appends, and the two compose.
+- The hooks are called positionally and their signatures will not grow within 1.x; new
+  data arrives as a new hook or field.
+
 ## [1.9.0] - 2026-09-26
 
 ### Added

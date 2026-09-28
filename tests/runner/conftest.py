@@ -20,6 +20,7 @@ from fifty_agent_sdk import (
     AgentEvent,
     AgentLoop,
     AgentRunner,
+    Interventions,
     JsonModeParser,
     MemoryStateStore,
     PromptSections,
@@ -69,6 +70,7 @@ def make_runner(
     persona: str = "You are a helpful agent.",
     audit: AuditSink | None = None,
     hooks: Hooks | None = None,
+    interventions: Interventions | None = None,
 ) -> tuple[AgentRunner, StateStore]:
     """Build a ready-to-drive :class:`AgentRunner` and return it with its store.
 
@@ -84,6 +86,11 @@ def make_runner(
     and the :class:`AgentRunner` — the consumer-shares-one-instance pattern
     — so the two Loop-tier hooks and the five Runner-tier hooks all fire
     from one wired stack. Left ``None`` (default) no hooks fire.
+
+    Pass ``interventions`` to wire an
+    :class:`fifty_agent_sdk.interventions.Interventions` into the
+    :class:`AgentLoop` only: the Runner takes none (FR-003). Left ``None``
+    (default) the loop runs without interventions.
     """
     loop = AgentLoop(
         llm=llm,
@@ -93,6 +100,7 @@ def make_runner(
         safety=safety if safety is not None else SafetyConfig(),
         model="test-model",
         hooks=hooks,
+        interventions=interventions,
     )
     store = state if state is not None else MemoryStateStore()
     runner = AgentRunner(

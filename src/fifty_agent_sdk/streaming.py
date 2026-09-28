@@ -66,7 +66,11 @@ class ActionEvent(_EventBase):
     Attributes:
         event_type: Literal discriminator; always ``"action"``.
         tool_name: Name of the tool the model asked to invoke.
-        args: Arguments for the invocation. Defaults to ``{}``.
+        args: The arguments the call is dispatched with. These are the
+            model's arguments unless a ``before_tool`` intervention returned
+            a :class:`fifty_agent_sdk.interventions.ReplaceToolArgs`, in which
+            case they are the replacement (FR-003); for a call that
+            ``before_tool`` denies they are the model's. Defaults to ``{}``.
     """
 
     event_type: Literal["action"] = "action"
@@ -79,7 +83,11 @@ class ToolStartedEvent(_EventBase):
 
     Emitted right before :meth:`fifty_agent_sdk.tools.registry.Registry.invoke`
     is awaited. Pairs with a later :class:`ObservationEvent` or
-    :class:`ToolFailedEvent` carrying the same ``call_id``.
+    :class:`ToolFailedEvent` carrying the same ``call_id``. Also emitted for a
+    call that a ``before_tool`` intervention denies (FR-003), which is then
+    never dispatched and ends in a :class:`ToolFailedEvent`, the same shape as
+    an unregistered tool name: every tool call has exactly one
+    ``ToolStartedEvent``.
 
     Attributes:
         event_type: Literal discriminator; always ``"tool_started"``.
@@ -144,6 +152,8 @@ class ToolFailedEvent(_EventBase):
     * The tool returned ``ToolResult(is_error=True)``.
     * :class:`fifty_agent_sdk.errors.ToolNotFound` raised (hallucinated tool name).
     * :class:`fifty_agent_sdk.errors.ToolTimeout` raised (per-tool timeout).
+    * A ``before_tool`` intervention denied the call, so it never ran
+      (FR-003). ``error`` is ``"Tool call denied: <reason>"``.
 
     The loop appends a synthesized ``role="tool"`` message to the working
     history so the model can reason about the failure on the next

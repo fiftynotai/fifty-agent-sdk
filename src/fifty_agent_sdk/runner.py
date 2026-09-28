@@ -46,6 +46,9 @@ Transactional persistence invariants
       deterministically re-derivable from the assistant's final answer
       on the next turn. Tool-level provenance is instead captured through
       the optional :class:`fifty_agent_sdk.audit.protocol.AuditSink` (see below).
+      The same holds for an ``after_tool`` note or a ``before_tool`` denial
+      text (FR-003): it is part of that call's observation for the rest of
+      the run and is never persisted, in any tool-result role.
 
 Audit emission
     When an optional :class:`fifty_agent_sdk.audit.protocol.AuditSink` is wired
@@ -83,6 +86,18 @@ Observability hooks
     the swallow guarantee is what makes awaiting a hook there safe.
     :class:`asyncio.CancelledError` is re-raised untouched. When ``hooks``
     is ``None`` (the default) dispatch is zero-overhead.
+
+Interventions
+    The value-honouring hooks of :class:`fifty_agent_sdk.interventions.
+    Interventions` (FR-003) are wired on :class:`fifty_agent_sdk.loop.
+    AgentLoop` only; the Runner takes none. It already passes its
+    ``session_id`` into :meth:`AgentLoop.run`, which forwards it to
+    ``before_tool`` and ``after_tool``. A call that ``before_tool`` denies
+    still emits ``ActionEvent``, ``ToolStartedEvent`` and a terminal
+    ``ToolFailedEvent``, so the per-call correlation below (args claimed FIFO
+    per ``ToolStartedEvent``) holds unchanged, and a ``ReplaceToolArgs``
+    replacement is what ``on_tool_start`` and the ``tool_invocation`` audit
+    payload see, because both read ``ActionEvent.args``.
 
 Logging
     Module-level :mod:`structlog` logger. ``INFO`` on run start and run
@@ -262,7 +277,9 @@ class AgentRunner:
           session — only on the first ``run()`` call for that session.
         * Tool roundtrips are NOT persisted to state; the loop's working
           list carries them. Tool-level provenance is captured through the
-          optional ``audit`` sink instead.
+          optional ``audit`` sink instead. Intervention text (an
+          ``after_tool`` note, a ``before_tool`` denial; FR-003) is part of
+          those roundtrips and is never persisted either.
         * Audit emission is best-effort and isolated: a raising
           :class:`AuditSink` is caught and logged, never propagated. With
           ``audit=None`` the run behaves identically to a Runner built

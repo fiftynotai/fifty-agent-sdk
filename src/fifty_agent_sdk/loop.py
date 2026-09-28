@@ -29,6 +29,21 @@ Request options (FR-002)
     values and JSON types). The two are independent: setting
     ``reasoning_effort`` never drops or changes ``temperature``.
 
+Interventions (FR-003)
+    ``AgentLoop(interventions=...)`` takes a :class:`fifty_agent_sdk.
+    interventions.Interventions`, the loop's only value-honouring hooks (a
+    Runner has none). ``before_tool`` runs before each tool call's
+    ``ActionEvent`` and may deny the call or replace its arguments.
+    ``after_tool`` runs after each dispatched call's terminal event has been
+    yielded, and a note it returns is appended after a blank line to that
+    call's observation, at one point in :meth:`AgentLoop._build_tool_message`,
+    so every tool mode and role gets the same suffix. Notes and denials live
+    in the working list for the rest of the run and are never persisted.
+    With ``interventions`` omitted the loop sends the same request bodies
+    (same keys, values and JSON types) and emits the same event stream as
+    1.9.0 (timestamps and minted ids aside); see
+    :mod:`fifty_agent_sdk.interventions` for the contract.
+
 Statelessness
     Every :meth:`AgentLoop.run` call is its own scoped iteration. The
     loop holds no state across calls — conversation persistence and
@@ -77,6 +92,7 @@ import json
 import re
 import time
 from collections.abc import AsyncIterator
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Final, Literal, TypeVar
 from uuid import uuid4
@@ -90,6 +106,15 @@ from fifty_agent_sdk.errors import (
     ParserError,
     ToolNotFound,
     ToolTimeout,
+)
+from fifty_agent_sdk.interventions import (
+    _AFTER_TOOL_SEPARATOR,
+    AfterToolHook,
+    BeforeToolFallback,
+    BeforeToolHook,
+    Interventions,
+    _apply_after_tool,
+    _apply_before_tool,
 )
 from fifty_agent_sdk.llm.protocol import LLMClient
 from fifty_agent_sdk.llm.types import (
@@ -140,6 +165,22 @@ class _Unset(enum.Enum):
 
 _UNSET: Final = _Unset.UNSET
 """The single :class:`_Unset` member, the default of ``AgentLoop(temperature=)``."""
+
+
+@dataclass(frozen=True, slots=True)
+class _DeniedCall:
+    """A batch member that ``before_tool`` denied, carried through the gather (FR-003 D3).
+
+    ``_run_one`` returns it at once, without taking a semaphore slot, so the
+    gathered results stay index-aligned with the calls. The classification
+    loop turns it into a ``ToolFailedEvent`` and the denial observation.
+
+    Attributes:
+        text: The full denial text, ``"Tool call denied: <reason>"``.
+    """
+
+    text: str
+
 
 _AgentEventT = TypeVar(
     "_AgentEventT",
@@ -439,7 +480,8 @@ class AgentLoop:
             the synthetic message carries the tool name inline in its
             content (so the model retains identity context) and omits
             ``tool_call_id`` / ``name``.
-        hooks: Optional :class:`fifty_agent_sdk.observability.Hooks`. When set,
+        hooks: Optional :class:`fifty_agent_sdk.observability.Hooks`
+            (observability only; see ``interventions``). When set,
             the loop fires the two Loop-tier hooks — ``on_iteration`` once
             per ReACT iteration and ``on_llm_call`` once per successful LLM
             call. The other five hooks are Runner-tier; wire the SAME
@@ -448,6 +490,22 @@ class AgentLoop:
             receive ``hooks`` from a Runner — the two are wired
             independently by the consumer). A raising hook never aborts the
             loop. When ``None`` (default), hook dispatch is zero-overhead.
+        interventions: FR-003. Optional :class:`fifty_agent_sdk.
+            interventions.Interventions`: hooks whose return values the loop
+            honours, wired on the loop only (an :class:`fifty_agent_sdk.
+            runner.AgentRunner` takes none and forwards its ``session_id``
+            instead). ``before_tool`` runs before each tool call and may deny
+            it or replace its arguments; its failure behaviour is
+            ``Interventions.before_tool_fallback`` (``DENY``, the default,
+            fails closed). ``after_tool`` runs after each dispatched call's
+            terminal event and may return a note, appended after a blank line
+            to that call's model-facing observation in every tool mode and
+            role; it always fails soft. Neither changes a ``ToolResult``, and
+            neither note nor denial is ever persisted. With ``None`` (the
+            default) no hook is called and no extra argument copy or per-call
+            carrier is made, and the loop sends the same request bodies (same
+            keys, values and JSON types) and emits the same event stream as
+            1.9.0 (timestamps and minted ids aside).
         tool_mode: FR-001. A :class:`fifty_agent_sdk.tool_mode.ToolMode` (or
             its string value) that configures the parser, output format,
             tool-result role, tool declaration and parser-retry reminder
@@ -488,7 +546,10 @@ class AgentLoop:
             rather than passing the private default marker.
 
     Raises:
-        TypeError: When both ``parser`` and ``tool_mode`` are omitted.
+        TypeError: When both ``parser`` and ``tool_mode`` are omitted; when
+            ``interventions`` is neither ``None`` nor an
+            :class:`~fifty_agent_sdk.interventions.Interventions` (for example
+            a :class:`Hooks` passed by mistake).
         ValueError: When ``reasoning_effort`` is neither ``None`` nor a
             lowercase token; when ``temperature`` is neither ``None`` nor a
             number in ``[0.0, 2.0]`` (``bool`` and numeric strings are
@@ -520,6 +581,7 @@ class AgentLoop:
         output_format: str = "",
         tool_message_role: Literal["tool", "user", "assistant"] | None = None,
         hooks: Hooks | None = None,
+        interventions: Interventions | None = None,
         tool_mode: ToolMode | None = None,
         reasoning_effort: str | None = None,
         temperature: float | None | _Unset = _UNSET,
@@ -529,6 +591,13 @@ class AgentLoop:
         # a pydantic ValidationError inside run().
         reasoning_effort = _validate_reasoning_effort(reasoning_effort)
         temperature = _validate_temperature(temperature)
+        # FR-003: a wrong type (a Hooks passed by mistake, a dict) fails here,
+        # never on the first tool call inside run().
+        if interventions is not None and not isinstance(interventions, Interventions):
+            raise TypeError(
+                "interventions must be an Interventions instance or None; "
+                f"got {type(interventions).__name__}"
+            )
         # FR-001: resolve every tool-calling knob together. `tool_mode=None`
         # is the frozen legacy path — each resolved value equals what 1.7.0
         # read directly (parser required, role "tool", native behaviour keyed
@@ -561,6 +630,22 @@ class AgentLoop:
         self._stream = stream
         self._tool_message_role: Literal["tool", "user", "assistant"] = resolved.tool_message_role
         self._hooks = hooks
+        # FR-003: resolved once, at construction (coding_guidelines §8b); run()
+        # reads only these. `_before_tool_fallback` is read only when
+        # `_before_tool` is set, and `Interventions` has already normalised it
+        # to a BeforeToolFallback member.
+        self._interventions = interventions
+        self._before_tool: BeforeToolHook | None = (
+            interventions.before_tool if interventions is not None else None
+        )
+        self._after_tool: AfterToolHook | None = (
+            interventions.after_tool if interventions is not None else None
+        )
+        self._before_tool_fallback: BeforeToolFallback = (
+            interventions.before_tool_fallback
+            if interventions is not None
+            else BeforeToolFallback.DENY
+        )
         self._tool_mode: ToolMode | None = resolved.mode
         self._declare_native_tools = resolved.declare_native_tools
         self._native_precedence = resolved.native_precedence
@@ -678,10 +763,12 @@ class AgentLoop:
                 system message it constructed at ``__init__`` time.
             session_id: Opaque session identifier forwarded verbatim to the
                 Loop-tier observability hooks (``on_iteration`` and
-                ``on_llm_call``). ``None`` — the default — when the loop is
+                ``on_llm_call``) and to the intervention hooks
+                (``before_tool`` and ``after_tool``, FR-003). ``None`` — the
+                default — when the loop is
                 driven directly without an :class:`fifty_agent_sdk.runner.
                 AgentRunner`; a Runner passes the conversation's
-                ``session_id`` down. The hook contract types this parameter
+                ``session_id`` down. The hook contracts type this parameter
                 as ``str | None`` for exactly this reason.
 
         Yields:
@@ -998,14 +1085,39 @@ class AgentLoop:
                 # mirroring the single-call ThoughtEvent below).
                 yield self._make_event(ThoughtEvent, sequence_box, text=parsed.thought)
 
+                # FR-003 D3: what each call dispatches, and whether
+                # `before_tool` denied it. Without the hook every call passes
+                # through with the model's own args object: no hook call, no
+                # copy, no per-call carrier (coding_guidelines §9b), exactly as
+                # on the single-call path. With it, one decision per call, one
+                # at a time in CALL order with that call's own pre-minted id,
+                # before any ActionEvent.
+                batch_args: list[dict[str, Any]] = [tc.args for tc in calls]
+                batch_denials: list[str | None] = [None] * len(calls)
+                if self._before_tool is not None:
+                    for index, (tc, cid) in enumerate(zip(calls, call_ids, strict=True)):
+                        outcome = await _apply_before_tool(
+                            self._before_tool,
+                            fallback=self._before_tool_fallback,
+                            session_id=session_id,
+                            call_id=cid,
+                            tool_name=tc.name,
+                            args=tc.args,
+                        )
+                        batch_args[index] = outcome.args
+                        batch_denials[index] = outcome.denial
+
                 # One ActionEvent PER call, in CALL order, via _make_event so
-                # sequence stays monotonic and dense.
-                for tc in calls:
+                # sequence stays monotonic and dense. Each carries the args
+                # that call will be dispatched with (FR-003: a `before_tool`
+                # replacement when there is one; the model's args otherwise,
+                # including for a denied call).
+                for tc, call_args in zip(calls, batch_args, strict=True):
                     yield self._make_event(
                         ActionEvent,
                         sequence_box,
                         tool_name=tc.name,
-                        args=dict(tc.args),
+                        args=dict(call_args),
                     )
 
                 # Append the assistant turn carrying ALL N tool_calls (each
@@ -1013,7 +1125,9 @@ class AgentLoop:
                 # it is single-valued and cannot carry N ids; the per-call ids
                 # live on tool_calls[].id and _serialize_message sources each
                 # wire id from there (falling back to tool_call_id for the
-                # single-call path).
+                # single-call path). The entries keep the MODEL's args: a
+                # `before_tool` replacement never rewrites the model's own
+                # turn (FR-003 D5).
                 working.append(
                     ChatMessage(
                         role="assistant",
@@ -1030,20 +1144,27 @@ class AgentLoop:
                 # force-reconsider guard.
                 tool_invoked_this_run = True
 
-                # One ToolStartedEvent PER call, in CALL order.
-                for tc, cid in zip(calls, call_ids, strict=True):
+                # One ToolStartedEvent PER call, in CALL order. A call that
+                # `before_tool` denied gets one too, exactly like a ToolNotFound
+                # call (FR-003 D5). This is load-bearing: the Runner claims
+                # ActionEvent args FIFO per ToolStartedEvent, so skipping it
+                # for a denied member would hand the next call its args.
+                for tc, cid, call_denial in zip(calls, call_ids, batch_denials, strict=True):
                     yield self._make_event(
                         ToolStartedEvent,
                         sequence_box,
                         tool_name=tc.name,
                         call_id=cid,
                     )
-                    _log.debug(
-                        "tool_invoked",
-                        name=tc.name,
-                        call_id=cid,
-                        run_id=run_id,
-                    )
+                    if call_denial is not None:
+                        _log.debug("tool_denied", call_id=cid, run_id=run_id)
+                    else:
+                        _log.debug(
+                            "tool_invoked",
+                            name=tc.name,
+                            call_id=cid,
+                            run_id=run_id,
+                        )
 
                 # Semaphore-bounded gather (Decision §C). `return_exceptions=
                 # True` is MANDATORY: without it, the first failing call
@@ -1055,17 +1176,31 @@ class AgentLoop:
                 sem = asyncio.Semaphore(self._safety.max_concurrent_tool_calls)
 
                 async def _run_one(
-                    cid: str, tc: ToolCall, _sem: asyncio.Semaphore = sem
-                ) -> ToolResult:
+                    cid: str,
+                    tc: ToolCall,
+                    call_args: dict[str, Any],
+                    call_denial: str | None,
+                    _sem: asyncio.Semaphore = sem,
+                ) -> ToolResult | _DeniedCall:
+                    # FR-003 D3: a denied call returns its carrier at once,
+                    # without taking a semaphore slot, so raw_results stays
+                    # index-aligned with calls and call_ids.
+                    if call_denial is not None:
+                        return _DeniedCall(call_denial)
                     async with _sem:
                         return await self._registry.invoke(
                             tc.name,
-                            dict(tc.args),
+                            dict(call_args),
                             timeout=self._safety.tool_timeout_seconds,
                         )
 
                 raw_results = await asyncio.gather(
-                    *[_run_one(cid, tc) for cid, tc in zip(call_ids, calls, strict=True)],
+                    *[
+                        _run_one(cid, tc, call_args, call_denial)
+                        for cid, tc, call_args, call_denial in zip(
+                            call_ids, calls, batch_args, batch_denials, strict=True
+                        )
+                    ],
                     return_exceptions=True,
                 )
 
@@ -1076,10 +1211,36 @@ class AgentLoop:
                 # return_exceptions=True are RE-RAISED here (learning #886):
                 # a genuinely fatal error must still terminate; recoverable
                 # tool failures (ToolNotFound/ToolTimeout/is_error) yield a
-                # ToolFailedEvent + observation for THAT call only.
-                for tc, cid, raw in zip(calls, call_ids, raw_results, strict=True):
+                # ToolFailedEvent + observation for THAT call only. FR-003: one
+                # iteration is one call, so `after_tool` can only ever see this
+                # call's own id, args and result, and its note can only land in
+                # this call's own message.
+                for tc, cid, call_args, raw in zip(
+                    calls, call_ids, batch_args, raw_results, strict=True
+                ):
                     tool_name = tc.name
-                    if isinstance(raw, ToolNotFound):
+                    if isinstance(raw, _DeniedCall):
+                        # FR-003 D5: `before_tool` denied this call, so it never
+                        # ran. Same terminal shape and observation layout as
+                        # ToolNotFound below; `after_tool` does not run. This arm
+                        # is disjoint from every arm below (a _DeniedCall is
+                        # never an exception or a ToolResult).
+                        yield self._make_event(
+                            ToolFailedEvent,
+                            sequence_box,
+                            tool_name=tool_name,
+                            call_id=cid,
+                            error=raw.text,
+                        )
+                        working.append(
+                            self._build_tool_message(
+                                tool_name=tool_name,
+                                call_id=cid,
+                                content_for_tool_role=raw.text,
+                                content_for_other_role=f"Tool {tool_name} failed: {raw.text}",
+                            )
+                        )
+                    elif isinstance(raw, ToolNotFound):
                         yield self._make_event(
                             ToolFailedEvent,
                             sequence_box,
@@ -1136,6 +1297,9 @@ class AgentLoop:
                         # locks the recoverable contract.
                         raise raw
                     elif isinstance(raw, ToolResult):
+                        # FR-003 D2 (G1): `after_tool` runs only here, where a
+                        # ToolResult exists, AFTER this call's terminal event
+                        # is yielded and before its observation is appended.
                         if raw.is_error:
                             error_text = (
                                 raw.error
@@ -1149,6 +1313,18 @@ class AgentLoop:
                                 call_id=cid,
                                 error=error_text,
                             )
+                            note = (
+                                None
+                                if self._after_tool is None
+                                else await _apply_after_tool(
+                                    self._after_tool,
+                                    session_id=session_id,
+                                    call_id=cid,
+                                    tool_name=tool_name,
+                                    args=call_args,
+                                    result=raw,
+                                )
+                            )
                             working.append(
                                 self._build_tool_message(
                                     tool_name=tool_name,
@@ -1157,6 +1333,7 @@ class AgentLoop:
                                     content_for_other_role=(
                                         f"Tool {tool_name} failed: {error_text}"
                                     ),
+                                    augmentation=note,
                                 )
                             )
                         else:
@@ -1167,6 +1344,18 @@ class AgentLoop:
                                 call_id=cid,
                                 result=raw,
                             )
+                            note = (
+                                None
+                                if self._after_tool is None
+                                else await _apply_after_tool(
+                                    self._after_tool,
+                                    session_id=session_id,
+                                    call_id=cid,
+                                    tool_name=tool_name,
+                                    args=call_args,
+                                    result=raw,
+                                )
+                            )
                             working.append(
                                 self._build_tool_message(
                                     tool_name=tool_name,
@@ -1176,6 +1365,7 @@ class AgentLoop:
                                         f"Tool {tool_name} returned: "
                                         f"{_serialize_tool_output(raw.output)}"
                                     ),
+                                    augmentation=note,
                                 )
                             )
                     elif isinstance(raw, Exception):
@@ -1213,20 +1403,7 @@ class AgentLoop:
 
             # parsed is a ThoughtAction (narrowed by isinstance check above).
             yield self._make_event(ThoughtEvent, sequence_box, text=parsed.thought)
-            yield self._make_event(
-                ActionEvent,
-                sequence_box,
-                tool_name=parsed.tool_call.name,
-                args=dict(parsed.tool_call.args),
-            )
 
-            # Append the assistant turn to history before emitting ToolStarted, so the
-            # subsequent tool reply sits on top of the model's reasoning turn.
-            # BR-007 (D6): a native tool turn MUST carry the structured
-            # `tool_calls` on the assistant turn so provider-native replay can
-            # pair the subsequent `role="tool"` reply (keyed by `tool_call_id`)
-            # to this turn.
-            #
             # BR-008 (Decision B — the id-pairing reordering): mint the
             # `call_id` BEFORE the assistant-turn append and embed it on the
             # assistant message's `tool_call_id` (reusing the existing field —
@@ -1237,9 +1414,45 @@ class AgentLoop:
             # `tool_call_id` match — a strict OpenAI endpoint requires the
             # pairing key on BOTH sides or it returns 400 on turn 2. The
             # text-path `else` branch never read `call_id`; hoisting the mint
-            # above both branches is a no-op for text.
+            # above both branches is a no-op for text. FR-003 hoists it once
+            # more, above the ActionEvent, so `before_tool` receives the same
+            # id; it is still ONE uuid4 per call (learning #934).
             tool_name = parsed.tool_call.name
             call_id = uuid4().hex
+
+            # FR-003 D5: `before_tool` decides what this call dispatches (or
+            # that it is denied) before its ActionEvent. Without the hook the
+            # model's own args object passes through: no call, no copy.
+            dispatch_args = parsed.tool_call.args
+            denial: str | None = None
+            if self._before_tool is not None:
+                outcome = await _apply_before_tool(
+                    self._before_tool,
+                    fallback=self._before_tool_fallback,
+                    session_id=session_id,
+                    call_id=call_id,
+                    tool_name=tool_name,
+                    args=parsed.tool_call.args,
+                )
+                dispatch_args = outcome.args
+                denial = outcome.denial
+
+            # The ActionEvent carries the args this call is dispatched with: a
+            # `before_tool` replacement when there is one, else the model's.
+            yield self._make_event(
+                ActionEvent,
+                sequence_box,
+                tool_name=parsed.tool_call.name,
+                args=dict(dispatch_args),
+            )
+
+            # Append the assistant turn to history before emitting ToolStarted, so the
+            # subsequent tool reply sits on top of the model's reasoning turn.
+            # BR-007 (D6): a native tool turn MUST carry the structured
+            # `tool_calls` on the assistant turn so provider-native replay can
+            # pair the subsequent `role="tool"` reply (keyed by `tool_call_id`)
+            # to this turn. It carries the MODEL's args: a `before_tool`
+            # replacement never rewrites the model's own turn (FR-003 D5).
             if native_turn:
                 working.append(
                     ChatMessage(
@@ -1269,6 +1482,29 @@ class AgentLoop:
                 tool_name=tool_name,
                 call_id=call_id,
             )
+            if denial is not None:
+                # FR-003 D5: `before_tool` denied the call, so it is not run.
+                # The ToolStartedEvent above is still emitted, exactly as for a
+                # ToolNotFound call, and that is LOAD-BEARING: the Runner claims
+                # ActionEvent args FIFO per ToolStartedEvent. The terminal event
+                # and observation mirror ToolNotFound; `after_tool` does not run.
+                _log.debug("tool_denied", call_id=call_id, run_id=run_id)
+                yield self._make_event(
+                    ToolFailedEvent,
+                    sequence_box,
+                    tool_name=tool_name,
+                    call_id=call_id,
+                    error=denial,
+                )
+                working.append(
+                    self._build_tool_message(
+                        tool_name=tool_name,
+                        call_id=call_id,
+                        content_for_tool_role=denial,
+                        content_for_other_role=f"Tool {tool_name} failed: {denial}",
+                    )
+                )
+                continue
             _log.debug(
                 "tool_invoked",
                 name=tool_name,
@@ -1279,7 +1515,7 @@ class AgentLoop:
             try:
                 tool_result = await self._registry.invoke(
                     tool_name,
-                    dict(parsed.tool_call.args),
+                    dict(dispatch_args),
                     timeout=self._safety.tool_timeout_seconds,
                 )
             except ToolNotFound as exc:
@@ -1325,6 +1561,9 @@ class AgentLoop:
                 continue
 
             # ----- 5. Classify ToolResult ----------------------------------
+            # FR-003 D2 (G1): `after_tool` runs only on these two arms, where a
+            # ToolResult exists, AFTER the terminal event is yielded and before
+            # the observation is appended.
             if tool_result.is_error:
                 error_text = (
                     tool_result.error
@@ -1338,12 +1577,25 @@ class AgentLoop:
                     call_id=call_id,
                     error=error_text,
                 )
+                note = (
+                    None
+                    if self._after_tool is None
+                    else await _apply_after_tool(
+                        self._after_tool,
+                        session_id=session_id,
+                        call_id=call_id,
+                        tool_name=tool_name,
+                        args=dispatch_args,
+                        result=tool_result,
+                    )
+                )
                 working.append(
                     self._build_tool_message(
                         tool_name=tool_name,
                         call_id=call_id,
                         content_for_tool_role=f"Tool error: {error_text}",
                         content_for_other_role=(f"Tool {tool_name} failed: {error_text}"),
+                        augmentation=note,
                     )
                 )
             else:
@@ -1354,6 +1606,18 @@ class AgentLoop:
                     call_id=call_id,
                     result=tool_result,
                 )
+                note = (
+                    None
+                    if self._after_tool is None
+                    else await _apply_after_tool(
+                        self._after_tool,
+                        session_id=session_id,
+                        call_id=call_id,
+                        tool_name=tool_name,
+                        args=dispatch_args,
+                        result=tool_result,
+                    )
+                )
                 working.append(
                     self._build_tool_message(
                         tool_name=tool_name,
@@ -1363,6 +1627,7 @@ class AgentLoop:
                             f"Tool {tool_name} returned: "
                             f"{_serialize_tool_output(tool_result.output)}"
                         ),
+                        augmentation=note,
                     )
                 )
             # Loop continues.
@@ -1399,6 +1664,7 @@ class AgentLoop:
         call_id: str,
         content_for_tool_role: str,
         content_for_other_role: str,
+        augmentation: str | None = None,
     ) -> ChatMessage:
         """Build the synthetic post-tool message in the configured wire-format role.
 
@@ -1412,6 +1678,14 @@ class AgentLoop:
         that string so the model retains identity context without
         ``tool_call_id`` / ``name`` fields.
 
+        FR-003: an ``after_tool`` note is appended HERE, once, after the role
+        has chosen the content, as ``content + "\\n\\n" + augmentation``. This
+        is the only append point, so the same suffix lands on the
+        ``role="tool"`` body and on the collapsed ``user``/``assistant`` body
+        alike. With ``augmentation=None`` (every call site when no
+        ``after_tool`` is configured, and every non-``ToolResult`` outcome)
+        the content is exactly the chosen string.
+
         Args:
             tool_name: The name of the tool that was invoked (only used in
                 the ``"tool"`` role branch; the caller embeds it into
@@ -1424,21 +1698,27 @@ class AgentLoop:
             content_for_other_role: Body string for the
                 ``role="user"`` / ``role="assistant"`` envelope. Carries the
                 tool name inline since the envelope drops ``name``.
+            augmentation: FR-003. A non-blank ``after_tool`` note to append
+                after a blank line, or ``None`` (the default) for none.
 
         Returns:
             A :class:`ChatMessage` ready to append to the loop's working
             message list.
         """
-        if self._tool_message_role == "tool":
+        tool_role = self._tool_message_role == "tool"
+        content = content_for_tool_role if tool_role else content_for_other_role
+        if augmentation is not None:
+            content = content + _AFTER_TOOL_SEPARATOR + augmentation
+        if tool_role:
             return ChatMessage(
                 role="tool",
                 tool_call_id=call_id,
                 name=tool_name,
-                content=content_for_tool_role,
+                content=content,
             )
         return ChatMessage(
             role=self._tool_message_role,
-            content=content_for_other_role,
+            content=content,
         )
 
     async def _call_llm(self, request: ChatRequest) -> tuple[str, list[str], ChatResponse | None]:

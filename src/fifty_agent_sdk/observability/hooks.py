@@ -33,7 +33,13 @@ Sync or async
     returning an awaitable — a ``functools.partial``, a callable object).
     The dispatch helper invokes the hook and inspects the RETURN VALUE with
     :func:`inspect.isawaitable`; an awaitable result is awaited, a plain
-    result is not. There is no ``iscoroutinefunction`` guess.
+    result is not. There is no ``iscoroutinefunction`` guess. For these hooks
+    and the intervention hooks (:mod:`fifty_agent_sdk.interventions`, FR-003)
+    that inspection lives in ONE private primitive, :func:`_call_hook`, which
+    :func:`invoke_hook` wraps with its failure isolation and which the
+    intervention helpers call directly, so both surfaces accept the same
+    callable shapes. ``MCPClient``'s ``on_tool_error`` keeps its own copy of
+    the same two-line check (see :func:`_call_hook`).
 
 Failure isolation
     A raising hook never breaks a run. :func:`invoke_hook` catches
@@ -118,6 +124,11 @@ class Hooks:
     field. See the module docstring for the two-tier wiring contract, the
     sync/async dispatch rule, and the failure-isolation guarantee.
 
+    These hooks only observe: their return values are ignored. Hooks that
+    change what the model sees or which tool call runs live on
+    :class:`fifty_agent_sdk.interventions.Interventions` (FR-003), which has
+    its own failure contract.
+
     Attributes:
         on_run_start: ``(session_id, user_message) -> Any``. Fires once at
             the start of every :meth:`fifty_agent_sdk.runner.AgentRunner.run`,
@@ -179,6 +190,35 @@ class Hooks:
     on_error: Callable[[str, Exception, dict[str, Any]], Any] | None = None
 
 
+async def _call_hook(hook: Callable[..., Any], *args: Any) -> Any:
+    """Call ``hook(*args)`` once, await the result if it is awaitable, and return it.
+
+    The single place a hook's result is inspected for both :class:`Hooks`
+    (through :func:`invoke_hook`, which discards the value) and
+    :class:`fifty_agent_sdk.interventions.Interventions` (FR-003, which
+    validates it). Inspecting the RETURN VALUE with
+    :func:`inspect.isawaitable`, not the function, is correct for every
+    callable shape: ``async def``, a plain ``def``, a sync function returning
+    a coroutine, a callable object and :func:`functools.partial`.
+
+    No exception handling happens here: each caller owns its failure policy.
+    ``MCPClient._apply_tool_error_hook`` keeps its own two-line copy of this
+    check, because routing it through here would add an ``mcp`` ->
+    ``observability`` import for a cosmetic gain (FR-003 D4).
+
+    Args:
+        hook: The callable to invoke.
+        *args: Positional arguments forwarded verbatim to the hook.
+
+    Returns:
+        The hook's return value, awaited when it was awaitable.
+    """
+    result = hook(*args)
+    if inspect.isawaitable(result):
+        return await result
+    return result
+
+
 async def invoke_hook(
     hook: Callable[..., Any] | None,
     hook_name: str,
@@ -196,7 +236,8 @@ async def invoke_hook(
     * If ``hook is None`` — return immediately. This ``None`` check is the
       zero-overhead guard; with no hook configured nothing is constructed
       or called.
-    * Otherwise call ``hook(*args)`` exactly once. If the RETURN VALUE is
+    * Otherwise call ``hook(*args)`` exactly once, through the shared
+      :func:`_call_hook` primitive. If the RETURN VALUE is
       awaitable (:func:`inspect.isawaitable`), await it. A plain ``def``
       hook has already run its body by the time the call returns and yields
       a non-awaitable (typically ``None``) — it is simply not awaited. An
@@ -225,9 +266,8 @@ async def invoke_hook(
     if hook is None:
         return
     try:
-        result = hook(*args)
-        if inspect.isawaitable(result):
-            await result
+        # The shared awaitable inspection (FR-003 D4); the value is discarded.
+        await _call_hook(hook, *args)
     except asyncio.CancelledError:
         raise
     except Exception as exc:

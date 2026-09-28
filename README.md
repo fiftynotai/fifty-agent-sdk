@@ -185,11 +185,70 @@ the caps that bound a run: a max-iteration ceiling on react cycles and a per-too
 
 ### audit
 
-the audit sinks and observability hooks. they record what the agent did, so a run can be read back after it finishes.
+the audit sinks and observability hooks. they record what the agent did, so a run can be read back after it finishes. hooks that change a run instead of watching it are `Interventions`, below.
+
+### interventions
+
+hooks whose return values the loop honours. `Hooks` watch a run; `Interventions` change it, at two points around each tool call. `before_tool` runs before the call and can deny it or replace its arguments. `after_tool` runs after the tool returns and can add a note to what the model reads next. they are wired on the loop only, and the runner takes none: a runner's `session_id` reaches both hooks, and it is `None` when you drive the loop directly.
+
+```python
+from fifty_agent_sdk import (
+    AgentLoop,
+    DenyToolCall,
+    Interventions,
+    ObservationEvent,
+    ReplaceToolArgs,
+)
+
+card_calls: set[str] = set()  # call ids your ui already rendered as cards
+
+
+def before_tool(session_id, call_id, tool_name, args):
+    if tool_name == "delete_record":
+        return DenyToolCall(reason="deleting records is disabled in this workspace")
+    if args.get("limit", 0) > 50:
+        return ReplaceToolArgs(args={**args, "limit": 50})
+    return None  # run the call as the model asked
+
+
+def after_tool(session_id, call_id, tool_name, args, result):
+    if call_id in card_calls:
+        return "The user can already see these records; answer without listing them."
+    return None  # no note
+
+
+loop = AgentLoop(
+    ...,
+    interventions=Interventions(before_tool=before_tool, after_tool=after_tool),
+)
+
+async for event in runner.run(session_id, message):
+    if isinstance(event, ObservationEvent) and shows_as_card(event.result):
+        render_card(event.result.output)
+        card_calls.add(event.call_id)
+```
+
+`after_tool` runs once for every call that returned a `ToolResult`, a success or `is_error=True`, and never for an unknown tool, a timeout or a denied call. it runs after your code handled that call's event (inline in your `async for` body; under a runner, after `on_tool_end` too), so in the example the card set is already up to date. a non-blank string it returns is added after a blank line to the observation the model reads next, the same way in every tool mode; `None` or a blank string adds nothing. the sdk never writes to the `ToolResult`, and the events are the ones you would get without the hook, so your own renderer is unaffected. treat `result` as read-only. `args` is the hook's own deep copy of the dispatched arguments, taken after the tool returns, so nested values may carry in-place edits the tool made to its own arguments; changing the copy affects nothing else. the note inherits the observation's role, so keep it neutral and factual: in the `"user"` role it reads as the user's words, and in the `"assistant"` role as the model's own.
+
+`before_tool` sees every call, including tool names the model made up. its `args` is a deep copy of the model's arguments, taken before dispatch, so editing it, even a nested value, changes nothing: return `None` to run the call as asked, `ReplaceToolArgs(args=...)` to run it with other arguments, or `DenyToolCall(reason=...)` to skip it. a denied call still emits `ActionEvent` and `ToolStartedEvent`, then a `ToolFailedEvent` with `"Tool call denied: <reason>"`, and the model reads that reason. like a note, the reason takes the observation's role, so in the `"user"` role it carries user authority. a replacement is what `ActionEvent.args`, `on_tool_start` and the audit payload show; it is never written into the model's own turn. arguments that cannot be deep-copied (an object a custom parser or a custom `LLMClient` put into `ToolCall.args`, or extreme nesting) are copied one level deep instead, with a warning. the model controls how deeply its arguments nest, so it can cause this fallback. never rely on an in-place edit staying private: change arguments with `ReplaceToolArgs`, and alert on `intervention.args_not_copyable`.
+
+when a hook fails:
+
+- `after_tool` fails soft: if it raises or returns anything other than a string or `None`, the note is skipped and the run continues.
+- `before_tool` follows `before_tool_fallback`. `BeforeToolFallback.DENY`, the default, fails closed: the call is denied. `BeforeToolFallback.ALLOW` fails open: the call runs with the model's original arguments. use `DENY` for guards and for hooks that scope arguments, because a scoping hook (say, one that adds the current tenant) that failed open would run the model's unscoped call. use `ALLOW` only for advisory hooks, where availability matters more than the check.
+- a returned `DenyToolCall` is always honoured, whichever fallback you pick.
+- every fallback logs a warning under `fifty_agent_sdk.interventions` with the call id and the exception or returned type, never the exception's text. under `ALLOW` that line, with `fallback="call_allowed"`, is the only sign a check was skipped, so alert on it.
+- `asyncio.CancelledError` propagates from both hooks.
+
+```python
+Interventions(before_tool=normalise_dates, before_tool_fallback=BeforeToolFallback.ALLOW)
+```
+
+`after_tool` cannot replace or remove observation text, change `is_error` or `output`, or change an event. `before_tool` cannot rename a tool; deny instead. to screen mcp `isError` text, use `on_tool_error` (see mcp). a note or denial is part of that call's observation for the rest of the run and is never persisted: the next turn sees only the final answer. hooks may be sync or async and are awaited inline, one at a time even within a batch, so keep them fast: a call's own event reaches you before its `after_tool` runs, but later events wait for it. there is no hook that rewrites the llm request; wrap the `LLMClient` instead. without `interventions`, the loop sends the same request bodies (same keys, values and JSON types) and emits the same event stream as 1.9.0 (timestamps and minted ids aside).
 
 ### mcp
 
-an mcp client over streamable http, adapted into the same registry the in-proc tools live in. a `tools/call` that comes back `isError=True` is a recoverable observation the model can reason about, not a dead run — and `on_tool_error` is the seam for screening that server-controlled text before the model reads it.
+an mcp client over streamable http, adapted into the same registry the in-proc tools live in. a `tools/call` that comes back `isError=True` is a recoverable observation the model can reason about, not a dead run — and `on_tool_error` is the seam for screening that server-controlled text before the model reads it. an `after_tool` intervention can only add to that text, so screening stays here.
 
 ```python
 def screen(message: str, content: list[dict]) -> str:
@@ -215,6 +274,7 @@ fifty_agent_sdk  —  module graph (from src/fifty_agent_sdk/, ground-truth impo
 src/fifty_agent_sdk/
 ├─ ▢ audit
 ├─ errors
+├─ interventions
 ├─ ▢ llm
 ├─ loop
 ├─ ▢ mcp
@@ -225,18 +285,23 @@ src/fifty_agent_sdk/
 ├─ safety
 ├─ ▢ state
 ├─ streaming
+├─ tool_mode
 └─ ▢ tools
 
 depends (→):
    audit → errors
+   interventions → observability
+   interventions → tools
    llm → errors
    loop → errors
+   loop → interventions
    loop → llm
    loop → observability
    loop → parser
    loop → prompts
    loop → safety
    loop → streaming
+   loop → tool_mode
    loop → tools
    mcp → errors
    observability → llm
@@ -252,6 +317,9 @@ depends (→):
    state → errors
    state → llm
    streaming → tools
+   tool_mode → parser
+   tool_mode → prompts
+   tool_mode → safety
    tools → errors
    tools → llm
    tools → mcp
