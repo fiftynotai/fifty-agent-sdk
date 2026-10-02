@@ -2,7 +2,9 @@
 
 FR-003 adds ``AgentLoop(interventions=...)``. Its compatibility promise is that
 a loop built WITHOUT ``interventions`` sends the same request bodies (same
-keys, values and JSON types) and emits the same event stream as 1.9.0. The two
+keys, values and JSON types) and emits the same event stream as 1.9.0 (since
+1.10.2 claimed only for the runs :mod:`fifty_agent_sdk.loop` scopes it to:
+"Non-ASCII text (BR-020)" and "Error-path final text (BR-021)"). The two
 earlier fixtures (``legacy_1_7_0.json``, ``requests_1_8_0.json``) pin request
 bodies only, and none of their scenarios drives the branches FR-003 edits:
 
@@ -32,7 +34,9 @@ the bodies: ``{"bodies": [...], "events": [...]}``.
 
 It does NOT pin non-ASCII text or U+007F in the JSON the SDK writes for the
 model, which 1.10.2 changed (BR-020): no scenario's tool results, tool schemas
-or replayed arguments hold any.
+or replayed arguments hold any. Nor does it pin any error path: no scenario
+ends on an ``ErrorEvent``, so the error-path final text, message and context
+that 1.10.2 changed (BR-021) are outside it.
 
 Running ``python -m tests.loop.golden_capture_1_9_0`` from the repo root writes
 ``tests/loop/golden/requests_1_9_0.json``. The fixture in the tree was written

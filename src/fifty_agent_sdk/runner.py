@@ -385,7 +385,15 @@ class AgentRunner:
             payload: Structured, event-specific detail (lengths/counts and
                 tool metadata only — never message or prompt content, and
                 never tool-argument VALUES: ``tool_invocation`` carries the
-                non-content summary built by :func:`_args_metadata`).
+                non-content summary built by :func:`_args_metadata`). For a
+                loop-internal ``"error"`` the payload is ``run_id``,
+                ``error_type`` (``"LLMError"``, ``"ParserError"``,
+                ``"MaxIterationsExceeded"``), ``error_subtype`` (the
+                classified type code from ``ErrorEvent.context["type"]``, for
+                example ``"ContextLengthExceeded"``, else ``None``; BR-021) and
+                ``error_message``. For an ``"LLMError"``, ``error_message``
+                is the error's message, which may be the provider's own error
+                text and may quote its response body.
         """
         if self._audit is None:
             return
@@ -874,6 +882,13 @@ class AgentRunner:
                 # "Unknown"/"" fallbacks guard a future refactor that could
                 # decouple `saw_error` from `last_error`; do not delete them
                 # as dead code.
+                # BR-021: `error_subtype` is `ErrorEvent.context["type"]`; for
+                # the shipped client a type code (for example
+                # "ContextLengthExceeded"), not message text. A custom LLMClient
+                # sets that key itself. It is None when that is absent or not a
+                # str, as for a parser error or the iteration cap. Always present
+                # on this branch, so a sink sees one stable key set.
+                error_subtype = last_error.context.get("type") if last_error is not None else None
                 await self._emit_audit(
                     session_id,
                     "error",
@@ -881,6 +896,9 @@ class AgentRunner:
                         "run_id": run_id,
                         "error_type": (
                             last_error.error_type if last_error is not None else "Unknown"
+                        ),
+                        "error_subtype": (
+                            error_subtype if isinstance(error_subtype, str) else None
                         ),
                         "error_message": (last_error.message if last_error is not None else ""),
                     },

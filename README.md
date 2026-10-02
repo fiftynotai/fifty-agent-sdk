@@ -16,7 +16,7 @@ fifty-agent-sdk is a reusable agent loop for python. it implements a custom reAC
 - talks to any openai-compatible chat-completions endpoint by swapping one `base_url`: openai, google distributed cloud, a local oss server.
 - llm clients, state stores, and tools are pluggable behind protocols: bring your own, the loop stays the same.
 - the run emits a typed event stream the caller consumes, so you watch the react loop step by step.
-- an iteration cap and per-tool timeouts bound every run, with a fallback answer on error or cap: a loop that can't end is a loop that doesn't ship.
+- an iteration cap and per-tool timeouts bound every run, with a fallback answer when a run hits the cap and a separate one when it errors: a loop that can't end is a loop that doesn't ship.
 - zero-infra by default: no db, no redis, until you opt into an extra.
 
 ## Installation
@@ -117,7 +117,7 @@ how the model calls tools, set with one value: `AgentLoop(tool_mode=ToolMode.JSO
 | tool-result role | `"assistant"` (`"user"` allowed) | same as JSON | always `"tool"`, paired by `tool_call_id` |
 | `stream=True` | allowed | allowed | rejected at construction |
 
-`NATIVE` follows the openai-compatible function-calling protocol. a response with `tool_calls` is a tool turn, and any other text is the final answer, word for word. a text-shaped tool call (a json `{"action": "tool", ...}` envelope, a prose `Action:` block) is never run, so a `role="tool"` message always follows an assistant turn that carries its id. an empty response gets one retry with a native reminder; if that fails too, the run ends with a `ParserError` event and the fallback answer. with an empty registry, `tools` is left out of the request.
+`NATIVE` follows the openai-compatible function-calling protocol. a response with `tool_calls` is a tool turn, and any other text is the final answer, word for word. a text-shaped tool call (a json `{"action": "tool", ...}` envelope, a prose `Action:` block) is never run, so a `role="tool"` message always follows an assistant turn that carries its id. an empty response gets one retry with a native reminder; if that fails too, the run ends with a `ParserError` event and the error fallback answer. with an empty registry, `tools` is left out of the request.
 
 a mode owns its knobs. you can still pass one when it fits the mode, such as a custom parser that wraps `JsonModeParser` under `JSON`, `tool_message_role="user"` for chat templates that need strict user/assistant alternation, or an output format like "answer in markdown" under `NATIVE`. a value that belongs to another mode raises `ValueError` when the loop is built. the sdk never silently picks one:
 
@@ -128,7 +128,7 @@ AgentLoop(..., tool_mode=ToolMode.NATIVE, parser=JsonModeParser())
 # text tool call. Drop parser=; NATIVE supplies its own final-only text parser.
 ```
 
-omit `tool_mode` and the loop sends the same request bodies and system prompt as 1.7.0 (same keys, values and JSON types); since 1.10.2 the JSON the SDK writes for the model keeps non-ASCII text literal (see CHANGELOG), so this holds for runs where that JSON holds only code points U+0000-U+007E. the one event-level change is `ThoughtEvent.text` on native tool turns, which can now be non-empty (see CHANGELOG). `parser=` is required, `tool_message_role` defaults to `"tool"`, and `SafetyConfig(native_tools_enabled=True)` declares tools natively without changing the parser. that flag still works and is not deprecated, but on its own it leaves a text tool call dispatchable. to migrate, drop `parser=`, `output_format=` and `native_tools_enabled`, and pass `tool_mode=ToolMode.NATIVE`. the final answer is then plain text in `FinalEvent.text`, not a json envelope.
+omit `tool_mode` and the loop sends the same request bodies and system prompt as 1.7.0 (same keys, values and JSON types); since 1.10.2 the JSON the SDK writes for the model keeps non-ASCII text literal (see CHANGELOG), so this holds for runs where that JSON holds only code points U+0000-U+007E and that do not end on an llm or parser error, which since 1.10.2 end with `error_fallback_message`. on those runs the one event-level change is `ThoughtEvent.text` on native tool turns, which can now be non-empty (see CHANGELOG). `parser=` is required, `tool_message_role` defaults to `"tool"`, and `SafetyConfig(native_tools_enabled=True)` declares tools natively without changing the parser. that flag still works and is not deprecated, but on its own it leaves a text tool call dispatchable. to migrate, drop `parser=`, `output_format=` and `native_tools_enabled`, and pass `tool_mode=ToolMode.NATIVE`. the final answer is then plain text in `FinalEvent.text`, not a json envelope.
 
 ### llm
 
@@ -181,7 +181,9 @@ a typed event stream the caller consumes while the loop runs. each step in the r
 
 ### safety
 
-the caps that bound a run: a max-iteration ceiling on react cycles and a per-tool timeout, plus the fallback answer returned when a run errors or hits the cap. a loop that can't end is a loop that doesn't ship.
+the caps that bound a run: a max-iteration ceiling on react cycles and a per-tool timeout, plus two fallback answers: `fallback_message` when a run hits the cap, and `error_fallback_message` when it ends on an llm or parser error. setting one leaves the other at its default, so set both if you localise them. a loop that can't end is a loop that doesn't ship.
+
+`OpenAICompatibleClient` classifies a context-window overflow (`max_prompt_length`, `context_length_exceeded` or `maximum context length` in the provider's text, or `context_length_exceeded` as its error code) on these paths: a 4xx/5xx error that is not a rate limit; a non-streamed http 200 whose body is text that is not json, or a bare json string; on a streamed request, a 200 that is not labelled `text/event-stream` and produces no chunk, an event whose data is not json or is a bare json string, and an error event inside the stream. there it raises an `LLMError` whose `context["type"]` is `ContextLengthExceeded`, and the run ends with an `ErrorEvent` carrying that context. client-side timeouts, connection errors, rate limits and read failures mid-stream are never classified, and neither are other phrasings of the same failure. these provider answers are still not caught (measured on openai 2.43.0): a non-streamed 200 whose body is a json error object (`{"error": {...}}`) is reported as `MalformedResponse` ("Provider returned no choices.") with its text lost; a body without sse fields (plain text, or a json error object) labelled `text/event-stream` raises nothing (the stream just looks empty); and a non-streamed 200 with a json content type whose body is not valid utf-8, or holds an integer literal over python's digit limit, escapes as a raw `UnicodeDecodeError` or `ValueError`: the loop catches only `LLMError`, so that run ends with no `ErrorEvent` or `FinalEvent`. the `ErrorEvent`'s `message` is diagnostic text that may quote the provider's response; show the `FinalEvent` to end users.
 
 ### audit
 
@@ -244,7 +246,7 @@ when a hook fails:
 Interventions(before_tool=normalise_dates, before_tool_fallback=BeforeToolFallback.ALLOW)
 ```
 
-`after_tool` cannot replace or remove observation text, change `is_error` or `output`, or change an event. `before_tool` cannot rename a tool; deny instead. to screen mcp `isError` text, use `on_tool_error` (see mcp). a note or denial is part of that call's observation for the rest of the run and is never persisted: the next turn sees only the final answer. hooks may be sync or async and are awaited inline, one at a time even within a batch, so keep them fast: a call's own event reaches you before its `after_tool` runs, but later events wait for it. there is no hook that rewrites the llm request; wrap the `LLMClient` instead. without `interventions`, the loop sends the same request bodies (same keys, values and JSON types) and emits the same event stream as 1.9.0 (timestamps and minted ids aside); since 1.10.2 the JSON the SDK writes for the model keeps non-ASCII text literal (see CHANGELOG), so this holds for runs where that JSON holds only code points U+0000-U+007E.
+`after_tool` cannot replace or remove observation text, change `is_error` or `output`, or change an event. `before_tool` cannot rename a tool; deny instead. to screen mcp `isError` text, use `on_tool_error` (see mcp). a note or denial is part of that call's observation for the rest of the run and is never persisted: the next turn sees only the final answer. hooks may be sync or async and are awaited inline, one at a time even within a batch, so keep them fast: a call's own event reaches you before its `after_tool` runs, but later events wait for it. there is no hook that rewrites the llm request; wrap the `LLMClient` instead. without `interventions`, the loop sends the same request bodies (same keys, values and JSON types) and emits the same event stream as 1.9.0 (timestamps and minted ids aside); since 1.10.2 the JSON the SDK writes for the model keeps non-ASCII text literal (see CHANGELOG), so this holds for runs where that JSON holds only code points U+0000-U+007E and that do not end on an llm or parser error, which since 1.10.2 end with `error_fallback_message` (see CHANGELOG).
 
 ### mcp
 

@@ -12,11 +12,16 @@ Covers BR-011's Runner-integration surface:
 * ``audit=None`` is a zero-overhead no-op.
 * A raising sink never aborts the run; the failure is logged at ``WARNING``.
 * ``result_summary`` is bounded with a truncation marker.
+* BR-021: the ``error`` payload's ``error_subtype`` separates a classified
+  provider failure from the iteration cap, and a provider text body ends the
+  turn with ``SafetyConfig.error_fallback_message`` and no assistant turn
+  stored.
 """
 
 from __future__ import annotations
 
 import structlog
+from pytest_httpx import HTTPXMock
 
 from fifty_agent_sdk import (
     ActionEvent,
@@ -316,6 +321,129 @@ async def test_llm_error_run_emits_session_start_then_error() -> None:
     error_event = next(e for e in spy.events if e.event_type == "error")
     assert error_event.payload["error_type"] == "LLMError"
     assert "run_id" in error_event.payload
+
+
+async def test_error_audit_tells_provider_failure_from_steps_exhausted() -> None:
+    """The error audit payload's error_subtype separates a classified provider failure from the cap (BR-021)."""
+    from fifty_agent_sdk.errors import LLMError
+
+    provider_llm = FakeLLMClient(
+        replies=[LLMError("too long", context={"type": "ContextLengthExceeded"})]
+    )
+    provider_spy = SpyAuditSink()
+    runner, _store = make_runner(llm=provider_llm, audit=provider_spy)
+    await collect(runner.run("s1", "Hi"))
+
+    registry = Registry()
+    registry.register(FakeTool("t", result=ToolResult(output="ok")))
+    cap_llm = FakeLLMClient(replies=[make_response(tool_json("t", "t", {}))])
+    cap_spy = SpyAuditSink()
+    runner, _store = make_runner(
+        llm=cap_llm, registry=registry, safety=SafetyConfig(max_iterations=1), audit=cap_spy
+    )
+    await collect(runner.run("s2", "Hi"))
+
+    provider_error = next(e for e in provider_spy.events if e.event_type == "error")
+    cap_error = next(e for e in cap_spy.events if e.event_type == "error")
+    assert provider_error.payload["error_type"] == "LLMError"
+    assert provider_error.payload["error_subtype"] == "ContextLengthExceeded"
+    assert cap_error.payload["error_type"] == "MaxIterationsExceeded"
+    assert cap_error.payload["error_subtype"] is None
+    # One stable key set on this branch, whichever error ended the run.
+    keys = {"run_id", "error_type", "error_subtype", "error_message"}
+    assert set(provider_error.payload) == keys
+    assert set(cap_error.payload) == keys
+
+
+async def test_error_audit_subtype_is_none_for_non_string_types() -> None:
+    """A non-str context["type"] is reported as error_subtype None, never coerced (BR-021)."""
+    from fifty_agent_sdk.errors import LLMError
+
+    llm = FakeLLMClient(replies=[LLMError("odd client", context={"type": 42})])
+    spy = SpyAuditSink()
+    runner, _store = make_runner(llm=llm, audit=spy)
+
+    await collect(runner.run("s1", "Hi"))
+
+    error_event = next(e for e in spy.events if e.event_type == "error")
+    assert error_event.payload["error_subtype"] is None
+
+
+async def test_runner_yields_the_error_text_and_persists_no_assistant_turn(
+    httpx_mock: HTTPXMock,
+) -> None:
+    """A provider text body ends the Runner's turn with the error text; nothing of it is stored or logged (BR-021).
+
+    Drives the real ``OpenAICompatibleClient``. The store holds only the
+    user message, and no structlog entry of the run (Runner, loop, adapter;
+    no audit sink is wired) carries the provider text. With an audit sink,
+    the text does reach ``error_message`` (see the next test).
+    """
+    from fifty_agent_sdk import (
+        AgentLoop,
+        AgentRunner,
+        FinalEvent,
+        JsonModeParser,
+        MemoryStateStore,
+        OpenAICompatibleClient,
+        PromptSections,
+    )
+
+    httpx_mock.add_response(
+        method="POST",
+        url="https://example.com/v1/chat/completions",
+        content=b"Prompt length 145048 exceeds max_prompt_length 131072 SENTINEL-br021",
+        headers={"content-type": "text/plain"},
+    )
+    client = OpenAICompatibleClient(
+        api_key="k", base_url="https://example.com/v1", timeout=5.0, max_retries=0
+    )
+    loop = AgentLoop(
+        llm=client,
+        registry=Registry(),
+        parser=JsonModeParser(),
+        prompts=PromptSections(persona="You are a helpful agent."),
+        safety=SafetyConfig(),
+        model="test-model",
+    )
+    store = MemoryStateStore()
+    runner = AgentRunner(loop=loop, state=store)
+
+    with structlog.testing.capture_logs() as logs:
+        events = await collect(runner.run("s1", "Hi"))
+
+    final = events[-1]
+    assert isinstance(final, FinalEvent)
+    assert final.text == SafetyConfig().error_fallback_message
+    history = await store.get_messages("s1")
+    assert [(m.role, m.content) for m in history] == [("user", "Hi")]
+    assert logs, "capture_logs saw no entries; the leak check below would be vacuous"
+    assert all("SENTINEL" not in repr(entry) for entry in logs)
+
+
+async def test_error_audit_message_carries_the_provider_text_and_subtype() -> None:
+    """With an audit sink wired, error_message carries the provider text, as 4xx text did before (BR-021).
+
+    Pins where the text DOES go, so a docstring that says so stays true.
+    """
+    from fifty_agent_sdk.errors import LLMError
+
+    llm = FakeLLMClient(
+        replies=[
+            LLMError(
+                "Provider response body could not be read as a JSON object: upstream busy",
+                context={"type": "NonJsonProviderBody", "body_length": 13},
+            )
+        ]
+    )
+    spy = SpyAuditSink()
+    runner, _store = make_runner(llm=llm, audit=spy)
+
+    await collect(runner.run("s1", "Hi"))
+
+    error_event = next(e for e in spy.events if e.event_type == "error")
+    assert error_event.payload["error_subtype"] == "NonJsonProviderBody"
+    assert "upstream busy" in error_event.payload["error_message"]
 
 
 async def test_fatal_sdk_error_escaping_loop_is_audited() -> None:

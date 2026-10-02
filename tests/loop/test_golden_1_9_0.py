@@ -49,6 +49,8 @@ What this does NOT pin:
 * Non-ASCII text or U+007F in the JSON the SDK writes for the model, which
   1.10.2 changed (BR-020). No scenario's tool results, tool schemas or
   replayed arguments hold any.
+* Any error path. No scenario ends on an ``ErrorEvent``, so the error-path
+  final text, message and context that 1.10.2 changed (BR-021) are outside it.
 """
 
 from __future__ import annotations

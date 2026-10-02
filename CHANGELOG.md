@@ -8,6 +8,74 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [1.10.2] - 2026-10-02
 
+### Added
+- `SafetyConfig.error_fallback_message`: the text of the `FinalEvent` that ends a run after
+  an LLM error or a parser error. It defaults to "Something went wrong while answering.
+  Please try again." and must be non-empty. It follows every `ErrorEvent` except the one
+  whose `error_type` is `MaxIterationsExceeded`. (BR-021)
+
+### Changed
+- After an LLM error or a parser error the run now ends with `error_fallback_message`. A
+  parser error here is the native `tool_calls` rejection, or a text parse failure with the
+  retry disabled or used up. Before, these runs ended with `fallback_message`, whose
+  default reads "I was unable to complete the task within the allowed steps.", and
+  `fallback_message` now follows only the iteration cap. The two fields are independent:
+  setting only `fallback_message` does not change the error text. **If you set
+  `fallback_message`, for example to localised text, set `error_fallback_message` too:
+  until you do, your end users see its English default after a provider or parser
+  error.** A test that asserts `fallback_message` after an LLM or parser error needs
+  updating. (BR-021)
+- `SafetyConfig.model_dump()` has one more key, `error_fallback_message`. A config written
+  for 1.10.1 validates unchanged. A dump from this release does not validate on 1.10.1,
+  whose `SafetyConfig` forbids unknown fields. (BR-021)
+- `LLMError.context["type"]` from `OpenAICompatibleClient` takes new values:
+  - `ContextLengthExceeded`, when the provider's text contains `max_prompt_length`,
+    `context_length_exceeded` or `maximum context length` (compared case-insensitively),
+    or the provider's error code is `context_length_exceeded`. It is applied on these
+    paths only: the 200 body errors below (`NonJsonProviderBody`,
+    `NonStreamProviderBody`), and every `APIError` other than `APITimeoutError`,
+    `APIConnectionError` and `RateLimitError` (for example `BadRequestError`,
+    `InternalServerError` and a mid-stream error event), on `complete()` and on
+    `stream()`. It is never applied to those three on `complete()` or when `stream()`
+    opens the request; while `stream()` iterates, `openai` 2.43.0 raises only the base
+    `APIError` for an error event. It is never applied to a failure of the read itself
+    while a stream is read (an `httpx` read error, for example), or to the bodies the
+    client still does not catch or that still escape raw (see Fixed).
+    `context["classified_from"]` keeps the type the error would otherwise have had, for
+    example `BadRequestError`. The list is closed: other phrasings of the same failure
+    stay unclassified, and an unrelated error whose text quotes one of these strings is
+    classified too. A release that adds a marker will say so here.
+  - `NonJsonProviderBody` for a stream event whose data is not JSON, or is a bare JSON
+    string (before BR-021 the first was `JSONDecodeError`, with the decoder's message
+    instead of the event's text, and the second `MalformedChunk`).
+  - `NonStreamProviderBody` for a streamed 200 whose Content-Type is not
+    `text/event-stream` and which produced no chunk (see the next items).
+
+  (BR-021)
+- The Runner's `error` audit event has a new key, `error_subtype`: the `ErrorEvent`'s
+  `context["type"]` when it is a string (for example `ContextLengthExceeded`), else `None`.
+  It is on every `error` event the Runner emits for an `ErrorEvent`, so
+  `{"error_type": "LLMError", "error_subtype": "ContextLengthExceeded"}` and
+  `{"error_type": "MaxIterationsExceeded", "error_subtype": null}` can be told apart
+  without reading logs. (BR-021)
+- `OpenAICompatibleClient.stream()` now reads a response whose media type is not
+  `text/event-stream`, or that has no Content-Type, in full before yielding its first
+  chunk, so a direct caller gets those chunks only once the body has arrived. A
+  `text/event-stream` response streams as before. `AgentLoop` emits nothing for a
+  streamed turn until it has read the stream up to its terminal chunk, so for a run the
+  change adds only the time to receive whatever follows that chunk. If such a response
+  produces no chunk at all, `stream()` now raises `LLMError` typed
+  `NonStreamProviderBody`, whatever the body holds: an SSE-framed body with only
+  `data: [DONE]` included. Before, it yielded nothing. If reading the body fails, the
+  error is an `LLMError` whose `context["type"]` is the `httpx` exception's class name
+  (for example `ReadError`), with `context["phase"] == "stream"`. (BR-021)
+- The release-equivalence statements (`tool_mode` omitted ≡ 1.7.0, request options
+  omitted ≡ 1.8.0, `interventions` omitted ≡ 1.9.0) now hold only for runs that do not end
+  on an LLM or parser error. Those runs end with `error_fallback_message`, and a streamed
+  200 that is not `text/event-stream` and yields no chunk now ends the run after one
+  request with an `LLMError`, where with the shipped text parsers it used to end with a
+  `ParserError`, after a parser retry when that is enabled. (BR-021)
+
 ### Fixed
 - JSON that the SDK writes for the model now carries non-ASCII text as literal UTF-8
   instead of `\uXXXX` escapes. By default Python's `json.dumps` writes every non-ASCII
@@ -31,7 +99,52 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   result that is already a string is unchanged by this release.
 - Stored data is unchanged: tool results are never persisted, and Redis branch metadata
   keeps its encoding.
-- No public API changes. (BR-020)
+- This fix makes no public API changes. (BR-020)
+- A provider answering HTTP 200 with a plain-text body now makes `OpenAICompatibleClient`
+  raise `LLMError` carrying that body, typed `NonJsonProviderBody` (or
+  `ContextLengthExceeded`, see Changed). The message quotes the first 500 characters of
+  the stripped provider text, with `…[truncated]` appended when it was cut.
+  `context["body_length"]` is the length in characters of that text before stripping: the
+  decoded body, the value of a body that is a bare JSON string (so 61 for a 63-character
+  body), or the data of the stream event that failed. It used to raise `Malformed provider
+  response: 'str' object has no attribute 'choices'`, and the provider's explanation was
+  lost. The same holds for a body that is a bare JSON string, and for a body labelled
+  `application/json` whose UTF-8 text is not JSON, which used to escape `complete()` and
+  `AgentLoop.run()` as a raw `json.JSONDecodeError`, with no `ErrorEvent` or
+  `FinalEvent`. Two bodies with a JSON Content-Type still escape raw, as before: one that
+  is not valid UTF-8 (`UnicodeDecodeError`; measured labelled `application/json`,
+  `application/problem+json` and `text/json`) and one whose integer literal exceeds the
+  interpreter's digit limit (`ValueError`; measured labelled `application/json`).
+  `AgentLoop.run()` catches only `LLMError`, so such a run ends with no `ErrorEvent` or
+  `FinalEvent` (measured labelled `application/json`).
+- A streaming request answered with such a body looked like an empty stream: with the
+  parser retry on (the default), the run ended with a `ParserError` after two provider
+  calls. It now raises `LLMError` typed `NonStreamProviderBody` (or
+  `ContextLengthExceeded`) after one, unless the body is labelled `text/event-stream` (see
+  below).
+- Some provider answers are still not caught (the raw escapes are in the item above). A
+  non-streamed 200 whose body is a JSON object without `choices`, such as an error
+  envelope `{"error": {...}}` (measured labelled `application/json` and `text/plain`),
+  still raises `MalformedResponse` (`Provider returned no choices.`) with its text lost,
+  so it is never classified; the same body on a streamed request that is not labelled
+  `text/event-stream` raises `NonStreamProviderBody` carrying its text, classified
+  `ContextLengthExceeded` when that text holds a marker. A body without SSE fields (plain
+  text, or a JSON error envelope) labelled `text/event-stream` still looks empty, because
+  the `openai` client's SSE decoder drops it before the SDK sees it.
+- An over-long prompt whose provider error uses one of the three markers, on one of the
+  paths listed under Changed, is classified `ContextLengthExceeded`, so a consumer can
+  react to it, for example by trimming a tool result and retrying.
+- The end user is no longer told the steps ran out when the provider failed: the run ends
+  with `error_fallback_message` (see Added).
+- Where the quoted provider text goes: `LLMError.message`, `ErrorEvent.message`, the
+  Runner's `error` audit `error_message` (`ConsoleAuditSink` logs it, `SqlAuditSink` stores
+  it) and the `on_error` hook, the places a provider's 4xx/5xx text already reached, in
+  full. It is not in `FinalEvent.text`, in `LLMError.context`, in the state store, or in
+  the log lines the loop, the client and the Runner write for such a run with no audit
+  sink wired. Treat `ErrorEvent.message` as diagnostic text, not text for end users.
+- How these bodies reach the SDK is the `openai` client's behaviour, measured on `openai`
+  2.43.0. The BR-021 test suite also passed with `openai` 2.54.0 (on CPython 3.11.15 and
+  3.13.2). (BR-021)
 
 ## [1.10.1] - 2026-09-28
 

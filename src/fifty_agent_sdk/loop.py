@@ -57,6 +57,24 @@ Non-ASCII text (BR-020)
     in which that JSON contains only code points U+0000-U+007E, and they hold
     for runs where it does.
 
+Error-path final text (BR-021)
+    Since 1.10.2 a run that ends on an ``LLMError`` or a ``ParserError`` ends
+    with :attr:`SafetyConfig.error_fallback_message`, where earlier releases
+    used ``fallback_message``. An ``LLMError`` from
+    :class:`~fifty_agent_sdk.llm.openai_compat.OpenAICompatibleClient` can
+    carry a different message and ``context`` for the same provider answer.
+    A streamed request answered with a 200 that is not labelled
+    ``text/event-stream`` and yields no chunk now ends the run after one
+    request with an ``LLMError``, where earlier releases, with the shipped
+    text parsers, ended it with a ``ParserError``, after a parser retry when
+    that is enabled. The 1.9.0 golden, the one fixture that records events,
+    holds no run that ends on an ``ErrorEvent``. The release-equivalence
+    statements in this module (above, in :class:`AgentLoop`'s Args and in
+    its ``__init__`` comments),
+    and the matching ones in :mod:`fifty_agent_sdk.tool_mode` and
+    :mod:`fifty_agent_sdk.interventions`, are claimed only for runs that do
+    not end on an ``LLMError`` or a ``ParserError``.
+
 Statelessness
     Every :meth:`AgentLoop.run` call is its own scoped iteration. The
     loop holds no state across calls — conversation persistence and
@@ -474,7 +492,8 @@ class AgentLoop:
             also empty, no output-format section appears in the system
             prompt.
         safety: :class:`fifty_agent_sdk.safety.SafetyConfig` with iteration cap,
-            tool timeout, and fallback message.
+            tool timeout, and fallback messages (one for the iteration cap,
+            one for errors; BR-021).
         model: Model identifier embedded in every
             :class:`fifty_agent_sdk.llm.types.ChatRequest`.
         stream: If ``True``, use :meth:`LLMClient.stream` and emit
@@ -782,7 +801,11 @@ class AgentLoop:
         Non-recoverable failures (``LLMError``, ``ParserError``, iteration
         cap exhaustion) emit an :class:`fifty_agent_sdk.streaming.ErrorEvent`
         followed by a fallback :class:`fifty_agent_sdk.streaming.FinalEvent`,
-        then return.
+        then return. Since 1.10.2 (BR-021) that ``FinalEvent`` carries
+        :attr:`SafetyConfig.fallback_message` only after iteration cap
+        exhaustion (``error_type="MaxIterationsExceeded"``), and
+        :attr:`SafetyConfig.error_fallback_message` after an ``LLMError`` or
+        a ``ParserError``. Neither is ever the error's own message.
 
         :class:`asyncio.CancelledError` and any
         :class:`fifty_agent_sdk.errors.AgentSdkError` subclass not explicitly
@@ -868,16 +891,24 @@ class AgentLoop:
                         message=exc.message,
                         context=dict(exc.context),
                     )
+                    # BR-021: a provider failure is not exhausted steps, so the
+                    # end user gets the error text, never `exc.message` (which
+                    # may quote the provider's body).
                     yield self._make_event(
                         FinalEvent,
                         sequence_box,
-                        text=self._safety.fallback_message,
+                        text=self._safety.error_fallback_message,
                     )
+                    # BR-021: `llm_error_type` is `context["type"]`; for the shipped
+                    # client a type code (for example "ContextLengthExceeded"), not
+                    # message text (§10). A custom LLMClient sets that key itself.
+                    llm_error_type = exc.context.get("type")
                     _log.info(
                         "agent_loop_completed",
                         iterations=iteration,
                         run_id=run_id,
                         terminated_by="llm_error",
+                        llm_error_type=llm_error_type if isinstance(llm_error_type, str) else None,
                     )
                     return
 
@@ -932,10 +963,12 @@ class AgentLoop:
                             message=exc.message,
                             context=dict(exc.context),
                         )
+                        # BR-021: a malformed native envelope is an error, not
+                        # exhausted steps.
                         yield self._make_event(
                             FinalEvent,
                             sequence_box,
-                            text=self._safety.fallback_message,
+                            text=self._safety.error_fallback_message,
                         )
                         _log.info(
                             "agent_loop_completed",
@@ -1002,6 +1035,9 @@ class AgentLoop:
                     # Retry disabled OR per-iteration budget exhausted:
                     # preserve the pre-BR-018 terminal ParserError shape
                     # verbatim — ErrorEvent + fallback FinalEvent + return.
+                    # BR-021: the run stopped on output it could not parse,
+                    # before the iteration cap, so the final text is the
+                    # error text, not the step-limit text.
                     yield self._make_event(
                         ErrorEvent,
                         sequence_box,
@@ -1012,7 +1048,7 @@ class AgentLoop:
                     yield self._make_event(
                         FinalEvent,
                         sequence_box,
-                        text=self._safety.fallback_message,
+                        text=self._safety.error_fallback_message,
                     )
                     _log.info(
                         "agent_loop_completed",
@@ -1680,6 +1716,7 @@ class AgentLoop:
                 "iteration_count": iteration,
             },
         )
+        # BR-021: the one path that keeps `fallback_message` (steps exhausted).
         yield self._make_event(FinalEvent, sequence_box, text=self._safety.fallback_message)
         _log.info(
             "agent_loop_completed",

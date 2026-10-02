@@ -8,6 +8,92 @@ The provider differences are absorbed by ``base_url``.
 All provider SDK exceptions are wrapped into :class:`fifty_agent_sdk.errors.LLMError`
 at the public method boundary, in line with the
 :class:`fifty_agent_sdk.llm.protocol.LLMClient` contract.
+
+Provider bodies and context-window errors (BR-021)
+    An OpenAI-compatible endpoint can answer an error with HTTP 200 and a
+    body that is not a chat completion, for example plain text. Measured on
+    ``openai`` 2.43.0, such a body reaches the adapter as a ``str``, as a
+    :class:`json.JSONDecodeError` (a body labelled JSON whose text is not
+    JSON), or on a streaming request as a stream with no events. The adapter
+    raises :class:`~fifty_agent_sdk.errors.LLMError` for each, with one of
+    these ``context["type"]`` values:
+
+    * ``"NonJsonProviderBody"``: the adapter got text where it expected a
+      JSON object, as the response body or as the data of a stream event:
+      text that is not JSON, a bare JSON string, or (a non-streaming body
+      whose Content-Type is not JSON) JSON the client could not decode.
+    * ``"NonStreamProviderBody"``: a streaming request got a 200 whose
+      media type is not ``text/event-stream``, or that has no
+      ``Content-Type``, and that produced no chunk. The type names what was
+      detected, not the body's format: an SSE-framed body holding only
+      ``data: [DONE]`` gets it too. ``context["content_type"]`` holds the
+      media type (``""`` when the header is missing), cut to 100 characters.
+    * ``"ContextLengthExceeded"``: see below.
+
+    The message is a fixed prefix plus the first 500 characters of the
+    stripped provider text, with ``…[truncated]`` appended when it was cut.
+    That text is the decoded body, the value of a body that is a bare JSON
+    string, or the data of the one stream event that failed. ``context``
+    holds ``model``, ``type``, ``body_length`` (the length in characters of
+    that text before stripping) and, on a stream, ``phase="stream"`` (plus
+    ``content_type`` for ``NonStreamProviderBody``, the provider's media type
+    cut to 100 characters). It holds none of the body's text.
+
+    Not every such body becomes one of these errors (measured on 2.43.0):
+
+    * A non-streaming 200 whose body is a JSON object without ``choices``,
+      such as an error envelope ``{"error": {...}}``, stays
+      ``"MalformedResponse"`` (``Provider returned no choices.``) and its
+      text is not kept, labelled ``application/json`` or ``text/plain``. On a
+      streaming request the same body is a ``NonStreamProviderBody`` error
+      carrying its text (``ContextLengthExceeded`` when that text holds a
+      marker), unless it is labelled ``text/event-stream``; see the next
+      item.
+    * A streaming 200 labelled ``text/event-stream`` whose body holds no SSE
+      field (plain text, or a JSON error envelope) yields no chunk and no
+      error: the ``openai`` SSE decoder drops it before the adapter sees it.
+    * A non-streaming 200 with a JSON Content-Type still escapes
+      ``complete()`` raw, as before BR-021, when its body is not valid UTF-8
+      (``UnicodeDecodeError``; measured labelled ``application/json``,
+      ``application/problem+json`` and ``text/json``) or holds an integer
+      literal over the interpreter's digit limit (``ValueError``; measured
+      labelled ``application/json``). The ``openai`` 2.43.0 source treats a
+      Content-Type as JSON when the part before ``;`` ends in ``json``.
+    * A 200 body, or a stream event's data, that is JSON but neither an
+      object nor a string (an array, a number, ``null``, ``true`` or
+      ``false``) still raises ``"MalformedResponse"`` or
+      ``"MalformedChunk"`` without its text, as before BR-021 (measured
+      labelled ``application/json``).
+
+    The provider text is diagnostic text, not end-user text. It
+    reaches ``LLMError.message``, and from there
+    :attr:`fifty_agent_sdk.streaming.ErrorEvent.message`, the Runner's
+    ``error`` audit payload (``error_message``) and the ``on_error`` hook,
+    the same places the provider's 4xx/5xx text already reaches (that text
+    is not cut to a bound). :class:`fifty_agent_sdk.loop.AgentLoop` ends
+    the run with :attr:`fifty_agent_sdk.safety.SafetyConfig.
+    error_fallback_message`, never with this text.
+
+    Context-window overflow is classified on these paths only: the
+    ``NonJsonProviderBody`` and ``NonStreamProviderBody`` errors above, and
+    any ``openai.APIError`` other than ``APITimeoutError``,
+    ``APIConnectionError`` or ``RateLimitError`` (``BadRequestError``,
+    ``InternalServerError``, a mid-stream error event, ...), whether
+    ``complete()`` gets it, ``stream()`` gets it when opening the request,
+    or ``stream()`` gets it while iterating. It is never applied to those
+    three when ``complete()`` gets them or ``stream()`` opens the request.
+    While iterating, ``stream()`` has no ``RateLimitError`` arm: ``openai``
+    2.43.0 raises only the base ``APIError`` for a mid-stream error event,
+    so no rate limit was measured there. It is never applied to any other
+    failure while a stream is read (an ``httpx`` read error, for example),
+    or to the bodies the list above leaves unhandled. When the full text
+    contains ``max_prompt_length``, ``context_length_exceeded`` or
+    ``maximum context length`` (compared case-insensitively), or the
+    error's ``code`` is ``context_length_exceeded``, ``context["type"]`` is
+    ``"ContextLengthExceeded"`` and ``context["classified_from"]`` holds the
+    type it would otherwise have had. The marker list is closed: other
+    phrasings of the same failure stay unclassified, and an unrelated error
+    whose text quotes a marker is misclassified.
 """
 
 from __future__ import annotations
@@ -53,6 +139,49 @@ _FINISH_REASON_MAP: dict[str, FinishReason] = {
 _MAX_TOOL_CALL_ARG_EXCERPT: int = 200
 """Maximum length of ``arguments_excerpt`` in the malformed-arguments context."""
 
+_MAX_PROVIDER_BODY_EXCERPT: int = 500
+"""Maximum characters of a provider body quoted in an ``LLMError`` message (BR-021)."""
+
+_PROVIDER_BODY_TRUNCATION_MARKER: str = "…[truncated]"
+"""Appended to a provider-body excerpt that was cut (BR-021).
+
+The same text as the Runner's result-summary marker. It is defined here
+because ``llm/`` must not import ``runner.py``.
+"""
+
+_CONTEXT_LENGTH_MARKERS: tuple[str, ...] = (
+    "max_prompt_length",
+    "context_length_exceeded",
+    "maximum context length",
+)
+"""Lower-case substrings that classify a provider error as a context-window overflow.
+
+BR-021. Matched case-insensitively against the full provider text. The list
+is closed: other phrasings stay unclassified, and a provider error that
+merely quotes one of these strings is misclassified. Adding a marker moves
+those errors to a new ``context["type"]``, so it is a CHANGELOG item.
+"""
+
+_CONTEXT_LENGTH_CODE: str = "context_length_exceeded"
+"""Provider error ``code`` that classifies an error as a context-window overflow (BR-021)."""
+
+_EVENT_STREAM_MEDIA_TYPE: str = "text/event-stream"
+"""The one media type a streamed response is iterated without reading it first (BR-021)."""
+
+_MAX_CONTENT_TYPE_LENGTH: int = 100
+"""Maximum length of the media type recorded as ``context["content_type"]`` (BR-021)."""
+
+# Fixed message prefixes of the three provider-body errors (BR-021). The
+# excerpt of the provider's own text follows the prefix.
+_NON_JSON_BODY_PREFIX: str = "Provider response body could not be read as a JSON object: "
+_NON_JSON_EVENT_PREFIX: str = "Provider stream event is not a JSON object: "
+# The stream prefix states what was detected (no chunk, and a media type that
+# is not text/event-stream), not that the body is not SSE: an SSE-framed body
+# holding only `data: [DONE]` also ends here.
+_NON_STREAM_BODY_PREFIX: str = (
+    "Provider stream produced no chunk and its Content-Type is not text/event-stream. Body: "
+)
+
 _MaxTokensParam = Literal["max_tokens", "max_completion_tokens"]
 """Request-body key that carries :attr:`ChatRequest.max_tokens` on the wire."""
 
@@ -66,6 +195,106 @@ _MAX_COMPLETION_TOKENS_MODEL_RE = re.compile(
     r"^(?:.*[/:])?(?:gpt-5|o[134])(?![0-9a-z])",
     re.IGNORECASE,
 )
+
+
+def _is_context_length_exceeded(text: str, code: object = None) -> bool:
+    """Return whether a provider error reports a context-window overflow (BR-021).
+
+    True when ``text`` contains any of :data:`_CONTEXT_LENGTH_MARKERS`
+    (compared after :meth:`str.casefold`), or when ``code`` is a ``str``
+    equal to :data:`_CONTEXT_LENGTH_CODE` after casefolding. The ``code``
+    rule covers a provider error whose message carries no marker. A
+    non-``str`` ``code`` is ignored.
+
+    Args:
+        text: The full provider text: a body, or ``str()`` of an ``openai``
+            exception. Never an excerpt, so a marker past the excerpt bound
+            still counts.
+        code: The ``code`` attribute of an ``openai.APIError``, if any.
+
+    Returns:
+        ``True`` when the error should be typed ``"ContextLengthExceeded"``.
+    """
+    folded = text.casefold()
+    if any(marker in folded for marker in _CONTEXT_LENGTH_MARKERS):
+        return True
+    return isinstance(code, str) and code.casefold() == _CONTEXT_LENGTH_CODE
+
+
+def _classify(context: dict[str, Any], text: str, code: object = None) -> dict[str, Any]:
+    """Re-type an error context as ``"ContextLengthExceeded"`` when the text says so (BR-021).
+
+    Returns ``context`` itself, unchanged, when
+    :func:`_is_context_length_exceeded` is false, so an unclassified error
+    gains no key. Otherwise returns a new dict with ``type`` set to
+    ``"ContextLengthExceeded"`` and ``classified_from`` set to the type it
+    replaced (for example ``"BadRequestError"`` or ``"NonJsonProviderBody"``).
+
+    Args:
+        context: The error context, which must hold a ``"type"`` key.
+        text: The full provider text the classification reads.
+        code: The provider error ``code``, if any.
+
+    Returns:
+        The context to attach to the :class:`LLMError`.
+    """
+    if not _is_context_length_exceeded(text, code):
+        return context
+    return {**context, "type": "ContextLengthExceeded", "classified_from": context["type"]}
+
+
+def _provider_body_error(
+    text: str,
+    *,
+    model: str,
+    type_: str,
+    prefix: str,
+    extra: dict[str, Any] | None = None,
+) -> LLMError:
+    """Build the :class:`LLMError` for a provider body the adapter cannot map (BR-021).
+
+    The message is ``prefix`` plus the stripped ``text`` cut to
+    :data:`_MAX_PROVIDER_BODY_EXCERPT` characters, with
+    :data:`_PROVIDER_BODY_TRUNCATION_MARKER` appended when it was cut. The
+    context holds ``model``, ``type``, ``body_length`` (``len(text)``,
+    before stripping) and ``extra``, and is passed through :func:`_classify`
+    on the WHOLE ``text``. The context holds none of ``text``.
+
+    The error is returned, not raised, so each caller chooses its cause
+    (``raise ... from e`` after a decode failure; no cause on a ``str`` body).
+
+    Args:
+        text: The provider text: the decoded body, the value of a body that
+            is a bare JSON string, or the data of one stream event.
+        model: Model identifier for the context.
+        type_: The context type before classification.
+        prefix: The fixed message prefix naming the failure.
+        extra: Further context keys that carry no body text (``phase``,
+            ``content_type``).
+
+    Returns:
+        The error to raise.
+    """
+    stripped = text.strip()
+    excerpt = stripped[:_MAX_PROVIDER_BODY_EXCERPT]
+    if len(stripped) > _MAX_PROVIDER_BODY_EXCERPT:
+        excerpt += _PROVIDER_BODY_TRUNCATION_MARKER
+    context: dict[str, Any] = {"model": model, "type": type_, "body_length": len(text)}
+    if extra:
+        context.update(extra)
+    return LLMError(prefix + excerpt, context=_classify(context, text))
+
+
+def _media_type(content_type: str | None) -> str:
+    """Return the media type of a ``Content-Type`` header value, casefolded (BR-021).
+
+    The parameters after ``;`` are dropped, so ``"text/event-stream;
+    charset=utf-8"`` gives ``"text/event-stream"``. A missing header gives
+    ``""``.
+    """
+    if content_type is None:
+        return ""
+    return content_type.split(";", 1)[0].strip().casefold()
 
 
 class OpenAICompatibleClient:
@@ -187,7 +416,12 @@ class OpenAICompatibleClient:
         Raises:
             fifty_agent_sdk.errors.LLMError: Wraps any failure of the underlying
                 provider call (network, timeout, rate-limit, malformed
-                envelope, missing fields).
+                envelope, missing fields). A 200 whose body the adapter
+                receives as text (text that is not JSON, or a bare JSON
+                string; see the module docstring) is ``context["type"] ==
+                "NonJsonProviderBody"``, with the body's start in the message
+                (BR-021). A context-window overflow is
+                ``"ContextLengthExceeded"`` (see the module docstring).
         """
         model = request.model or self._default_model
         if not model:
@@ -216,7 +450,29 @@ class OpenAICompatibleClient:
         except APIError as e:
             raise LLMError(
                 str(e),
-                context={"model": model, "type": type(e).__name__},
+                context=_classify(
+                    {"model": model, "type": type(e).__name__},
+                    str(e),
+                    getattr(e, "code", None),
+                ),
+            ) from e
+        except json.JSONDecodeError as e:
+            # BR-021: a 200 labelled JSON whose body is not JSON. The openai
+            # client decodes it outside its own error handling (measured on
+            # 2.43.0), so the decode error would otherwise escape complete()
+            # raw. `e.doc` is the decoded body. Deliberately NOT `ValueError`:
+            # a `UnicodeEncodeError` (a ValueError) from encoding the request
+            # is BR-022's case, and must not be reported as a provider body.
+            # The cost, measured on 2.43.0: a JSON-labelled body whose integer
+            # literal exceeds the interpreter's digit limit (`ValueError`), or
+            # that is not valid UTF-8 (`UnicodeDecodeError`, also a
+            # ValueError), still escapes raw, as it did before BR-021. Both
+            # are tracked as BR-023.
+            raise _provider_body_error(
+                e.doc,
+                model=model,
+                type_="NonJsonProviderBody",
+                prefix=_NON_JSON_BODY_PREFIX,
             ) from e
         return self._map_response(raw, model=model)
 
@@ -232,6 +488,24 @@ class OpenAICompatibleClient:
         ``finish_reason`` without misreading an intermediate delta as
         terminal.
 
+        Non-event-stream responses (BR-021)
+            A 200 whose media type is not ``text/event-stream`` (a missing
+            ``Content-Type`` included) is read whole before its first chunk
+            is yielded, so a direct caller gets that response's chunks only
+            after its body has arrived. If it then yields no chunk, the
+            adapter raises :class:`LLMError` with ``context["type"] ==
+            "NonStreamProviderBody"`` and the body's start in the message,
+            whatever the body holds: an SSE-framed body with only
+            ``data: [DONE]`` gets this error too. If reading the body fails,
+            the adapter raises :class:`LLMError` whose ``context["type"]``
+            is the ``httpx`` exception's class name (for example
+            ``"ReadError"``) and ``context["phase"]`` is ``"stream"``. A
+            ``text/event-stream`` response is not read ahead. One case is
+            not recoverable: a body without SSE fields (plain text, or a
+            JSON error envelope) labelled ``text/event-stream`` yields no
+            chunk and no error, because the ``openai`` SSE decoder discards
+            it (measured on 2.43.0).
+
         Args:
             request: The chat completion request.
 
@@ -241,6 +515,14 @@ class OpenAICompatibleClient:
         Raises:
             fifty_agent_sdk.errors.LLMError: Wraps any failure of the underlying
                 provider call. Errors mid-stream surface from the iterator.
+                A stream event whose data is not JSON, or is a bare JSON
+                string, is ``context["type"] == "NonJsonProviderBody"``
+                (before BR-021 the first was ``"JSONDecodeError"`` and the
+                second ``"MalformedChunk"``). A context-window
+                overflow is ``"ContextLengthExceeded"`` (see the module
+                docstring); a failure of the ``httpx`` read itself, such as
+                a mid-stream ``ReadTimeout``, is never classified.
+                Provider-body errors carry ``context["phase"] == "stream"``.
         """
         model = request.model or self._default_model
         if not model:
@@ -269,12 +551,45 @@ class OpenAICompatibleClient:
         except APIError as e:
             raise LLMError(
                 str(e),
-                context={"model": model, "type": type(e).__name__},
+                context=_classify(
+                    {"model": model, "type": type(e).__name__},
+                    str(e),
+                    getattr(e, "code", None),
+                ),
             ) from e
 
         try:
+            # BR-021 (D8): the openai client iterates a 200 stream without
+            # looking at its Content-Type, and its SSE decoder silently drops
+            # a body that is not SSE, so a plain-text error would look like an
+            # empty stream. Read every non-event-stream body first (the openai
+            # iterator then replays it from httpx's cache), so its text is
+            # still available if it yields no chunk. `getattr` + `isinstance`
+            # keep a stream object without an httpx `response` (another
+            # openai release, a test double) on the unbuffered path.
+            response = getattr(stream, "response", None)
+            buffered: httpx.Response | None = None
+            media_type = ""
+            if isinstance(response, httpx.Response):
+                media_type = _media_type(response.headers.get("content-type"))
+                if media_type != _EVENT_STREAM_MEDIA_TYPE:
+                    await response.aread()
+                    buffered = response
+            upstream_chunks = 0
             async for raw_chunk in stream:
+                upstream_chunks += 1
                 yield self._map_chunk(raw_chunk, model=model)
+            if buffered is not None and upstream_chunks == 0:
+                raise _provider_body_error(
+                    buffered.text,
+                    model=model,
+                    type_="NonStreamProviderBody",
+                    prefix=_NON_STREAM_BODY_PREFIX,
+                    extra={
+                        "phase": "stream",
+                        "content_type": media_type[:_MAX_CONTENT_TYPE_LENGTH],
+                    },
+                )
         except APITimeoutError as e:
             raise LLMError(
                 str(e),
@@ -288,11 +603,29 @@ class OpenAICompatibleClient:
         except APIError as e:
             raise LLMError(
                 str(e),
-                context={"model": model, "type": type(e).__name__, "phase": "stream"},
+                context=_classify(
+                    {"model": model, "type": type(e).__name__, "phase": "stream"},
+                    str(e),
+                    getattr(e, "code", None),
+                ),
             ) from e
         except LLMError:
-            # Allow defensive mapping errors raised from `_map_chunk` to surface unchanged.
+            # Allow defensive mapping errors raised from `_map_chunk` (and the
+            # BR-021 provider-body errors above) to surface unchanged.
             raise
+        except json.JSONDecodeError as e:
+            # BR-021: SSE-framed data that is not JSON (`data: <text>`). `e.doc`
+            # is the event data. Deliberately NOT `ValueError`: only a decode
+            # failure carries provider text in `e.doc`, so any other
+            # ValueError (a `UnicodeEncodeError` included, see BR-022) keeps
+            # the generic wrap below rather than reading as a provider body.
+            raise _provider_body_error(
+                e.doc,
+                model=model,
+                type_="NonJsonProviderBody",
+                prefix=_NON_JSON_EVENT_PREFIX,
+                extra={"phase": "stream"},
+            ) from e
         except Exception as e:
             raise LLMError(
                 str(e),
@@ -444,7 +777,25 @@ class OpenAICompatibleClient:
         with the offending ``tool_call_id`` and a bounded
         ``arguments_excerpt`` — a provider sending malformed ``arguments`` is
         an unrecoverable envelope error, not model drift.
+
+        A ``str`` ``raw`` is a provider body that could not be read as a
+        JSON object: measured on ``openai`` 2.43.0, the client returns a 200
+        body as text when its Content-Type is not JSON and it does not
+        decode, and returns a bare JSON string as that string. It raises
+        :class:`LLMError` with ``context["type"] == "NonJsonProviderBody"``
+        (or ``"ContextLengthExceeded"``) and the body's start in the
+        message, instead of ``"MalformedResponse"`` (BR-021). A body that
+        decodes to a JSON object without ``choices``, such as an error
+        envelope ``{"error": {...}}``, is not a ``str`` and still raises
+        ``"MalformedResponse"`` without its text (out of BR-021's scope).
         """
+        if isinstance(raw, str):
+            raise _provider_body_error(
+                raw,
+                model=model,
+                type_="NonJsonProviderBody",
+                prefix=_NON_JSON_BODY_PREFIX,
+            )
         try:
             choices = raw.choices
             if not choices:
@@ -545,7 +896,21 @@ class OpenAICompatibleClient:
         on the chunk whose upstream ``finish_reason`` is non-``None``. This
         lets consumers branch on ``finish_reason`` without misreading an
         intermediate delta as terminal.
+
+        A ``str`` ``raw`` is a stream event whose data is a bare JSON string.
+        It raises :class:`LLMError` with ``context["type"] ==
+        "NonJsonProviderBody"`` (or ``"ContextLengthExceeded"``),
+        ``context["phase"] == "stream"`` and the text in the message,
+        instead of ``"MalformedChunk"`` (BR-021).
         """
+        if isinstance(raw, str):
+            raise _provider_body_error(
+                raw,
+                model=model,
+                type_="NonJsonProviderBody",
+                prefix=_NON_JSON_EVENT_PREFIX,
+                extra={"phase": "stream"},
+            )
         try:
             choices = raw.choices
             if not choices:

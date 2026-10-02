@@ -666,7 +666,9 @@ async def test_parser_error_retry_exhausted_terminates() -> None:
 
     Locks the terminal ``ErrorEvent`` + fallback ``FinalEvent`` shape on
     the retry-exhausted path and asserts the LLM was called exactly twice
-    — once for the drift, once for the retry that also drifted.
+    — once for the drift, once for the retry that also drifted. Since
+    BR-021 that ``FinalEvent`` carries ``error_fallback_message``: the run
+    stopped on unparseable output, not on the iteration cap.
     """
     llm = FakeLLMClient(replies=[make_response("drift one"), make_response("drift two")])
     loop = _make_loop(llm=llm)
@@ -678,7 +680,7 @@ async def test_parser_error_retry_exhausted_terminates() -> None:
     assert isinstance(error_event, ErrorEvent)
     assert error_event.error_type == "ParserError"
     assert isinstance(final_event, FinalEvent)
-    assert final_event.text == SafetyConfig().fallback_message
+    assert final_event.text == SafetyConfig().error_fallback_message
     # The retry attempt fires a second LLM call before exhausting the budget.
     assert len(llm.calls) == 2
 
