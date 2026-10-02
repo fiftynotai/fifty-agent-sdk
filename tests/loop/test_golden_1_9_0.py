@@ -46,6 +46,9 @@ What this does NOT pin:
 * Any intervention path. No scenario passes ``interventions``; the
   configured-but-passive cases are pinned by
   ``test_passive_interventions_leave_requests_and_events_unchanged``.
+* Non-ASCII text or U+007F in the JSON the SDK writes for the model, which
+  1.10.2 changed (BR-020). No scenario's tool results, tool schemas or
+  replayed arguments hold any.
 """
 
 from __future__ import annotations

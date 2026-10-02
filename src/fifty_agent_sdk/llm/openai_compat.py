@@ -27,6 +27,7 @@ from openai import (
     RateLimitError,
 )
 
+from fifty_agent_sdk._model_json import dumps_for_model
 from fifty_agent_sdk.errors import LLMError
 from fifty_agent_sdk.llm.types import (
     ChatMessage,
@@ -314,7 +315,7 @@ class OpenAICompatibleClient:
 
             {role:"assistant", content, tool_calls: [
                 {id, type:"function",
-                 function:{name, arguments: json.dumps(args)}}
+                 function:{name, arguments: dumps_for_model(args)}}
             ]}
 
         The ``id`` is sourced PER ENTRY from the entry's own
@@ -328,7 +329,12 @@ class OpenAICompatibleClient:
         sets ``ToolCall(id=None)`` and ``msg.tool_call_id=call_id``, so
         ``tc.id is None`` falls back to ``msg.tool_call_id`` and emits the
         same id BR-008 did. ``arguments`` is emitted as a JSON STRING (not an
-        object), per the OpenAI function-calling spec.
+        object), per the OpenAI function-calling spec. Since 1.10.2 that
+        string keeps non-ASCII text literal rather than as ``\\uXXXX``
+        escapes (a value holding a surrogate code point keeps the escaped
+        form; :func:`fifty_agent_sdk._model_json.dumps_for_model`, BR-020);
+        it decodes to the same value the 1.10.1 string did. Only
+        ``arguments`` changed: the ``id`` expression above is untouched.
 
         Flag-OFF proof: ``ChatMessage.tool_calls`` defaults to ``None`` and is
         only populated on a native turn (which requires
@@ -342,7 +348,7 @@ class OpenAICompatibleClient:
                     "type": "function",
                     "function": {
                         "name": tc.name,
-                        "arguments": json.dumps(tc.args),
+                        "arguments": dumps_for_model(tc.args),
                     },
                 }
                 for tc in msg.tool_calls

@@ -36,6 +36,10 @@ fixture from newer source and destroy its provenance.
 No scenario here passes ``reasoning_effort`` or ``temperature`` to
 ``AgentLoop``: neither kwarg existed when the fixture was captured.
 
+It does NOT pin non-ASCII text or U+007F in the JSON the SDK writes for the
+model, which 1.10.2 changed (BR-020): no scenario's tool results, tool schemas
+or replayed arguments hold any.
+
 This file is deliberately NOT named ``test_*.py`` so pytest does not collect
 it; :mod:`tests.loop.test_golden_1_8_0` imports it.
 """

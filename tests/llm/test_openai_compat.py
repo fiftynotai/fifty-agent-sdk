@@ -805,6 +805,63 @@ async def test_assistant_tool_calls_envelope_on_wire(httpx_mock: HTTPXMock) -> N
     assert json.loads(tc["function"]["arguments"]) == {"q": "x"}
 
 
+async def test_assistant_tool_calls_arguments_keep_non_ascii_literal(
+    httpx_mock: HTTPXMock,
+) -> None:
+    """A replayed native turn's ``arguments`` string keeps Arabic literal, still decodes to the args, and keeps its ``id`` (BR-020)."""
+    assistant_msg = ChatMessage(
+        role="assistant",
+        content="",
+        tool_call_id="pairing-id-123",
+        tool_calls=[ToolCall(name="search", args={"q": "فاطمة"})],
+    )
+    httpx_mock.add_response(method="POST", url=ENDPOINT, json=_canonical_response())
+    client = _make_client()
+    await client.complete(_basic_request(messages=[assistant_msg]))
+    raw = httpx_mock.get_request()
+    assert raw is not None
+    body = json.loads(raw.read())
+    tc = body["messages"][0]["tool_calls"][0]
+    assert tc["id"] == "pairing-id-123"
+    arguments = tc["function"]["arguments"]
+    assert isinstance(arguments, str)
+    assert arguments == '{"q": "فاطمة"}'
+    assert json.loads(arguments) == {"q": "فاطمة"}
+
+
+async def test_assistant_tool_calls_arguments_with_lone_surrogate_still_send(
+    httpx_mock: HTTPXMock,
+) -> None:
+    """``arguments`` holding a surrogate code point gets the escaped form, so ``complete()`` sends the request and returns (BR-020).
+
+    Its first leg runs through the ``openai`` release's own body encoder: on
+    the dev environment's 2.43.0, which encodes the body as strict UTF-8
+    without escaping, a literal surrogate made ``complete()`` raise
+    ``UnicodeEncodeError`` before sending.
+    The exact-``arguments`` assertion requires the escaped text on any
+    release; that leg was not run against a release that escapes the body.
+    ``tests/test_model_json.py`` and ``tests/loop/test_loop_non_ascii.py`` pin
+    the fallback whatever the ``openai`` release.
+    """
+    surrogate = chr(0xD800)
+    assistant_msg = ChatMessage(
+        role="assistant",
+        content="",
+        tool_call_id="pairing-id-123",
+        tool_calls=[ToolCall(name="search", args={"q": surrogate})],
+    )
+    httpx_mock.add_response(method="POST", url=ENDPOINT, json=_canonical_response())
+    client = _make_client()
+    resp = await client.complete(_basic_request(messages=[assistant_msg]))
+    assert resp.message.content == "hello"
+    raw = httpx_mock.get_request()
+    assert raw is not None
+    body = json.loads(raw.read())
+    arguments = body["messages"][0]["tool_calls"][0]["function"]["arguments"]
+    assert arguments == '{"q": "\\ud800"}'
+    assert json.loads(arguments) == {"q": surrogate}
+
+
 async def test_id_pairing_assistant_id_matches_tool_reply(httpx_mock: HTTPXMock) -> None:
     """The assistant tool_calls id and the tool reply tool_call_id pair on the wire."""
     assistant_msg = ChatMessage(

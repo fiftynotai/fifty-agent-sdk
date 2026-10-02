@@ -44,6 +44,19 @@ Interventions (FR-003)
     1.9.0 (timestamps and minted ids aside); see
     :mod:`fifty_agent_sdk.interventions` for the contract.
 
+Non-ASCII text (BR-020)
+    Since 1.10.2, JSON the SDK writes for the model carries non-ASCII text
+    literally instead of as ``\\uXXXX`` escapes: non-string tool results,
+    the text-mode tool list, and the ``arguments`` string of a replayed
+    native tool call (a value holding a surrogate code point keeps the
+    escaped form; see :mod:`fifty_agent_sdk._model_json`). The
+    release-equivalence statements in this module (above, in
+    :class:`AgentLoop`'s Args and in its ``__init__`` comments), and the
+    matching ones in :mod:`fifty_agent_sdk.tool_mode` and
+    :mod:`fifty_agent_sdk.interventions`, were measured with golden fixtures
+    in which that JSON contains only code points U+0000-U+007E, and they hold
+    for runs where it does.
+
 Statelessness
     Every :meth:`AgentLoop.run` call is its own scoped iteration. The
     loop holds no state across calls — conversation persistence and
@@ -88,7 +101,6 @@ from __future__ import annotations
 
 import asyncio
 import enum
-import json
 import re
 import time
 from collections.abc import AsyncIterator
@@ -100,6 +112,7 @@ from uuid import uuid4
 import structlog
 from pydantic import ValidationError
 
+from fifty_agent_sdk._model_json import dumps_for_model
 from fifty_agent_sdk.errors import (
     AgentSdkError,
     LLMError,
@@ -210,7 +223,11 @@ def _render_tool_descriptions(tools: list[Tool]) -> str:
     Format::
 
         - <name>: <description>
-          args: <JSON of schema.properties with sorted keys>
+          args: <JSON of schema.properties with sorted keys, non-ASCII literal>
+
+    The ``args`` JSON comes from :func:`fifty_agent_sdk._model_json.dumps_for_model`
+    (BR-020), so non-ASCII text in a property ``description`` or ``enum``
+    reaches the system prompt as written rather than as ``\\uXXXX`` escapes.
 
     Args:
         tools: Snapshot of registered tools from
@@ -224,7 +241,7 @@ def _render_tool_descriptions(tools: list[Tool]) -> str:
         return ""
     lines: list[str] = []
     for tool in tools:
-        args_json = json.dumps(tool.schema.properties, sort_keys=True)
+        args_json = dumps_for_model(tool.schema.properties, sort_keys=True)
         lines.append(f"- {tool.name}: {tool.description}\n  args: {args_json}")
     return "\n".join(lines)
 
@@ -281,9 +298,16 @@ def _serialize_tool_output(output: Any) -> str:
     Strategy:
 
     1. If ``output`` is already a string, return it unchanged.
-    2. Otherwise attempt :func:`json.dumps` with ``default=str`` to handle
-       common non-serializable types (datetimes, paths, custom classes).
-    3. As a last resort fall back to :func:`repr`.
+    2. Otherwise attempt
+       :func:`fifty_agent_sdk._model_json.dumps_for_model` with
+       ``default=str`` to handle common non-serializable types (datetimes,
+       paths, custom classes). Non-ASCII text stays literal instead of
+       becoming ``\\uXXXX`` escapes (BR-020); a payload holding a surrogate
+       code point gets the escaped form, so the JSON this step returns
+       always encodes as UTF-8. (Step 1 returns a ``str`` as it is, so a
+       surrogate code point in a string result is passed through.)
+    3. As a last resort fall back to :func:`repr`, when ``json.dumps`` itself
+       raises ``TypeError`` or ``ValueError``.
 
     The shape of the tool message content is provider-tolerated; both
     JSON-mode and prose-mode LLMs accept a stringified payload.
@@ -293,12 +317,19 @@ def _serialize_tool_output(output: Any) -> str:
             protocol.ToolResult.output`.
 
     Returns:
-        A string representation of the output, guaranteed not to raise.
+        A string representation of the output. A ``TypeError`` or
+        ``ValueError`` from ``json.dumps`` falls back to :func:`repr`. A
+        ``RecursionError`` from deeply nested output is not caught, as in
+        1.10.1 (BR-020 measured a 200,000-level list on CPython 3.14.3).
     """
     if isinstance(output, str):
         return output
     try:
-        return json.dumps(output, default=str)
+        # BR-020: the ``UnicodeEncodeError`` a surrogate code point causes is
+        # a ``ValueError`` subclass, but the helper handles it, so it never
+        # reaches the ``repr`` arm below (pinned by
+        # test_serialize_tool_output_lone_surrogate_keeps_json_not_repr).
+        return dumps_for_model(output, default=str)
     except (TypeError, ValueError):
         return repr(output)
 

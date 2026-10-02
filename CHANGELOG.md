@@ -6,6 +6,33 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.10.2] - 2026-10-02
+
+### Fixed
+- JSON that the SDK writes for the model now carries non-ASCII text as literal UTF-8
+  instead of `\uXXXX` escapes. By default Python's `json.dumps` writes every non-ASCII
+  character as an escape: 6 characters each, 12 for a character outside the Basic
+  Multilingual Plane such as an emoji. One Arabic-heavy tool result measured 141,325
+  characters escaped and 35,840 unescaped, about 3.9 times shorter. In that measured
+  case the previous request had used 12,535 prompt tokens, and the provider rejected the
+  request that added the escaped result for exceeding its max_prompt_length of 131,072.
+- Three places change:
+  - a tool result that is not a string (a dict or list, including an MCP tool's
+    `structuredContent` or content blocks), in every tool mode and tool-result role, on
+    the single-call path and in a native batch;
+  - the argument schemas in the system prompt's text-mode tool list;
+  - the `arguments` string of a replayed native tool call.
+- The decoded JSON values are unchanged.
+- For data whose strings hold only code points U+0000-U+007E, that JSON is unchanged,
+  byte for byte. U+007F (DEL) is the one ASCII exception: it is now sent as the
+  character rather than as `\u007f`.
+- In those three places, a value holding a surrogate code point (U+D800-U+DFFF), which
+  UTF-8 cannot encode, keeps the fully escaped 1.10.1 form, which UTF-8 can encode. A tool
+  result that is already a string is unchanged by this release.
+- Stored data is unchanged: tool results are never persisted, and Redis branch metadata
+  keeps its encoding.
+- No public API changes. (BR-020)
+
 ## [1.10.1] - 2026-09-28
 
 ### Fixed

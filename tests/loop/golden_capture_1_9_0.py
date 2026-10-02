@@ -30,6 +30,10 @@ the bodies: ``{"bodies": [...], "events": [...]}``.
   ``tool_call_id`` and event ``call_id`` share a placeholder when they share
   an id), and the result does not depend on how many times ``uuid4`` runs.
 
+It does NOT pin non-ASCII text or U+007F in the JSON the SDK writes for the
+model, which 1.10.2 changed (BR-020): no scenario's tool results, tool schemas
+or replayed arguments hold any.
+
 Running ``python -m tests.loop.golden_capture_1_9_0`` from the repo root writes
 ``tests/loop/golden/requests_1_9_0.json``. The fixture in the tree was written
 from the UNMODIFIED 1.9.0 source (commit ``50560a3``) before any FR-003 edit

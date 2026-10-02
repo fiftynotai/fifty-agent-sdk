@@ -21,7 +21,10 @@ behaviour is pinned by the unmodified ``tests/loop`` and ``tests/runner``
 suites instead. Nor key order: the fixture is written with ``sort_keys=True``
 and :func:`_canonical` sorts too, so this pins keys, values and JSON types
 only. Key order is preserved by construction
-(``OpenAICompatibleClient._build_body`` is unchanged since 1.7.0).
+(``OpenAICompatibleClient._build_body`` is unchanged since 1.7.0). Nor
+non-ASCII text or U+007F in the JSON the SDK writes for the model, which
+1.10.2 changed (BR-020): no scenario's tool results, tool schemas or replayed
+arguments hold any.
 """
 
 from __future__ import annotations
