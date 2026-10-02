@@ -24,7 +24,9 @@ only. Key order is preserved by construction
 (``OpenAICompatibleClient._build_body`` is unchanged since 1.7.0). Nor
 non-ASCII text or U+007F in the JSON the SDK writes for the model, which
 1.10.2 changed (BR-020): no scenario's tool results, tool schemas or replayed
-arguments hold any.
+arguments hold any. Nor any text the 64-level nesting check refuses
+(BR-019): it refuses no text in any scenario, whose tool arguments nest at
+most 1 level.
 """
 
 from __future__ import annotations

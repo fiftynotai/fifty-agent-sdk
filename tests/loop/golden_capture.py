@@ -19,7 +19,9 @@ values, JSON types). This module is the harness that pins that promise:
 
 It does NOT pin non-ASCII text or U+007F in the JSON the SDK writes for the
 model, which 1.10.2 changed (BR-020): no scenario's tool results, tool schemas
-or replayed arguments hold any.
+or replayed arguments hold any. Nor any text the 64-level nesting check
+refuses (BR-019): it refuses no text in any scenario, whose tool arguments
+nest at most 1 level.
 
 Running ``python -m tests.loop.golden_capture`` from the repo root writes
 ``tests/loop/golden/legacy_1_7_0.json``. The fixture in the tree was written

@@ -14,6 +14,7 @@ import httpx
 import pytest
 from pytest_httpx import HTTPXMock
 
+from fifty_agent_sdk._json_depth import MAX_TOOL_ARGS_DEPTH
 from fifty_agent_sdk.errors import LLMError
 from fifty_agent_sdk.llm.openai_compat import OpenAICompatibleClient
 from fifty_agent_sdk.llm.protocol import LLMClient
@@ -670,6 +671,188 @@ async def test_complete_non_object_arguments_raises_llm_error(httpx_mock: HTTPXM
         await client.complete(_basic_request())
     assert exc.value.context["type"] == "MalformedResponse"
     assert exc.value.context["tool_call_id"] == "call_3"
+
+
+# ---------------------------------------------------------------------------
+# Tool-call argument nesting limit (BR-019)
+# ---------------------------------------------------------------------------
+
+_DEPTH_MESSAGE = f"provider tool_call arguments nest deeper than {MAX_TOOL_ARGS_DEPTH} levels"
+
+
+def _nested_arguments(depth: int) -> str:
+    """Arguments text nested ``depth`` levels: ``{"b":"[","a":[[...0...]]}`` (BR-019).
+
+    The ``"["`` string gives the text one more ``[`` than levels, so the depth
+    check reads past its ``str.count`` shortcut at the limit too.
+    """
+    return '{"b":"[","a":' + "[" * (depth - 1) + "0" + "]" * (depth - 1) + "}"
+
+
+def _tool_call_entry(call_id: str, arguments: str) -> dict[str, Any]:
+    return {
+        "id": call_id,
+        "type": "function",
+        "function": {"name": "search", "arguments": arguments},
+    }
+
+
+def _decode_maximum_here() -> int:
+    """Deepest ``_nested_arguments`` text ``json.loads`` decodes, measured from this frame.
+
+    Doubling from 128, then a binary search. Each probe text is built fresh
+    and only decoded; nothing deep reaches an ``assert``.
+    """
+    lo, hi = 1, 128
+    while True:
+        try:
+            json.loads(_nested_arguments(hi))
+        except RecursionError:
+            break
+        lo, hi = hi, hi * 2
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        try:
+            json.loads(_nested_arguments(mid))
+            lo = mid
+        except RecursionError:
+            hi = mid
+    return lo
+
+
+async def test_complete_accepts_tool_call_arguments_nested_at_the_limit(
+    httpx_mock: HTTPXMock,
+) -> None:
+    """Arguments nested exactly the limit (64 levels) decode as before (BR-019)."""
+    arguments = _nested_arguments(MAX_TOOL_ARGS_DEPTH)
+    payload = _canonical_response(
+        content="",
+        finish_reason="tool_calls",
+        tool_calls=[_tool_call_entry("call_at_limit", arguments)],
+    )
+    httpx_mock.add_response(method="POST", url=ENDPOINT, json=payload)
+    resp = await _make_client().complete(_basic_request())
+
+    assert resp.finish_reason == "tool_calls"
+    assert resp.message.tool_calls is not None
+    assert resp.message.tool_calls[0].args == json.loads(arguments)
+
+
+async def test_complete_refuses_tool_call_arguments_one_past_the_limit(
+    httpx_mock: HTTPXMock,
+) -> None:
+    """One level past the limit raises a fixed-message MalformedResponse LLMError (BR-019)."""
+    arguments = _nested_arguments(MAX_TOOL_ARGS_DEPTH + 1)
+    payload = _canonical_response(
+        content="",
+        finish_reason="tool_calls",
+        tool_calls=[_tool_call_entry("call_deep", arguments)],
+    )
+    httpx_mock.add_response(method="POST", url=ENDPOINT, json=payload)
+    with pytest.raises(LLMError) as exc:
+        await _make_client().complete(_basic_request())
+
+    assert str(exc.value) == _DEPTH_MESSAGE
+    for fragment in ("[", "{", '"a"', '"b"'):
+        assert fragment not in str(exc.value)
+    assert exc.value.context == {
+        "model": "gpt-4o",
+        "type": "MalformedResponse",
+        "tool_call_id": "call_deep",
+        "arguments_excerpt": arguments[:200],
+        "max_tool_args_depth": MAX_TOOL_ARGS_DEPTH,
+    }
+    assert exc.value.__cause__ is None
+
+
+async def test_complete_refuses_arguments_deeper_than_the_decoder_reaches(
+    httpx_mock: HTTPXMock,
+) -> None:
+    """Arguments nested past json.loads's own limit raise the depth LLMError, not RecursionError (BR-019).
+
+    The depth is twice the decode maximum measured in this process. Before
+    BR-019 the decoder raised RecursionError there, which the ``ValueError``
+    arm does not catch, so it escaped ``complete()`` raw (BR-019 evidence,
+    P1(c), on CPython 3.11.15, 3.13.2 and 3.14.3).
+    """
+    arguments = _nested_arguments(2 * _decode_maximum_here())
+    payload = _canonical_response(
+        content="",
+        finish_reason="tool_calls",
+        tool_calls=[_tool_call_entry("call_very_deep", arguments)],
+    )
+    httpx_mock.add_response(method="POST", url=ENDPOINT, json=payload)
+    with pytest.raises(LLMError) as exc:
+        await _make_client().complete(_basic_request())
+
+    assert str(exc.value) == _DEPTH_MESSAGE
+    assert exc.value.context["type"] == "MalformedResponse"
+    assert exc.value.context["tool_call_id"] == "call_very_deep"
+    assert exc.value.context["max_tool_args_depth"] == MAX_TOOL_ARGS_DEPTH
+    assert exc.value.context["arguments_excerpt"] == arguments[:200]
+
+
+async def test_one_too_deep_entry_refuses_the_whole_batch(httpx_mock: HTTPXMock) -> None:
+    """A too-deep second entry refuses the whole response, naming that entry (BR-019)."""
+    payload = _canonical_response(
+        content="",
+        finish_reason="tool_calls",
+        tool_calls=[
+            _tool_call_entry("call_ok", '{"q": "x"}'),
+            _tool_call_entry("call_deep", _nested_arguments(MAX_TOOL_ARGS_DEPTH + 1)),
+        ],
+    )
+    httpx_mock.add_response(method="POST", url=ENDPOINT, json=payload)
+    with pytest.raises(LLMError) as exc:
+        await _make_client().complete(_basic_request())
+
+    assert str(exc.value) == _DEPTH_MESSAGE
+    assert exc.value.context["tool_call_id"] == "call_deep"
+    assert exc.value.context["max_tool_args_depth"] == MAX_TOOL_ARGS_DEPTH
+
+
+async def test_brackets_inside_argument_strings_are_not_nesting(httpx_mock: HTTPXMock) -> None:
+    """A string holding 200 brackets is one level of arguments and decodes intact (BR-019)."""
+    arguments = json.dumps({"q": "[" * 200 + "{" * 200})
+    payload = _canonical_response(
+        content="",
+        finish_reason="tool_calls",
+        tool_calls=[_tool_call_entry("call_brackets", arguments)],
+    )
+    httpx_mock.add_response(method="POST", url=ENDPOINT, json=payload)
+    resp = await _make_client().complete(_basic_request())
+
+    assert resp.message.tool_calls is not None
+    assert resp.message.tool_calls[0].args == {"q": "[" * 200 + "{" * 200}
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    ["[" * (MAX_TOOL_ARGS_DEPTH + 1) + "not json", "x" + "[" * 100],
+    ids=["deep_then_invalid", "invalid_at_the_first_character"],
+)
+async def test_depth_is_checked_before_json_validity(httpx_mock: HTTPXMock, arguments: str) -> None:
+    """Invalid text whose brackets open past the limit gets the depth error, not the invalid-JSON one (BR-019).
+
+    ``x`` followed by 100 ``[`` fails ``json.loads`` at its first character
+    and nests nothing; before BR-019 it raised ``provider tool_call arguments
+    is not valid JSON``. So ``max_tool_args_depth`` marks the check's
+    refusal, not a value proved to nest deeply.
+    """
+    with pytest.raises(ValueError):
+        json.loads(arguments)
+    payload = _canonical_response(
+        content="",
+        finish_reason="tool_calls",
+        tool_calls=[_tool_call_entry("call_both", arguments)],
+    )
+    httpx_mock.add_response(method="POST", url=ENDPOINT, json=payload)
+    with pytest.raises(LLMError) as exc:
+        await _make_client().complete(_basic_request())
+
+    assert str(exc.value) == _DEPTH_MESSAGE
+    assert exc.value.context["max_tool_args_depth"] == MAX_TOOL_ARGS_DEPTH
+    assert exc.value.__cause__ is None
 
 
 async def test_complete_no_tool_calls_field_is_none(httpx_mock: HTTPXMock) -> None:

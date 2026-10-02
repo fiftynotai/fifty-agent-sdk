@@ -19,7 +19,8 @@ Wiring
     request bodies (same keys, values and JSON types) and emits the same event
     stream as 1.9.0 (timestamps and minted ids aside), for the runs
     :mod:`fifty_agent_sdk.loop` scopes that claim to ("Non-ASCII text
-    (BR-020)" and "Error-path final text (BR-021)").
+    (BR-020)", "Error-path final text (BR-021)" and "Tool-argument nesting
+    (BR-019)").
 
 ``before_tool(session_id, call_id, tool_name, args)``
     Runs once per model tool call (the single call, and each member of a

@@ -75,6 +75,33 @@ Error-path final text (BR-021)
     :mod:`fifty_agent_sdk.interventions`, are claimed only for runs that do
     not end on an ``LLMError`` or a ``ParserError``.
 
+Tool-argument nesting (BR-019)
+    Since 1.10.2 the shipped
+    :class:`~fifty_agent_sdk.llm.openai_compat.OpenAICompatibleClient`,
+    :class:`~fifty_agent_sdk.parser.json_mode.JsonModeParser` and
+    :class:`~fifty_agent_sdk.parser.prose_mode.ProseModeParser` check the
+    text they are about to decode (a native call's ``arguments``; in JSON
+    mode the whole completion and its recovery candidate; in PROSE mode the
+    ``Action Input:`` body and its recovery candidate) before decoding it,
+    and refuse tool arguments nested deeper than 64 levels (one level per
+    JSON object or array, the JSON-mode envelope counting one more;
+    :mod:`fifty_agent_sdk._json_depth`). Earlier
+    releases decoded and dispatched every such argument ``json.loads`` could
+    decode. On a native turn the run now ends on that turn, with no further
+    request, with an ``LLMError`` (``MalformedResponse``), and none of that
+    turn's tools runs. In JSON and PROSE mode the parser first sends a
+    refused text to its recovery pass; a ``ParserError`` from the refusal
+    takes the parser retry when it is enabled. A custom ``LLMClient`` or ``Parser`` is
+    not checked. The check refuses no text in any golden scenario, whose
+    tool arguments nest at most 1 level. The release-equivalence statements
+    in this module (above, in :class:`AgentLoop`'s Args and in its
+    ``__init__`` comments), and the matching ones in
+    :mod:`fifty_agent_sdk.tool_mode` and :mod:`fifty_agent_sdk.interventions`,
+    are claimed only for runs in which that check refuses no text. A
+    JSON-mode or PROSE text it refuses goes to the parser's recovery pass,
+    so such a run can differ from earlier releases even when its tool
+    arguments nest at most 64 levels.
+
 Statelessness
     Every :meth:`AgentLoop.run` call is its own scoped iteration. The
     loop holds no state across calls — conversation persistence and

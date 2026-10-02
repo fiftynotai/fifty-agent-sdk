@@ -52,6 +52,53 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     `text/event-stream` and which produced no chunk (see the next items).
 
   (BR-021)
+- `OpenAICompatibleClient`, `JsonModeParser` and `ProseModeParser` refuse tool arguments
+  nested deeper than 64 levels. A level is one JSON object or array (`{"q": [1]}` is 2
+  levels; brackets inside strings do not count). In JSON mode the envelope counts one
+  more, so `tool_args` may still nest 64 levels. The check reads the text before it is
+  decoded.
+  - On a native turn, `complete()` raises `LLMError` with `context["type"] ==
+    "MalformedResponse"`, the message `provider tool_call arguments nest deeper than 64
+    levels`, and `tool_call_id`, `arguments_excerpt` (the first 200 characters, as for
+    invalid JSON) and a new key, `max_tool_args_depth` (64), in `context`. One such entry
+    refuses the whole response, so no tool of that turn runs, and `AgentLoop` ends the
+    run on that turn with `error_fallback_message`, with no further request.
+  - The text parsers' depth error is a `ParserError` (`error_phase` `json_decode` or
+    `action_input_decode`, with `context["max_tool_args_depth"]`), and the loop takes its
+    parser retry for it when that is enabled (the default). A strict-pass text that is too deep
+    goes to the parsers' recovery pass first, as a decode failure does, and the depth error
+    is raised only when that pass finds no `{`...`}` candidate or one past the limit. A
+    candidate within the limit is decoded as in 1.10.1: an unclosed `[draft ` before a
+    valid envelope still parses. That pass now also runs for valid JSON that is too deep,
+    which 1.10.1 passed to `json.loads` as it stood: for example, the JSON-mode completion
+    `[<envelope>, <70 nested arrays>]` now parses to that envelope, where 1.10.1 raised
+    `schema_validation` and, with the retry enabled, took the parser retry, and a PROSE
+    `Action Input` of
+    `[{"a": 1}, <70-level array>]` now dispatches `{"a": 1}`, where 1.10.1 raised
+    `Action Input JSON must decode to an object`.
+  - Before, arguments that `json.loads` could decode were decoded and dispatched at any
+    depth (see Fixed for what then happened on a native turn).
+  - The check reads brackets, not JSON, so invalid text can get the depth error too, for
+    example `x` followed by 100 `[`, which `json.loads` rejects at its first character. On
+    a native turn any text whose brackets open more than 64 levels gets it: before,
+    `complete()` raised `provider tool_call arguments is not valid JSON` for it, with the
+    decode error as `__cause__`. In the text parsers such text gets it when the recovery
+    pass finds no candidate or the check also refuses the candidate (65 levels for the
+    whole JSON-mode envelope), as with `x` followed by 100 `[`; before, they raised their
+    invalid-JSON `ParserError`. So `context["max_tool_args_depth"]` means the check refused
+    the text; do not read it as proof that the arguments were deeply nested.
+  - In JSON mode the check covers the whole envelope, not only `tool_args`. An `answer` or
+    `thought` value nested more than 64 levels, which the schema rejects anyway, now gets
+    the `json_decode` depth error where it used to get `schema_validation` whenever
+    `json.loads` could decode it. Both are `ParserError` and take the parser retry when it
+    is enabled.
+  - The check reads the text once before `json.loads` does. Measured on CPython 3.11.15,
+    3.13.2 and 3.14.3: 10 MB of arguments with few brackets took about 6.5 ms, less than
+    `json.loads` of the same text; 10 MB of `[[],[],...]` took 0.69 s, 0.85 s and 1.02 s,
+    1.5 to 6.2 times `json.loads`, growing linearly from 1 MB. The JSON-mode parser can
+    check one completion twice (its strict text, then its recovery candidate).
+  - The limit is fixed: there is no setting. A custom `LLMClient` or `Parser` decodes its
+    own arguments and is not checked. No public API changes. (BR-019)
 - The Runner's `error` audit event has a new key, `error_subtype`: the `ErrorEvent`'s
   `context["type"]` when it is a string (for example `ContextLengthExceeded`), else `None`.
   It is on every `error` event the Runner emits for an `ErrorEvent`, so
@@ -74,7 +121,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   on an LLM or parser error. Those runs end with `error_fallback_message`, and a streamed
   200 that is not `text/event-stream` and yields no chunk now ends the run after one
   request with an `LLMError`, where with the shipped text parsers it used to end with a
-  `ParserError`, after a parser retry when that is enabled. (BR-021)
+  `ParserError`, after a parser retry when that is enabled. (BR-021) Since BR-019 they
+  also hold only for runs in which the 64-level nesting check refuses no text. It refuses
+  no text in any golden scenario, whose tool arguments nest at most 1 level. (BR-019)
 
 ### Fixed
 - JSON that the SDK writes for the model now carries non-ASCII text as literal UTF-8
@@ -145,6 +194,27 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - How these bodies reach the SDK is the `openai` client's behaviour, measured on `openai`
   2.43.0. The BR-021 test suite also passed with `openai` 2.54.0 (on CPython 3.11.15 and
   3.13.2). (BR-021)
+- A native tool call whose `arguments` `json.loads` decoded but the SDK could not
+  re-encode for the next request ran the tool, and building that request then raised a raw
+  `RecursionError` out of `AgentLoop.run()`, with no `ErrorEvent` or `FinalEvent`.
+  - Reproduced on CPython 3.14.3 at 100,000 levels of nested objects, for a single call
+    and a batch, with and without intervention hooks. 100,000 levels of nested arrays
+    still re-encoded there, and that run completed.
+  - Reproduced on 3.11.15 in a band of 3 levels just below the depth at which decoding
+    failed. No such band was found on 3.13.2.
+  - Arguments deeper than `json.loads` itself decodes raised the `RecursionError` out of
+    `complete()` instead, before any tool ran: the `ValueError` arm around the decode does
+    not catch it (reproduced on 3.11.15, 3.13.2 and 3.14.3).
+  - Both now end as described under Changed.
+  - Why only those interpreters and depths, measured with stdlib `json` from a module's
+    top level: `json.loads` and `json.dumps` both reach 995 levels on CPython 3.11.5 and
+    3.11.15, and 9998 on 3.13.2, for nested objects and nested arrays alike. On 3.14.3
+    `json.loads` reaches 116,213 levels, and `json.dumps` 61,525 for nested objects and
+    104,591 for nested arrays. The 3.11.15 band comes from the SDK re-encoding the
+    replayed arguments 3 Python frames deeper than it decodes them. Inside an async
+    pytest test each of these limits was lower: 948 on 3.11.15, 9976 on 3.13.2, and
+    about 116,100 / 61,470 / 104,500 on 3.14.3, where they moved by a level between
+    runs. (BR-019)
 
 ## [1.10.1] - 2026-09-28
 

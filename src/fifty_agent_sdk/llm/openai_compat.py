@@ -94,6 +94,31 @@ Provider bodies and context-window errors (BR-021)
     type it would otherwise have had. The marker list is closed: other
     phrasings of the same failure stay unclassified, and an unrelated error
     whose text quotes a marker is misclassified.
+
+Tool-call arguments (BR-019)
+    Before decoding the ``arguments`` string of a native tool call, the
+    adapter checks how deeply it nests, one level per JSON object or array
+    (``{"q": [1]}`` is 2 levels; brackets inside strings do not count).
+    Arguments nested deeper than 64 levels
+    (:data:`fifty_agent_sdk._json_depth.MAX_TOOL_ARGS_DEPTH`) raise
+    :class:`~fifty_agent_sdk.errors.LLMError` with ``context["type"] ==
+    "MalformedResponse"`` and the fixed message ``provider tool_call
+    arguments nest deeper than 64 levels``. ``context`` holds ``model``,
+    ``type``, ``tool_call_id``, ``arguments_excerpt`` (the first 200
+    characters of the arguments, as for invalid JSON) and
+    ``max_tool_args_depth`` (``64``), the key that tells this refusal apart
+    from the other ``MalformedResponse`` errors. The check reads brackets,
+    not JSON: invalid text whose brackets open more than 64 levels (``x``
+    followed by 100 ``[``, for example) gets this error too, where earlier
+    releases raised ``provider tool_call arguments is not valid JSON``, so
+    the key means the check refused the text, not that the text decodes to
+    a deeply nested value. The whole response is
+    refused: ``complete()`` returns no :class:`ChatResponse`, so one such
+    entry in a multi-call response refuses every call in it. Before BR-019
+    such arguments were decoded wherever ``json.loads`` could decode them,
+    and re-encoding them for the next request could raise a raw
+    :class:`RecursionError`; past ``json.loads``'s own limit, the decode
+    itself raised it, out of ``complete()``.
 """
 
 from __future__ import annotations
@@ -113,6 +138,7 @@ from openai import (
     RateLimitError,
 )
 
+from fifty_agent_sdk._json_depth import MAX_TOOL_ARGS_DEPTH, json_nesting_exceeds
 from fifty_agent_sdk._model_json import dumps_for_model
 from fifty_agent_sdk.errors import LLMError
 from fifty_agent_sdk.llm.types import (
@@ -421,7 +447,10 @@ class OpenAICompatibleClient:
                 string; see the module docstring) is ``context["type"] ==
                 "NonJsonProviderBody"``, with the body's start in the message
                 (BR-021). A context-window overflow is
-                ``"ContextLengthExceeded"`` (see the module docstring).
+                ``"ContextLengthExceeded"`` (see the module docstring). Tool
+                call ``arguments`` nested deeper than 64 levels are
+                ``"MalformedResponse"`` with ``context["max_tool_args_depth"]``
+                (BR-019; see the module docstring).
         """
         model = request.model or self._default_model
         if not model:
@@ -776,7 +805,9 @@ class OpenAICompatibleClient:
         ``arguments`` raises :class:`LLMError` (``type="MalformedResponse"``)
         with the offending ``tool_call_id`` and a bounded
         ``arguments_excerpt`` — a provider sending malformed ``arguments`` is
-        an unrecoverable envelope error, not model drift.
+        an unrecoverable envelope error, not model drift. So do
+        ``arguments`` nested deeper than 64 levels, which are refused
+        before decoding (BR-019; see :meth:`_map_tool_calls`).
 
         A ``str`` ``raw`` is a provider body that could not be read as a
         JSON object: measured on ``openai`` 2.43.0, the client returns a 200
@@ -847,7 +878,18 @@ class OpenAICompatibleClient:
 
         Raises:
             fifty_agent_sdk.errors.LLMError: When an entry's ``arguments``
-                is not valid JSON.
+                is not valid JSON or not a JSON object, or (BR-019) nests
+                deeper than :data:`~fifty_agent_sdk._json_depth.
+                MAX_TOOL_ARGS_DEPTH` levels. The depth check reads
+                brackets before ``json.loads`` runs, so invalid text whose
+                brackets open more than 64 levels (``x`` followed by 100
+                ``[``, which ``json.loads`` rejects at its first character)
+                gets the depth error where earlier releases raised the
+                invalid-JSON one. All three are
+                ``"MalformedResponse"``; only the depth error carries
+                ``context["max_tool_args_depth"]``, and it has no
+                ``__cause__``. The first such entry in ``raw`` ends the
+                mapping, so no :class:`ToolCall` is returned for any entry.
         """
         if not raw:
             return None
@@ -855,6 +897,41 @@ class OpenAICompatibleClient:
         for tc in raw:
             function = tc.function
             arguments = function.arguments if function.arguments is not None else ""
+            # BR-019: check the nesting of the exact text json.loads would
+            # decode, before decoding it. Deeply nested arguments used to
+            # decode and then make the next request's re-encode raise a raw
+            # RecursionError, or raise it here, past the decoder's own limit
+            # (BR-019 evidence, P1).
+            # The message is fixed and holds no model text; the excerpt goes
+            # in `context`, as in the two arms below. A non-`str` value skips
+            # the check and keeps its pre-BR-019 path: an empty or false one
+            # becomes `{}` without decoding, and any other makes json.loads
+            # raise TypeError, which `_map_response` reports as
+            # MalformedResponse.
+            if (
+                isinstance(arguments, str)
+                and arguments
+                and json_nesting_exceeds(arguments, MAX_TOOL_ARGS_DEPTH)
+            ):
+                raise LLMError(
+                    f"provider tool_call arguments nest deeper than {MAX_TOOL_ARGS_DEPTH} levels",
+                    context={
+                        "model": model,
+                        "type": "MalformedResponse",
+                        "tool_call_id": getattr(tc, "id", None),
+                        "arguments_excerpt": arguments[:_MAX_TOOL_CALL_ARG_EXCERPT],
+                        "max_tool_args_depth": MAX_TOOL_ARGS_DEPTH,
+                    },
+                )
+            # No RecursionError arm (BR-019): after the check, json.loads sees
+            # at most MAX_TOOL_ARGS_DEPTH levels. An arm would also hide the
+            # check's removal from part of the regression suite: with the
+            # check removed and such an arm added, the four codec-limit loop
+            # cases and the past-the-decoder client test passed on CPython
+            # 3.11.15 and 3.13.2, where their arguments fail inside
+            # json.loads itself; the tests one level past the limit stayed
+            # red (BR-019 evidence, mutant M1a). Not measured: a host whose
+            # stack is nearly exhausted when this decodes up to 64 levels.
             try:
                 args = json.loads(arguments) if arguments else {}
             except ValueError as e:

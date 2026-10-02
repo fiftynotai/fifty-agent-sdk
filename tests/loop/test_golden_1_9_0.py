@@ -51,6 +51,8 @@ What this does NOT pin:
   replayed arguments hold any.
 * Any error path. No scenario ends on an ``ErrorEvent``, so the error-path
   final text, message and context that 1.10.2 changed (BR-021) are outside it.
+* Any text the 64-level nesting check refuses (BR-019). It refuses no text
+  in any scenario, whose tool arguments nest at most 1 level.
 """
 
 from __future__ import annotations
