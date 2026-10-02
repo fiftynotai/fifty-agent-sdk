@@ -16,10 +16,20 @@ Covers BR-011's Runner-integration surface:
   provider failure from the iteration cap, and a provider text body ends the
   turn with ``SafetyConfig.error_fallback_message`` and no assistant turn
   stored.
+* BR-022: an output whose ``repr`` raises gets the ``result_summary`` marker
+  ``<unrepresentable TYPE: ERROR>`` (type names only) instead of ending
+  ``AgentRunner.run()``, with or without an audit sink; I2 drives a real value
+  nested past the limits the running interpreter measures. A ``BaseException``
+  that is not an ``Exception`` still propagates from the summary.
 """
 
 from __future__ import annotations
 
+import asyncio
+import sys
+from collections.abc import Callable
+
+import pytest
 import structlog
 from pytest_httpx import HTTPXMock
 
@@ -27,12 +37,21 @@ from fifty_agent_sdk import (
     ActionEvent,
     AuditEvent,
     AuditSink,
+    FinalEvent,
     Registry,
     SafetyConfig,
     ToolResult,
     ToolStartedEvent,
 )
-from tests.loop.conftest import FakeLLMClient, FakeTool, make_multi_tool_response, make_response
+from fifty_agent_sdk.runner import _bounded_repr
+from tests.loop.conftest import (
+    FakeLLMClient,
+    FakeTool,
+    list_chain,
+    make_multi_tool_response,
+    make_response,
+    measured_unrenderable_depth,
+)
 from tests.runner.conftest import collect, final_json, make_runner, tool_json
 
 # ---------------------------------------------------------------------------
@@ -651,6 +670,128 @@ async def test_large_tool_output_is_truncated_in_result_summary() -> None:
     assert summary.endswith("…[truncated]")
     # Cap is 500 chars plus the marker.
     assert len(summary) <= 500 + len("…[truncated]")
+
+
+# ---------------------------------------------------------------------------
+# BR-022: an output whose repr raises
+# ---------------------------------------------------------------------------
+
+_SECRET = "SECRET-BR022-runner"
+_DIGIT_LIMIT = sys.get_int_max_str_digits()
+
+
+class _Boom:
+    """An output whose ``__repr__`` raises with a secret in the message."""
+
+    def __repr__(self) -> str:
+        raise RuntimeError(f"repr failed {_SECRET}")
+
+
+@pytest.mark.parametrize(
+    ("make", "marker"),
+    [
+        pytest.param(_Boom, "<unrepresentable _Boom: RuntimeError>", id="raising_repr"),
+        pytest.param(
+            lambda: 10**_DIGIT_LIMIT,
+            "<unrepresentable int: ValueError>",
+            id="int_over_digit_limit",
+            marks=pytest.mark.skipif(
+                _DIGIT_LIMIT == 0, reason="the int-to-str digit limit is disabled (0)"
+            ),
+        ),
+    ],
+)
+async def test_result_summary_names_an_output_whose_repr_raises(
+    make: Callable[[], object], marker: str
+) -> None:
+    """An output whose ``repr`` raises gets ``<unrepresentable TYPE: ERROR>`` as its ``result_summary``, never the exception text, and the turn completes (BR-022).
+
+    Before BR-022 the ``repr`` error ended ``AgentRunner.run()`` from the
+    audit summary (BR-022 evidence, P2 and P3). The integer has
+    ``sys.get_int_max_str_digits() + 1`` digits.
+    """
+    tool = FakeTool("odd", result=ToolResult(output=make()))
+    registry = Registry()
+    registry.register(tool)
+    llm = FakeLLMClient(
+        replies=[
+            make_response(tool_json("fetch", "odd", {})),
+            make_response(final_json("answered")),
+        ]
+    )
+    spy = SpyAuditSink()
+    runner, _store = make_runner(llm=llm, registry=registry, audit=spy)
+
+    events = await collect(runner.run("s1", "Hi"))
+
+    tool_event = next(e for e in spy.events if e.event_type == "tool_invocation")
+    assert tool_event.payload["result_summary"] == marker
+    assert tool_event.payload["outcome"] == "ok"
+    assert _SECRET not in str(tool_event.payload)
+    assert isinstance(events[-1], FinalEvent) and events[-1].text == "answered"
+
+
+class _ReprRaisesBase:
+    def __init__(self, exc_type: type[BaseException]) -> None:
+        self._exc_type = exc_type
+
+    def __repr__(self) -> str:
+        raise self._exc_type()
+
+
+@pytest.mark.parametrize("exc_type", [KeyboardInterrupt, SystemExit, asyncio.CancelledError])
+def test_result_summary_lets_base_exceptions_propagate(exc_type: type[BaseException]) -> None:
+    """``_bounded_repr`` catches ``Exception`` only: a ``BaseException`` raised by ``__repr__`` propagates (BR-022)."""
+    with pytest.raises(exc_type):
+        _bounded_repr(_ReprRaisesBase(exc_type))
+
+
+async def test_runner_survives_a_result_nested_past_the_measured_limits() -> None:
+    """A real list chain past what ``json.dumps`` and ``repr`` render in this test's frame ends the turn on the model's answer, with or without an audit sink (BR-022).
+
+    The depth comes from ``measured_unrenderable_depth(include_repr=True)``
+    (``tests/loop/conftest.py``), called once from this test's frame, so it
+    is derived from the running interpreter; both runs below use it. Its
+    docstring says why ``_bounded_repr`` and the loop's renderer, which run
+    deeper on the stack, cannot render it either. The depth it derived was
+    about 1,900 levels on CPython 3.11.15, 9,980 on 3.13.2 and 104,500 on
+    3.14.3, moving by a few levels with the test harness (3.12 and Linux
+    first run in CI). Before BR-022 the run
+    raised a raw ``RecursionError`` out of ``AgentRunner.run()`` from
+    ``repr`` in ``_bounded_repr``, even with no audit sink, on all three
+    (BR-022 evidence, P2). The list chain is used because on 3.14.3 its
+    ``json.dumps`` limit is past its ``repr`` limit, so the first candidate
+    already fails both and the measurement costs one failing ``repr`` (about
+    0.8 s there); see the evidence, P4. The deep value only meets the code
+    under test: only scalars and short strings reach an ``assert``.
+    """
+    depth = measured_unrenderable_depth(include_repr=True, shape=list_chain)
+
+    for audit in (SpyAuditSink(), None):
+        deep = ToolResult(output=list_chain(depth))
+        registry = Registry()
+        registry.register(FakeTool("deep", result=deep))
+        llm = FakeLLMClient(
+            replies=[
+                make_response(tool_json("fetch", "deep", {})),
+                make_response(final_json("answered")),
+            ]
+        )
+        runner, store = make_runner(llm=llm, registry=registry, audit=audit)
+
+        events = await collect(runner.run("s1", "Hi"))
+
+        kinds = [type(e).__name__ for e in events]
+        assert kinds[-1] == "FinalEvent" and "ErrorEvent" not in kinds
+        final = events[-1]
+        assert isinstance(final, FinalEvent) and final.text == "answered"
+        assert len(llm.calls) == 2
+        history = await store.get_messages("s1")
+        assert [m.role for m in history] == ["user", "assistant"]
+        if isinstance(audit, SpyAuditSink):
+            tool_event = next(e for e in audit.events if e.event_type == "tool_invocation")
+            assert tool_event.payload["result_summary"] == "<unrepresentable list: RecursionError>"
+            assert tool_event.payload["outcome"] == "ok"
 
 
 # ---------------------------------------------------------------------------

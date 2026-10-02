@@ -731,8 +731,10 @@ async def test_json_decode_arm_does_not_wrap_other_value_errors(
 ) -> None:
     """complete()'s JSONDecodeError arm leaves every other ValueError raw (BR-021 D9).
 
-    A ``UnicodeEncodeError`` (a ``ValueError``) from encoding the request is
-    BR-022's case; a ``ValueError`` arm would report it as a provider body.
+    A ``UnicodeEncodeError`` (a ``ValueError``) from encoding the request
+    would be reported as a provider body by a ``ValueError`` arm. BR-022
+    escapes surrogate code points in the tool-result messages the loop
+    builds and adds no arm here, so this pin stands unchanged.
     """
     client = _client()
 

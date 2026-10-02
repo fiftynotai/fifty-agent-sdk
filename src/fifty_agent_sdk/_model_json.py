@@ -1,4 +1,4 @@
-"""JSON text that the SDK writes for a model to read (BR-020).
+"""Text that the SDK writes for a model to read: JSON (BR-020) and tool-result message text (BR-022).
 
 Routing rule: every ``json.dumps`` whose output reaches a model prompt goes
 through :func:`dumps_for_model`. Since 1.10.2 those are the three call sites
@@ -6,6 +6,12 @@ that render tool results, the text-mode tool list and the ``arguments`` string
 of a replayed native tool call. JSON that is stored, hashed or used as a key
 (for example the Redis branch metadata in ``state/redis.py``) never goes
 through it and keeps the stdlib defaults, so stored bytes do not change.
+
+:func:`escape_surrogates` (BR-022) runs once on the text of every
+tool-result message the loop builds (``AgentLoop._build_tool_message``), so
+a surrogate code point in it reaches the model as its ``\\udXXX`` escape.
+The same rule holds for it: never use it on text that is stored, hashed or
+used as a key.
 
 This module is private and carries no semver protection.
 """
@@ -80,4 +86,50 @@ def dumps_for_model(
     return text
 
 
-__all__ = ["dumps_for_model"]
+def escape_surrogates(text: str) -> str:
+    """Write each surrogate code point in model-facing text as its ``\\udXXX`` escape (BR-022).
+
+    UTF-8 can encode every code point except the surrogates, U+D800-U+DFFF.
+    A Python ``str`` can still hold them (``json.loads('"\\ud800"')`` or a
+    ``surrogateescape`` decode makes one), and the ``openai`` releases BR-022
+    measured (2.43.0 and 2.54.0) encode the request body as strict UTF-8, so
+    one surrogate code point in a tool-result message made the next request
+    raise ``UnicodeEncodeError`` before it was sent.
+
+    The function tries ``text.encode("utf-8")``, which fails exactly when the
+    text holds a surrogate code point. If it succeeds, ``text`` itself is
+    returned (the same object): every other code point, non-ASCII text and
+    U+007F included, is left as it is. If it fails, each surrogate code point
+    becomes the six characters ``\\udXXX`` (lowercase hex), the spelling
+    ``json.dumps`` uses for it, and nothing else changes. Two surrogate code
+    points in a row (``chr(0xD83D) + chr(0xDE00)``) are escaped one by one,
+    not combined into the character they would pair to.
+
+    The escape is not reversible: the model cannot tell it from those six
+    characters typed literally, and the function leaves such typed text as
+    it is. Unlike :func:`dumps_for_model`'s all-or-nothing fallback, only the
+    surrogate code points change. That fallback can escape every non-ASCII
+    character because a JSON reader decodes the escapes back. Plain text has
+    no decoder, and escaping every non-ASCII character would bring back the
+    length BR-020 removed (six characters per Arabic letter).
+
+    Only ``UnicodeEncodeError`` from the encode check is caught. Never use
+    this on text that is stored, hashed or used as a key.
+
+    Args:
+        text: The text of a message the SDK is about to send to a model.
+
+    Returns:
+        ``text`` itself when it encodes as UTF-8, else a copy in which every
+        surrogate code point is written as ``\\udXXX``.
+    """
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        # BR-022: "backslashreplace" writes each code point the strict codec
+        # rejects, which for UTF-8 is exactly the surrogates, as \udXXX.
+        return text.encode("utf-8", "backslashreplace").decode("utf-8")
+    return text
+
+
+__all__ = ["dumps_for_model", "escape_surrogates"]

@@ -38,8 +38,8 @@ Legacy path
     When ``tool_mode`` is omitted the loop resolves exactly as 1.7.0 did
     and sends the same request bodies (same keys, values and JSON types),
     for the runs :mod:`fifty_agent_sdk.loop` scopes that claim to ("Non-ASCII
-    text (BR-020)", "Error-path final text (BR-021)" and "Tool-argument
-    nesting (BR-019)").
+    text (BR-020)", "Error-path final text (BR-021)", "Tool-argument
+    nesting (BR-019)" and "Tool-result text (BR-022)").
     That includes the half-native combination ``native_tools_enabled=True``
     + a text parser, kept for compatibility.
     ``tool_mode=ToolMode.NATIVE`` is the documented way to close that hole.

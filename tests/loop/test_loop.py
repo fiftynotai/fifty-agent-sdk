@@ -1393,8 +1393,9 @@ def test_serialize_tool_output_falls_back_to_repr_when_dumps_raises() -> None:
 
     json.dumps calls ``default=str`` on non-serializable objects; if ``str(obj)``
     itself raises, the exception propagates out of ``json.dumps``. We construct
-    objects whose ``__str__`` raises (one TypeError, one ValueError) to cover
-    both arms of the ``except`` clause.
+    objects whose ``__str__`` raises (one TypeError, one ValueError). Both
+    reach the ``repr`` fallback through its ``except Exception`` arm (an
+    ``except (TypeError, ValueError)`` clause before BR-022).
     """
     from fifty_agent_sdk.loop import _serialize_tool_output
 

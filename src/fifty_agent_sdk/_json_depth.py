@@ -92,7 +92,10 @@ of arguments holding few brackets took about 6.5 ms, less than
 1 MB. The JSON-mode parser can check one completion twice (its strict text,
 then its recovery candidate).
 
-BR-022 may add a sibling here that walks decoded objects (for tool output).
+Tool output gets no walker here. BR-022 contained the failures where the
+output is rendered (``loop._serialize_tool_output``, and the Runner's audit
+summary) instead of bounding its depth, because nothing the SDK does with
+the rendered text fails on depth.
 This module is private and carries no semver protection. It must never use
 the ``json`` module: BR-017's tests replace ``json.loads`` process-wide.
 """

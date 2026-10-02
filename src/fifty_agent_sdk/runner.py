@@ -177,8 +177,27 @@ def _bounded_repr(value: object) -> str:
     A clipped string carries the :data:`_TRUNCATION_MARKER` suffix so a
     consumer can tell the summary is partial. Used to bound the
     ``result_summary`` of a ``tool_invocation`` audit event.
+
+    BR-022: when ``repr`` raises an ``Exception`` (a value nested deeper than
+    ``repr`` reaches raises ``RecursionError``; an ``int`` with more digits
+    than ``sys.get_int_max_str_digits()`` allows raises ``ValueError``; a
+    host ``__repr__`` can raise anything), the text is the marker
+    ``<unrepresentable TYPE: ERROR>`` instead, built from the value's type
+    name and the exception's type name only, never the value or the
+    exception's text, and then clipped like any other text. A
+    ``BaseException`` that is not an ``Exception`` propagates.
     """
-    text = repr(value)
+    try:
+        text = repr(value)
+    except Exception as exc:
+        # BR-022: the Runner computes this summary for every tool call's
+        # terminal event even when no audit sink is configured (it is an
+        # argument of `_emit_audit` in `run()`), right after the consumer has
+        # handled the event and before the loop resumes. So before BR-022 an
+        # output whose `repr` raised (a deep value, an int over the digit
+        # limit) ended `AgentRunner.run()` here, before the loop's own
+        # rendering was reached (BR-022 evidence, P2).
+        text = f"<unrepresentable {type(value).__name__}: {type(exc).__name__}>"
     if len(text) <= _RESULT_SUMMARY_CAP:
         return text
     return text[:_RESULT_SUMMARY_CAP] + _TRUNCATION_MARKER
@@ -368,8 +387,10 @@ class AgentRunner:
     ) -> None:
         """Emit a single :class:`AuditEvent` through the configured sink.
 
-        Best-effort and isolated: short-circuits with zero overhead when no
-        sink is configured; otherwise builds an :class:`AuditEvent`
+        Best-effort and isolated: returns at once when no sink is
+        configured, though a caller may already have built ``payload`` (the
+        ``tool_invocation`` payload, with its ``_bounded_repr`` summary, is
+        built before this call; BR-022); otherwise builds an :class:`AuditEvent`
         (``timestamp`` stamped now in UTC, ``user_id=None`` — the Runner has
         no user-id channel, consumers wanting it set it via a wrapping
         sink) and awaits :meth:`AuditSink.record`. A raising sink is caught,
@@ -459,7 +480,9 @@ class AgentRunner:
 
         ``result_summary`` is a bounded ``repr`` of the tool's output (on
         success) or the failure string (on a recoverable failure), capped
-        so a large or binary result cannot bloat the audit row.
+        so a large or binary result cannot bloat the audit row. An output
+        whose ``repr`` raises gets ``<unrepresentable TYPE: ERROR>`` instead
+        (BR-022; see :func:`_bounded_repr`).
 
         ``args`` is NEVER embedded verbatim: argument values routinely carry
         secrets and PII, and the payload is persisted and logged as-is, so

@@ -19,8 +19,8 @@ Wiring
     request bodies (same keys, values and JSON types) and emits the same event
     stream as 1.9.0 (timestamps and minted ids aside), for the runs
     :mod:`fifty_agent_sdk.loop` scopes that claim to ("Non-ASCII text
-    (BR-020)", "Error-path final text (BR-021)" and "Tool-argument nesting
-    (BR-019)").
+    (BR-020)", "Error-path final text (BR-021)", "Tool-argument nesting
+    (BR-019)" and "Tool-result text (BR-022)").
 
 ``before_tool(session_id, call_id, tool_name, args)``
     Runs once per model tool call (the single call, and each member of a
@@ -68,6 +68,9 @@ Wiring
 
     A non-blank ``str`` return is appended verbatim (not stripped, not
     truncated) to that call's model-facing observation, after a blank line.
+    The one exception, since 1.10.2: a surrogate code point (U+D800-U+DFFF)
+    in the note reaches the model as its six-character ``\\udXXX`` escape,
+    as it does anywhere else in the observation (BR-022).
     There is one append point, after the tool-result role is chosen, so the
     same suffix lands in every tool mode and role: the ``role="tool"`` reply
     (``ToolMode.NATIVE`` and the legacy default) and the collapsed

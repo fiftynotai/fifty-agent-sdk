@@ -491,7 +491,13 @@ class OpenAICompatibleClient:
             # 2.43.0), so the decode error would otherwise escape complete()
             # raw. `e.doc` is the decoded body. Deliberately NOT `ValueError`:
             # a `UnicodeEncodeError` (a ValueError) from encoding the request
-            # is BR-022's case, and must not be reported as a provider body.
+            # must not be reported as a provider body. BR-022 escapes the
+            # surrogate code points in the tool-result messages the loop
+            # builds and adds no arm here (an arm would also catch httpx's
+            # ascii UnicodeEncodeError for a non-ASCII API key). A surrogate
+            # code point in text the loop does not build (the model's own
+            # completion or tool names echoed back, messages passed to
+            # `run()`) still raises raw from this `try`.
             # The cost, measured on 2.43.0: a JSON-labelled body whose integer
             # literal exceeds the interpreter's digit limit (`ValueError`), or
             # that is not valid UTF-8 (`UnicodeDecodeError`, also a
@@ -646,8 +652,13 @@ class OpenAICompatibleClient:
             # BR-021: SSE-framed data that is not JSON (`data: <text>`). `e.doc`
             # is the event data. Deliberately NOT `ValueError`: only a decode
             # failure carries provider text in `e.doc`, so any other
-            # ValueError (a `UnicodeEncodeError` included, see BR-022) keeps
-            # the generic wrap below rather than reading as a provider body.
+            # ValueError raised while iterating keeps the generic wrap below
+            # rather than reading as a provider body. Encoding the request
+            # happens in the `create()` call above, outside this `try`: a
+            # surrogate code point in a message raises `UnicodeEncodeError`
+            # raw there (measured for BR-022 on openai 2.43.0 and 2.54.0).
+            # BR-022 escapes those code points in the tool-result messages
+            # the loop builds and added no arm (see `complete()`).
             raise _provider_body_error(
                 e.doc,
                 model=model,

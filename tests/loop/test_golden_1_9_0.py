@@ -53,6 +53,10 @@ What this does NOT pin:
   final text, message and context that 1.10.2 changed (BR-021) are outside it.
 * Any text the 64-level nesting check refuses (BR-019). It refuses no text
   in any scenario, whose tool arguments nest at most 1 level.
+* Tool-result text holding a surrogate code point before the escape, or a
+  non-string tool result that cannot be rendered (BR-022). No scenario's
+  tool-result text holds one, and every successful tool result in the
+  scenarios is a non-string value that renders as JSON.
 """
 
 from __future__ import annotations

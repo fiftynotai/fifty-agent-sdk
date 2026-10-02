@@ -268,10 +268,10 @@ def test_serialize_tool_output_lone_surrogate_keeps_json_not_repr(payload: dict[
     """A result holding a surrogate code point gets the escaped 1.10.1 JSON, never the ``repr`` fallback, and encodes as UTF-8 (BR-020).
 
     ``UnicodeEncodeError`` is a ``ValueError`` subclass, so if it escaped the
-    helper, ``_serialize_tool_output``'s ``except (TypeError, ValueError)``
-    arm would return ``repr(output)``. The datetime case needs ``default=str``
-    in the fallback too: without it the fallback raises ``TypeError``, which
-    also lands in that arm.
+    helper, ``_serialize_tool_output``'s ``repr`` fallback arm (``except
+    Exception`` since BR-022) would return ``repr(output)``. The datetime case
+    needs ``default=str`` in the fallback too: without it the fallback raises
+    ``TypeError``, which also lands in that arm.
     """
     result = _serialize_tool_output(payload)
 

@@ -21,7 +21,10 @@ It does NOT pin non-ASCII text or U+007F in the JSON the SDK writes for the
 model, which 1.10.2 changed (BR-020): no scenario's tool results, tool schemas
 or replayed arguments hold any. Nor any text the 64-level nesting check
 refuses (BR-019): it refuses no text in any scenario, whose tool arguments
-nest at most 1 level.
+nest at most 1 level. Nor tool-result text holding a surrogate code point
+before the escape, or a non-string tool result that cannot be rendered
+(BR-022): no scenario's tool-result text holds one, and every successful
+tool result in the scenarios is a non-string value that renders as JSON.
 
 Running ``python -m tests.loop.golden_capture`` from the repo root writes
 ``tests/loop/golden/legacy_1_7_0.json``. The fixture in the tree was written

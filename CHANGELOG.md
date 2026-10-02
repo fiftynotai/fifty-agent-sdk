@@ -124,6 +124,49 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `ParserError`, after a parser retry when that is enabled. (BR-021) Since BR-019 they
   also hold only for runs in which the 64-level nesting check refuses no text. It refuses
   no text in any golden scenario, whose tool arguments nest at most 1 level. (BR-019)
+  Since BR-022 they also hold only for runs in which the surrogate escape changes no
+  tool-result message (no text that goes into one holds a surrogate code point) and every
+  non-string tool result renders to the text 1.10.1 rendered (JSON, or `repr` after a
+  `TypeError` or `ValueError` from `json.dumps`). Runs outside that scope used to end with
+  a raw exception (see Fixed), with two exceptions: a custom `LLMClient` received a
+  surrogate code point as it was, and a value whose `__str__` returns different text on
+  each call now runs it once (see the next item). For a surrogate code point with the
+  shipped client this was measured on `openai` 2.43.0 and 2.54.0, which encode the request
+  body as strict UTF-8; other `openai` and `httpx` releases were not measured. No golden
+  scenario's tool-result text held a surrogate code point before the escape, and every
+  successful tool result in them is a non-string value that renders as JSON. (BR-022)
+- Tool-result message text no longer holds a surrogate code point (U+D800-U+DFFF), which
+  UTF-8 cannot encode:
+  - Each one is written as its six-character `\udXXX` escape, the spelling `json.dumps`
+    uses. That applies whatever produced the text: a string result, an `is_error` text, an
+    `after_tool` note (otherwise still appended verbatim), a `before_tool` denial reason, a
+    `ToolNotFound` text or the `repr` fallback, in every tool mode and tool-result role, on
+    the single-call path and in a native batch.
+  - Other text, non-ASCII and U+007F included, is unchanged, and text without a surrogate
+    code point is unchanged byte for byte. Two surrogate code points in a row are escaped
+    one by one. The escape cannot be told apart from those six characters typed literally.
+  - A custom `LLMClient` used to receive the code point itself.
+  - `ObservationEvent.result` and `ToolFailedEvent.error` still carry the tool's own value
+    and text. The `name` field of a `"tool"`-role reply, which is the model's tool name, is
+    not escaped.
+  - A non-string tool result is now rendered once per call; it was rendered twice, so a
+    `default=str` conversion (the value's `__str__`) now runs once. The `"tool"` role used
+    the first rendering and the `"user"`/`"assistant"` roles the second, so in those two
+    roles a value whose `__str__` returns different text on each call now shows its first
+    text where it showed its second (measured on CPython 3.11.15 and 3.14.3).
+  - Each tool-result message gets one more UTF-8 encode, the surrogate check (two, and a
+    decode, when the text holds one). Measured on CPython 3.11.15, 3.13.2 and 3.14.3, best
+    of 7: 0.9-1.6 ms per million Arabic characters, and 0.3-0.4 ms for 10 million ASCII
+    characters, which come back as the same string. For the one non-string result
+    measured, a list of 20,000 dicts (1.4 million characters), that was less than the
+    rendering saved: one rendering took 10.6-12.1 ms and the check 0.6-0.7 ms.
+  - Any other `Exception` from `json.dumps` (not `TypeError`, `ValueError` or
+    `RecursionError`), for example one raised by a value's `__str__`, now falls back to
+    `repr`, as `TypeError` and `ValueError` did; it used to escape `AgentLoop.run()` (see
+    Fixed). A `RecursionError` gets the fixed sentence without `repr`, and a
+    `BaseException` that is not an `Exception` still propagates.
+
+  (BR-022)
 
 ### Fixed
 - JSON that the SDK writes for the model now carries non-ASCII text as literal UTF-8
@@ -144,8 +187,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   byte for byte. U+007F (DEL) is the one ASCII exception: it is now sent as the
   character rather than as `\u007f`.
 - In those three places, a value holding a surrogate code point (U+D800-U+DFFF), which
-  UTF-8 cannot encode, keeps the fully escaped 1.10.1 form, which UTF-8 can encode. A tool
-  result that is already a string is unchanged by this release.
+  UTF-8 cannot encode, keeps the fully escaped 1.10.1 form, which UTF-8 can encode. BR-020
+  does not change a tool result that is already a string (BR-022 escapes surrogate code
+  points in it; see Changed).
 - Stored data is unchanged: tool results are never persisted, and Redis branch metadata
   keeps its encoding.
 - This fix makes no public API changes. (BR-020)
@@ -215,6 +259,59 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     pytest test each of these limits was lower: 948 on 3.11.15, 9976 on 3.13.2, and
     about 116,100 / 61,470 / 104,500 on 3.14.3, where they moved by a level between
     runs. (BR-019)
+- A tool result could end a run with a raw exception and no `ErrorEvent` or
+  `FinalEvent`. Each case below was measured on CPython 3.11.15, 3.13.2 and 3.14.3:
+  - A string result holding a surrogate code point made the next request raise
+    `UnicodeEncodeError` out of `AgentLoop.run()` after one request, with the shipped
+    client on `openai` 2.43.0 and 2.54.0, which encode the request body as strict UTF-8.
+    An `is_error` text, an `after_tool` note, a denial reason or a `repr` fallback holding
+    one did the same.
+  - A non-string result nested deeper than `json.dumps` reaches, such as a 200,000-level
+    list, raised `RecursionError` out of `AgentLoop.run()` from `json.dumps`. Under
+    `AgentRunner` it raised out of `AgentRunner.run()` from the `repr` in the Runner's
+    `tool_invocation` audit summary, which is computed even with no audit sink, before the
+    loop rendered the result. On 3.14.3 a dict chain one level past `json.dumps`' reach,
+    which `repr` still renders there, raised from `json.dumps` under `AgentRunner` too.
+  - A result whose `repr` fallback raised ended the run with that exception, for example
+    one holding an integer over the interpreter's int-to-str digit limit (`ValueError`
+    from `json.dumps` and from `repr`). So did an exception other than `TypeError` or
+    `ValueError` raised by a value's `__str__` under `default=str` (see Changed).
+- Now a surrogate code point reaches the model escaped (see Changed), and a result that
+  cannot be converted reaches it as the fixed sentence "The tool's output could not be
+  converted to text, so it is not shown.", in the usual layout (`Tool <name> returned:
+  ...` outside the `"tool"` role). The run continues.
+  - The loop logs the WARNING `tool_output_not_rendered` with `call_id`, `run_id`,
+    `output_type` and `error_type` (type names), never the value or the exception's text.
+  - `repr` is not tried after a `RecursionError`: it recurses through the same value, and
+    on CPython 3.14.3 a failing `repr` of a 200,000-level list took about 0.8 s against
+    about 0.03 s for the failing `json.dumps`.
+  - The Runner's `tool_invocation` `result_summary` for an output whose `repr` raises is
+    `<unrepresentable TYPE: ERROR>` (type names only), for example `<unrepresentable list:
+    RecursionError>`, where the run used to end.
+- MCP over streamable HTTP: BR-022's probes called the parser the `mcp` client runs on
+  each response (`JSONRPCMessage.model_validate_json`; mcp 1.28.0 and 1.30.0) directly.
+  It refused a `tools/call` result whose text holds the lone escape `\ud800`, and one
+  whose `structuredContent` nests deeper than 198 levels, so those did not reach
+  `MCPClient`'s result. In-process tools and other `Tool` implementations can return
+  such values.
+- Not covered:
+  - A surrogate code point in text the loop does not build, such as the model's own
+    completion or tool names echoed back, or a message passed to `run()`, still makes the
+    shipped client raise `UnicodeEncodeError` raw (measured).
+  - A tool whose exception's own `__str__` raises still escapes `AgentLoop.run()` from
+    `Registry.invoke` (measured).
+  - Serialising an event that carries such a value with pydantic, as a consumer may,
+    still raises `PydanticSerializationError`: `ObservationEvent.model_dump_json()` when the
+    result holds a surrogate code point or is a dict chain nested deeper than 254 levels,
+    and `ToolFailedEvent.model_dump_json()` when its `error` holds a surrogate code point.
+    Events carry the tool's own value and text, so BR-022 does not change this (measured on
+    the BR-022 tree and its base, CPython 3.11.15, 3.13.2 and 3.14.3, pydantic 2.13.4 and
+    2.13.5). `ObservationEvent.model_dump(mode="json")` returned for a string result
+    holding one.
+  - Nothing bounds the time `json.dumps` or `repr` spend on a value before they render it
+    or fail.
+
+  No public API changes. (BR-022)
 
 ## [1.10.1] - 2026-09-28
 
