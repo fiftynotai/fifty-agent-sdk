@@ -177,10 +177,17 @@ async def test_per_request_model_overrides_client_default(httpx_mock: HTTPXMock)
     assert body["model"] == "gpt-4o-mini"
 
 
-async def test_client_default_model_used_when_request_omits_it() -> None:
-    # The Pydantic model requires `model`, so to exercise the fallback we
-    # build a ChatRequest with the default then patch it to be falsy.
-    # Easiest: construct via model_construct to bypass validation.
+async def test_client_default_model_used_when_request_omits_it(httpx_mock: HTTPXMock) -> None:
+    """A request whose model is falsy is sent with the client's default model.
+
+    BR-023 moved this test onto pytest-httpx. It used to patch
+    ``client._client.chat.completions.create`` with a double returning a
+    ``ChatCompletion``; ``complete()`` now calls ``with_raw_response.create``
+    and decodes the raw response itself, so such a double no longer fits
+    (``_client`` is private).
+    """
+    # The Pydantic model requires `model`, so construct via model_construct
+    # to bypass validation with a falsy model.
     req = ChatRequest.model_construct(
         messages=[ChatMessage(role="user", content="hi")],
         model="",  # falsy → triggers default lookup
@@ -188,25 +195,14 @@ async def test_client_default_model_used_when_request_omits_it() -> None:
         max_tokens=None,
         response_format=None,
     )
+    httpx_mock.add_response(method="POST", url=ENDPOINT, json=_canonical_response())
     client = _make_client(model="default-model")
-    # We don't need pytest-httpx here because we'll mock at a higher level
-    # by raising. But to keep the test minimal we just verify it raises
-    # if NO default and NO request model. Tested separately below.
-    # For this test, the request has falsy model and client has a default,
-    # so the request body must use the default — verify against mock.
-    with pytest.MonkeyPatch.context() as mp:
-        captured: dict[str, Any] = {}
 
-        async def fake_create(**kwargs: Any) -> Any:
-            captured.update(kwargs)
-            # Build a minimal SDK-shaped response stand-in.
-            from openai.types.chat import ChatCompletion
+    await client.complete(req)
 
-            return ChatCompletion.model_validate(_canonical_response())
-
-        mp.setattr(client._client.chat.completions, "create", fake_create)
-        await client.complete(req)
-    assert captured["model"] == "default-model"
+    raw = httpx_mock.get_request()
+    assert raw is not None
+    assert json.loads(raw.read())["model"] == "default-model"
 
 
 async def test_complete_raises_when_no_model_anywhere() -> None:

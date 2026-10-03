@@ -19,13 +19,15 @@ depend on the release. Tests that assert the route (``__cause__``) would turn
 red on a release that surfaced the body another way; the others assert only
 the resulting error.
 
-Two bodies the client still does not catch are pinned as documented
-residuals, not endorsed: a non-streamed 200 JSON error envelope stays
-``MalformedResponse`` (follow-up: BR-023), and a body without SSE fields
+Since BR-023 a non-streamed 200 JSON error envelope (an object without
+``choices`` and with a truthy ``error`` member) is ``ErrorEnvelopeProviderBody``
+carrying its text, classified like its streamed twin; the bodies the client
+cannot decode are in ``test_openai_compat_body_decoding.py``. Two bodies the
+client still does not catch are pinned as documented residuals, not endorsed:
+a no-choices JSON object without an ``error`` member stays
+``MalformedResponse`` with its text lost, and a body without SSE fields
 labelled ``text/event-stream`` yields nothing. Not pinned: other providers'
-phrasings of an overflow (they stay unclassified), and the bodies with a JSON
-Content-Type that still escape ``complete()`` raw (not valid UTF-8, or an
-integer over the digit limit; follow-up: BR-023).
+phrasings of an overflow (they stay unclassified).
 """
 
 from __future__ import annotations
@@ -57,6 +59,8 @@ _EVENT_PREFIX = "Provider stream event is not a JSON object: "
 _STREAM_PREFIX = (
     "Provider stream produced no chunk and its Content-Type is not text/event-stream. Body: "
 )
+_ENVELOPE_PREFIX = "Provider returned an error object instead of a completion: "
+_UNDECODABLE_STREAM_PREFIX = "Provider stream could not be decoded: "
 _TRUNCATED = "…[truncated]"
 
 # The three markers, written out independently of the module constant so that
@@ -195,15 +199,14 @@ async def test_complete_200_json_string_body_is_a_provider_body(httpx_mock: HTTP
 
 
 @pytest.mark.parametrize("content_type", ["application/json", "text/plain"])
-async def test_complete_200_json_error_envelope_stays_malformed_response(
+async def test_complete_200_json_error_envelope_carries_its_text_and_is_classified(
     httpx_mock: HTTPXMock, content_type: str
 ) -> None:
-    """A non-streamed 200 JSON error envelope is still MalformedResponse, unclassified, its text lost (BR-021 residual).
+    """A non-streamed 200 JSON error envelope quotes its body and is classified (BR-023 AC-3).
 
-    Pins a documented gap, not a decision: the body decodes to a JSON object
-    without ``choices``, so it never reaches the ``str`` check. The follow-up
-    is BR-023. If this test changes, the module docstring, README and
-    CHANGELOG must change with it. The streamed twin is
+    Before BR-023 this pinned a BR-021 residual: ``MalformedResponse``
+    ("Provider returned no choices."), unclassified, the text lost, under
+    both labels. The streamed twin is
     ``test_stream_200_json_error_body_is_classified``.
     """
     body = json.dumps({"error": {"message": _MODEL_MAX_CONTEXT, "code": "context_length_exceeded"}})
@@ -211,8 +214,184 @@ async def test_complete_200_json_error_envelope_stays_malformed_response(
 
     err = await _complete_error(_client())
 
+    assert err.__cause__ is None
+    assert err.message == _ENVELOPE_PREFIX + body
+    assert err.context == {
+        "model": MODEL,
+        "type": "ContextLengthExceeded",
+        "body_length": len(body),
+        "classified_from": "ErrorEnvelopeProviderBody",
+    }
+
+
+async def test_complete_200_error_envelope_without_a_marker_is_unclassified(
+    httpx_mock: HTTPXMock,
+) -> None:
+    """An error envelope that names no overflow is ErrorEnvelopeProviderBody, with no classified_from (BR-023)."""
+    body = json.dumps(
+        {"error": {"message": "invalid temperature", "type": "invalid_request_error"}}
+    )
+    _respond(httpx_mock, body.encode(), "application/json")
+
+    err = await _complete_error(_client())
+
+    assert err.message == _ENVELOPE_PREFIX + body
+    assert err.context == {
+        "model": MODEL,
+        "type": "ErrorEnvelopeProviderBody",
+        "body_length": len(body),
+    }
+
+
+@pytest.mark.parametrize(
+    "envelope",
+    [
+        pytest.param({"error": {"message": _MODEL_MAX_CONTEXT}}, id="marker_in_message"),
+        pytest.param(
+            {"error": {"message": "request rejected", "code": "context_length_exceeded"}},
+            id="code_only",
+        ),
+    ],
+)
+async def test_complete_and_stream_treat_the_same_error_envelope_alike(
+    httpx_mock: HTTPXMock, envelope: dict[str, Any]
+) -> None:
+    """complete() and stream() quote the same text, the same length and the same class for one envelope (BR-023 AC-3).
+
+    Both classify on the whole body text, so in the ``code_only`` row, whose
+    message names no overflow, the ``code`` string in the text classifies it
+    on both.
+    """
+    body = json.dumps(envelope)
+    _respond(httpx_mock, body.encode(), "application/json")
+    _respond(httpx_mock, body.encode(), "application/json")
+
+    complete_err = await _complete_error(_client())
+    stream_err = await _stream_error(_client())
+
+    assert complete_err.context["type"] == stream_err.context["type"] == "ContextLengthExceeded"
+    assert complete_err.message.removeprefix(_ENVELOPE_PREFIX) == body
+    assert stream_err.message.removeprefix(_STREAM_PREFIX) == body
+    assert complete_err.context["body_length"] == stream_err.context["body_length"] == len(body)
+    assert complete_err.context["classified_from"] == "ErrorEnvelopeProviderBody"
+    assert stream_err.context["classified_from"] == "NonStreamProviderBody"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        pytest.param(
+            {"id": "cmpl-1", "object": "chat.completion", "choices": []}, id="empty_choices"
+        ),
+        pytest.param({"id": "x"}, id="no_choices_no_error"),
+        pytest.param({"error": None}, id="error_null"),
+        pytest.param({"error": ""}, id="error_empty_string"),
+        pytest.param({"error": {}}, id="error_empty_object"),
+        pytest.param({"detail": _MODEL_MAX_CONTEXT}, id="detail_member"),
+    ],
+)
+async def test_complete_no_choices_without_an_error_member_stays_malformed_response(
+    httpx_mock: HTTPXMock, payload: dict[str, Any]
+) -> None:
+    """A no-choices object whose error member is absent or falsy stays MalformedResponse, text lost (BR-023 control).
+
+    The envelope rule needs a truthy ``error`` member, the ``openai``
+    client's own rule for a streamed error event. The ``detail_member`` row
+    pins a documented gap, not a decision: such a body (a FastAPI-style
+    error, for example) is not classified even when it names an overflow.
+    If it changes, the module docstring, README and CHANGELOG must change
+    with it.
+    """
+    _respond(httpx_mock, json.dumps(payload).encode(), "application/json")
+
+    err = await _complete_error(_client())
+
     assert err.message == "Provider returned no choices."
     assert err.context == {"model": MODEL, "type": "MalformedResponse"}
+
+
+@pytest.mark.parametrize("charset", ["utf-16", "utf-16-le", "utf-32", "hex", "base64", "rot13"])
+async def test_complete_error_envelope_under_a_charset_label_is_quoted_as_utf8(
+    httpx_mock: HTTPXMock, charset: str
+) -> None:
+    """A UTF-8 error envelope is quoted and classified whatever charset its Content-Type names (BR-023 round 2).
+
+    The ``openai`` client parses a JSON-labelled body from its bytes, so the
+    envelope is found under every label; the adapter quotes those bytes read
+    as UTF-8. In round 1 it quoted ``Response.text``, which decodes with the
+    named charset: ``hex`` and ``base64`` raised a raw ``AssertionError``
+    out of ``complete()`` (``MalformedResponse`` before BR-023), ``utf-16``
+    and ``utf-32`` raised in that read and were mislabelled
+    ``MalformedResponse``, ``rot13`` was ``MalformedResponse`` from a
+    ``TypeError``, and ``utf-16-le`` was quoted unreadably and not
+    classified (evidence, round 2, probe A).
+    """
+    body = json.dumps({"error": {"message": _MODEL_MAX_CONTEXT}})
+    _respond(httpx_mock, body.encode(), f"application/json; charset={charset}")
+
+    err = await _complete_error(_client())
+
+    assert err.message == _ENVELOPE_PREFIX + body
+    assert err.context == {
+        "model": MODEL,
+        "type": "ContextLengthExceeded",
+        "body_length": len(body),
+        "classified_from": "ErrorEnvelopeProviderBody",
+    }
+
+
+async def test_complete_error_envelope_encoded_in_utf16_is_quoted_as_its_utf8_reading(
+    httpx_mock: HTTPXMock,
+) -> None:
+    """An envelope actually encoded in UTF-16 is quoted as its UTF-8 reading and not classified (BR-023 residual).
+
+    Pins a documented gap, not a decision. ``json.loads`` detects UTF-16 from
+    the bytes, so the envelope is found, but the quote reads the bytes as
+    UTF-8: each ASCII character is followed by a NUL and the byte-order mark
+    becomes two U+FFFD, so no marker matches. Round 1 quoted
+    ``Response.text`` and classified this body when the label named
+    ``utf-16``; that read was not total (see the test above). If this test
+    changes, the module docstring and CHANGELOG must change with it.
+    """
+    body = json.dumps({"error": {"message": _MODEL_MAX_CONTEXT}}).encode("utf-16")
+    _respond(httpx_mock, body, "application/json; charset=utf-16")
+
+    err = await _complete_error(_client())
+
+    text = body.decode("utf-8", "replace")
+    assert "\x00" in text
+    assert err.message == _ENVELOPE_PREFIX + text.strip()
+    assert err.context == {
+        "model": MODEL,
+        "type": "ErrorEnvelopeProviderBody",
+        "body_length": len(text),
+    }
+
+
+async def test_error_member_beside_valid_choices_is_a_normal_completion(
+    httpx_mock: HTTPXMock,
+) -> None:
+    """A completion with choices AND an error member maps as a completion; choices are checked first (BR-023 control)."""
+    payload = {
+        "id": "cmpl-1",
+        "object": "chat.completion",
+        "created": 1,
+        "model": MODEL,
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": "hello"},
+                "finish_reason": "stop",
+            }
+        ],
+        "error": {"message": _MODEL_MAX_CONTEXT},
+    }
+    _respond(httpx_mock, json.dumps(payload).encode(), "application/json")
+
+    response = await _client().complete(_request())
+
+    assert response.message.content == "hello"
+    assert response.finish_reason == "stop"
 
 
 async def test_provider_body_excerpt_is_bounded_and_length_recorded(
@@ -729,12 +908,16 @@ async def test_mid_stream_read_failure_is_never_classified(httpx_mock: HTTPXMock
 async def test_json_decode_arm_does_not_wrap_other_value_errors(
     monkeypatch: pytest.MonkeyPatch, error: ValueError
 ) -> None:
-    """complete()'s JSONDecodeError arm leaves every other ValueError raw (BR-021 D9).
+    """complete()'s request step leaves every ValueError raw (BR-021 D9; BR-023 D8).
 
     A ``UnicodeEncodeError`` (a ``ValueError``) from encoding the request
     would be reported as a provider body by a ``ValueError`` arm. BR-022
     escapes surrogate code points in the tool-result messages the loop
-    builds and adds no arm here, so this pin stands unchanged.
+    builds and adds no arm here. Since BR-023 ``complete()`` calls the
+    patched ``create`` through ``with_raw_response`` (BR-023 evidence P2 iv),
+    and its decode arms wrap only the separate decode step, so the error
+    raised here, before any body exists, still escapes raw. The real-client
+    pins are in ``test_openai_compat_body_decoding.py``.
     """
     client = _client()
 
@@ -749,21 +932,30 @@ async def test_json_decode_arm_does_not_wrap_other_value_errors(
     assert exc.value is error
 
 
-async def test_mid_stream_json_decode_arm_does_not_claim_other_value_errors(
+async def test_mid_stream_iterator_value_error_is_undecodable_not_a_provider_text_body(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A non-decode ValueError mid-stream keeps the generic wrap, not NonJsonProviderBody (BR-021 D9).
+    """A ValueError from the stream iterator is UndecodableProviderBody quoting the error, not a body (BR-023 D3).
 
+    Changed on purpose by BR-023. As BR-021's
+    ``test_mid_stream_json_decode_arm_does_not_claim_other_value_errors``
+    this pinned the generic wrap (``type="ValueError"``, message
+    ``str(e)``). BR-023 types every ``ValueError`` the ``openai`` iterator
+    step raises as a decode failure: the ones its probe P1 measured from the
+    iterator (``openai`` 2.43.0 and 2.54.0) were. What BR-021 D9 protected
+    still holds: the message quotes the exception, not provider text, the
+    type is not ``NonJsonProviderBody``, and there is no ``body_length``.
     The fake stream has no ``response`` attribute, so the adapter iterates
     it without reading ahead (the ``getattr`` fallback).
     """
+    error = ValueError("not a decode error")
 
     class _RaisingStream:
         def __aiter__(self) -> AsyncIterator[Any]:
             return self
 
         async def __anext__(self) -> Any:  # noqa: ANN401 - opaque chunk type
-            raise ValueError("not a decode error")
+            raise error
 
     client = _client()
 
@@ -774,8 +966,14 @@ async def test_mid_stream_json_decode_arm_does_not_claim_other_value_errors(
 
     err = await _stream_error(client)
 
-    assert err.message == "not a decode error"
-    assert err.context == {"model": MODEL, "type": "ValueError", "phase": "stream"}
+    assert err.__cause__ is error
+    assert err.message == _UNDECODABLE_STREAM_PREFIX + "not a decode error"
+    assert err.context == {
+        "model": MODEL,
+        "type": "UndecodableProviderBody",
+        "decode_error": "ValueError",
+        "phase": "stream",
+    }
 
 
 # --- The predicate --------------------------------------------------------------------

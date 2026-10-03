@@ -33,14 +33,16 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     `context_length_exceeded` or `maximum context length` (compared case-insensitively),
     or the provider's error code is `context_length_exceeded`. It is applied on these
     paths only: the 200 body errors below (`NonJsonProviderBody`,
-    `NonStreamProviderBody`), and every `APIError` other than `APITimeoutError`,
-    `APIConnectionError` and `RateLimitError` (for example `BadRequestError`,
-    `InternalServerError` and a mid-stream error event), on `complete()` and on
-    `stream()`. It is never applied to those three on `complete()` or when `stream()`
+    `NonStreamProviderBody`), BR-023's `UndecodableProviderBody` from `complete()` and
+    `ErrorEnvelopeProviderBody` (see the BR-023 item), and every `APIError` other than
+    `APITimeoutError`, `APIConnectionError` and `RateLimitError` (for example
+    `BadRequestError`, `InternalServerError` and a mid-stream error event), on `complete()`
+    and on `stream()`. It is never applied to those three on `complete()` or when `stream()`
     opens the request; while `stream()` iterates, `openai` 2.43.0 raises only the base
     `APIError` for an error event. It is never applied to a failure of the read itself
-    while a stream is read (an `httpx` read error, for example), or to the bodies the
-    client still does not catch or that still escape raw (see Fixed).
+    while a stream is read (an `httpx` read error, for example), to
+    `UndecodableProviderBody` from `stream()`, or to the bodies the client still does not
+    catch (see Fixed).
     `context["classified_from"]` keeps the type the error would otherwise have had, for
     example `BadRequestError`. The list is closed: other phrasings of the same failure
     stay unclassified, and an unrelated error whose text quotes one of these strings is
@@ -135,6 +137,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   body as strict UTF-8; other `openai` and `httpx` releases were not measured. No golden
   scenario's tool-result text held a surrogate code point before the escape, and every
   successful tool result in them is a non-string value that renders as JSON. (BR-022)
+  BR-023 adds no scope: apart from runs whose call stack is already near the interpreter's
+  recursion limit (see its Not covered item), its new outcomes are runs that end on an
+  `LLMError`, which these statements already exclude, and its one change to the request is
+  a header, which is not part of the request bodies they compare. (BR-023)
 - Tool-result message text no longer holds a surrogate code point (U+D800-U+DFFF), which
   UTF-8 cannot encode:
   - Each one is written as its six-character `\udXXX` escape, the spelling `json.dumps`
@@ -167,6 +173,71 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     `BaseException` that is not an `Exception` still propagates.
 
   (BR-022)
+
+- `OpenAICompatibleClient.complete()` now calls the `openai` client's
+  `chat.completions.with_raw_response.create(...)`, which returns the response without
+  decoding its body, and decodes it with `parse()` in a separate step. So a body the client
+  cannot decode is told apart from a request it cannot encode. In that mode the `openai`
+  client adds one header to every non-streamed request, `X-Stainless-Raw-Response: true`.
+  Compared with and without it on `openai` 2.43.0 and 2.54.0, every other header had the
+  same value, the header order changed (the new header comes before
+  `x-stainless-retry-count`), the method, URL and body bytes were the same, and `parse()`
+  returned the same value or raised the same exception as `create()` did for every body
+  compared. `stream()` still
+  calls `create()`, and its requests do not carry the header. A request that cannot be
+  encoded (a non-ASCII API key, or a message holding a surrogate code point) still raises
+  `UnicodeEncodeError` unwrapped, with nothing sent (measured on both releases). A test
+  double that replaces the private `client._client.chat.completions.create` and returns a
+  `ChatCompletion` no longer works: set before the client's first `complete()`, it makes
+  `complete()` raise `AttributeError: 'ChatCompletion' object has no attribute 'parse'`;
+  set after it, it is silently bypassed and the request goes to the HTTP transport, because
+  `with_raw_response` binds `create` the first time it is used (both measured on both
+  releases). (BR-023)
+- `LLMError.context["type"]` from `OpenAICompatibleClient` takes two more values, and some
+  errors change type:
+  - `UndecodableProviderBody`: the `openai` client could not decode the body. On
+    `complete()`, a 200 whose Content-Type it treats as JSON (on `openai` 2.43.0 and 2.54.0,
+    one whose Content-Type, up to any `;`, ends in `json` (case-sensitive)) and whose body
+    is not valid UTF-8, holds an integer literal over the interpreter's int-to-str digit
+    limit, or nests deeper than `json.loads` decodes; also a 200 not labelled JSON whose
+    text the client's decode, with the `charset` its Content-Type names, rejects with a
+    `ValueError` (measured: `text/plain; charset=utf-16` or `utf-32` on a UTF-8 body, and
+    `charset=idna`). The message is `Provider response body could not be decoded: ` plus the
+    first 500 characters of the body's bytes read as UTF-8, invalid bytes as U+FFFD,
+    whatever `charset` the Content-Type names, and `context` holds `body_length` and
+    `decode_error`, the class name of the exception the client raised: for a body labelled
+    JSON, `UnicodeDecodeError`, `ValueError` or `RecursionError`; for the `charset` case,
+    measured `UnicodeDecodeError` for `utf-16` and `utf-32` on CPython 3.13.2 and 3.14.3,
+    and `UnicodeError` for them on 3.11.15 and for `idna` on all three. It is classified
+    `ContextLengthExceeded` by the same rule as the other provider-body errors. On
+    `stream()`, the same three failures while the client decodes the stream: the message is
+    `Provider stream could not be decoded: ` plus the exception's own text, `context` holds
+    `decode_error` and `phase`, and it is never classified.
+  - `ErrorEnvelopeProviderBody`: a non-streamed 200 whose body is a JSON object without
+    `choices` and with a truthy `error` member. The message is `Provider returned an error
+    object instead of a completion: ` plus the first 500 characters of the body, read the
+    same way, and `context` holds `body_length`. It is classified on the whole body, as the
+    same body on `stream()` is, so an envelope whose `code` is `context_length_exceeded` is
+    `ContextLengthExceeded` even when its message names no overflow.
+  - Old to new:
+
+    | Method | HTTP 200 body | 1.10.1 | 1.10.2 |
+    |---|---|---|---|
+    | `complete()` | labelled JSON, not valid UTF-8 | raw `UnicodeDecodeError` | `UndecodableProviderBody` |
+    | `complete()` | labelled JSON, an integer literal over the digit limit | raw `ValueError` | `UndecodableProviderBody` |
+    | `complete()` | labelled JSON, nested deeper than `json.loads` decodes | raw `RecursionError` | `UndecodableProviderBody` |
+    | `complete()` | not labelled JSON, text the client's decode rejects under the `charset` its Content-Type names (measured: `utf-16`, `utf-32`, `idna`) | raw `UnicodeDecodeError` (`utf-16`, `utf-32`) or `UnicodeError` (`idna`) | `UndecodableProviderBody` |
+    | `complete()` | a JSON object without `choices`, with a truthy `error` member | `MalformedResponse`, text lost | `ErrorEnvelopeProviderBody`, text quoted |
+    | `complete()` | a completion with a field of the wrong type or value that mapping rejects with a `ValueError` (pydantic's included), `OverflowError` or `KeyError` (see Fixed) | raw `ValidationError`, `ValueError`, `OverflowError` or `KeyError` | `MalformedResponse` |
+    | `stream()` | a line that is not valid UTF-8 | `UnicodeDecodeError` | `UndecodableProviderBody` |
+    | `stream()` | event data with an integer literal over the digit limit | `ValueError` | `UndecodableProviderBody` |
+    | `stream()` | event data nested deeper than `json.loads` decodes | `RecursionError` | `UndecodableProviderBody` |
+
+    The first five rows are `ContextLengthExceeded` instead, with the new type in
+    `classified_from`, when the body's text names an overflow. In the `stream()` rows the
+    old type is now in `decode_error`, and the message, which was the exception's text,
+    now has the prefix. Measured for 1.10.1 on CPython 3.14.3 with `openai` 2.43.0, and for
+    1.10.2 on 3.14.3 with 2.43.0 and on 3.11.15 and 3.13.2 with 2.54.0. (BR-023)
 
 ### Fixed
 - JSON that the SDK writes for the model now carries non-ASCII text as literal UTF-8
@@ -204,26 +275,21 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   lost. The same holds for a body that is a bare JSON string, and for a body labelled
   `application/json` whose UTF-8 text is not JSON, which used to escape `complete()` and
   `AgentLoop.run()` as a raw `json.JSONDecodeError`, with no `ErrorEvent` or
-  `FinalEvent`. Two bodies with a JSON Content-Type still escape raw, as before: one that
-  is not valid UTF-8 (`UnicodeDecodeError`; measured labelled `application/json`,
-  `application/problem+json` and `text/json`) and one whose integer literal exceeds the
-  interpreter's digit limit (`ValueError`; measured labelled `application/json`).
-  `AgentLoop.run()` catches only `LLMError`, so such a run ends with no `ErrorEvent` or
-  `FinalEvent` (measured labelled `application/json`).
+  `FinalEvent`. Bodies with a JSON Content-Type that the `openai` client could not decode
+  at all (not valid UTF-8, an integer literal over the digit limit) escaped raw too; BR-023
+  fixes them (see its items).
 - A streaming request answered with such a body looked like an empty stream: with the
   parser retry on (the default), the run ended with a `ParserError` after two provider
   calls. It now raises `LLMError` typed `NonStreamProviderBody` (or
   `ContextLengthExceeded`) after one, unless the body is labelled `text/event-stream` (see
   below).
-- Some provider answers are still not caught (the raw escapes are in the item above). A
-  non-streamed 200 whose body is a JSON object without `choices`, such as an error
-  envelope `{"error": {...}}` (measured labelled `application/json` and `text/plain`),
-  still raises `MalformedResponse` (`Provider returned no choices.`) with its text lost,
-  so it is never classified; the same body on a streamed request that is not labelled
-  `text/event-stream` raises `NonStreamProviderBody` carrying its text, classified
-  `ContextLengthExceeded` when that text holds a marker. A body without SSE fields (plain
-  text, or a JSON error envelope) labelled `text/event-stream` still looks empty, because
-  the `openai` client's SSE decoder drops it before the SDK sees it.
+- Some provider answers are still not caught. A non-streamed 200 whose body is a JSON
+  object without `choices` and without a truthy `error` member, such as `{"detail": ...}`,
+  still raises `MalformedResponse` (`Provider returned no choices.`) with its text lost, so
+  it is never classified. (An error envelope `{"error": {...}}` is caught since BR-023;
+  see its items.) A body without SSE fields (plain text, or a JSON error envelope)
+  labelled `text/event-stream` still looks empty, because the `openai` client's SSE
+  decoder drops it before the SDK sees it.
 - An over-long prompt whose provider error uses one of the three markers, on one of the
   paths listed under Changed, is classified `ContextLengthExceeded`, so a consumer can
   react to it, for example by trimming a tool result and retrying.
@@ -296,8 +362,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   such values.
 - Not covered:
   - A surrogate code point in text the loop does not build, such as the model's own
-    completion or tool names echoed back, or a message passed to `run()`, still makes the
-    shipped client raise `UnicodeEncodeError` raw (measured).
+    completion or tool names echoed back (open as BR-024), or a message passed to `run()`,
+    still makes the shipped client raise `UnicodeEncodeError` raw (measured).
   - A tool whose exception's own `__str__` raises still escapes `AgentLoop.run()` from
     `Registry.invoke` (measured).
   - Serialising an event that carries such a value with pydantic, as a consumer may,
@@ -312,6 +378,82 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     or fail.
 
   No public API changes. (BR-022)
+
+- A provider answering HTTP 200 could still end a run with a raw exception and no
+  `ErrorEvent` or `FinalEvent`, because `AgentLoop.run()` catches only `LLMError`.
+  Measured before BR-023 on CPython 3.14.3 with `openai` 2.43.0 and on 3.11.15 and 3.13.2
+  with 2.54.0, and on 1.10.1 (CPython 3.14.3, `openai` 2.43.0):
+  - a body labelled JSON (`application/json`, `application/problem+json` or `text/json`)
+    that is not valid UTF-8: `UnicodeDecodeError`;
+  - a body under the same labels with an integer literal one digit over the interpreter's
+    int-to-str digit limit: `ValueError`;
+  - a body labelled `application/json` nested twice as deep as `json.loads` decodes:
+    `RecursionError`;
+  - a body labelled `text/plain; charset=utf-16` or `charset=utf-32` that `json.loads`
+    cannot decode (measured: plain text, a body that is not valid UTF-8, an integer literal
+    over the digit limit): `UnicodeDecodeError` (`UnicodeError` on 3.11.15); under
+    `charset=idna`, `UnicodeError`; each from the `openai` client's own text decode;
+  - a completion whose `content` is `5` or `[1]`, whose tool call's `name` is `null`, whose
+    usage count is `-1`, `"abc"` or `1e400`, or whose `choices` is an object instead of a
+    list: a pydantic `ValidationError`, a `ValueError`, an `OverflowError` or a `KeyError`
+    from mapping the response.
+- Each of these now ends the run after one request with an `ErrorEvent` carrying the
+  `LLMError`, then the `FinalEvent` with `error_fallback_message`. The first four are
+  `UndecodableProviderBody` (see Changed). The last is `MalformedResponse` with the fixed
+  message `Malformed provider response: a field has the wrong type or value (<exception
+  class>).`, which quotes no value from the body, and the exception as `__cause__`.
+  Fields that fail with an `AttributeError`, `IndexError` or `TypeError` instead (measured,
+  for example: `choices` as a string, `finish_reason` `[1]`, a usage count `[1]`,
+  `tool_calls` `5`) were `MalformedResponse` before and keep the message `Malformed
+  provider response: <error>`. Of the 35 wrong-typed field shapes measured, none still
+  escapes `complete()` raw; some are accepted as before (a `usage` that is a list or a
+  string reads as zero counts). A streamed chunk with such a field keeps its earlier error
+  (`context["type"]` is the exception's class name).
+- A non-streamed 200 JSON error envelope (`{"error": {...}}`; measured labelled
+  `application/json` and `text/plain`) raised `MalformedResponse` (`Provider returned no
+  choices.`) with its text lost, so it was never classified, while the same body on a
+  streamed request not labelled `text/event-stream` was quoted and classified. It is now
+  `ErrorEnvelopeProviderBody` carrying its text, classified like its streamed twin (see
+  Changed).
+- Not covered:
+  - A 200 JSON object without `choices` and without a truthy `error` member, such as
+    `{"detail": ...}`, still raises `MalformedResponse` with its text lost, and a body
+    without SSE fields labelled `text/event-stream` still looks empty (see the BR-021
+    items above).
+  - A `RecursionError` in the decode step that comes from a call stack already nearly
+    exhausted, not from the body, is reported as `UndecodableProviderBody` too, with
+    `decode_error` `RecursionError`. Measured on CPython 3.11.15: a valid completion holding
+    a 300-level array in an extra key, with `complete()` awaited 679 to 962 coroutine frames
+    deep (before BR-023 those runs raised `RecursionError` raw). With that body no such
+    depth was found on 3.13.2 or 3.14.3, and with a completion without the deep key none on
+    any of the three: there the request step fails first (`APIConnectionError`, or
+    `RecursionError` raw with nothing sent), as before BR-023 but one frame shallower, so
+    at one measured depth per interpreter a run that ended with `APIConnectionError` now
+    raises `RecursionError` raw, and at one other a raw exception now ends as
+    `APIConnectionError`. On 3.11.15 the 300-level body also completes at 675 to 678
+    frames, where it raised raw before. `stream()`'s decode arm would report such a failure
+    of the event iterator the same way, as `UndecodableProviderBody` (by reading; not
+    measured).
+  - The quote reads the body's bytes as UTF-8 whatever `charset` the Content-Type names,
+    so a body actually encoded in UTF-16 or UTF-32 is quoted unreadably, NUL characters
+    included, and is not classified (measured for an error envelope in UTF-16 and UTF-32,
+    each with and without a byte-order mark).
+  - A 200 not labelled JSON whose body `json.loads` cannot decode (measured: plain text, a
+    body that is not valid UTF-8, an integer literal over the digit limit, nesting past the
+    decoder) and whose Content-Type names a codec that is not a text encoding (measured:
+    `charset=hex`, `base64`, `rot13`, `zlib`, `uu`) still raises `AssertionError` or
+    `TypeError` raw out of `complete()`, from the `openai` client's own `Response.text`
+    read inside `parse()`, as before BR-023 and in 1.10.1 (measured on `openai` 2.43.0 and
+    2.54.0; 1.10.1 on 2.43.0). A body under those labels that `json.loads` decodes (a
+    completion, an error envelope) is handled as above.
+  - On `stream()`, a 200 that is read ahead (not `text/event-stream`), yields no chunk, and
+    whose `charset` that read cannot decode with (the same five codecs, `idna`, or `utf-16`
+    and `utf-32` on a UTF-8 body) ends with the generic wrap (`context["type"]` is the
+    exception's class name) instead of `NonStreamProviderBody`. That read is BR-021's and is
+    unchanged.
+  - A custom `LLMClient` decodes its own responses.
+
+  No public API changes. (BR-023)
 
 ## [1.10.1] - 2026-09-28
 

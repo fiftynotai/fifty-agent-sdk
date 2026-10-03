@@ -250,7 +250,9 @@ class ErrorEvent(_EventBase):
             OpenAICompatibleClient` is often the provider's own error text
             and may quote its response body (since 1.10.2 the provider-body
             errors listed in that client's module docstring quote up to 500
-            characters of the body; 4xx/5xx text is not cut, as before). Show the
+            characters of the body, except an ``"UndecodableProviderBody"``
+            from ``stream()``, which quotes the decoder's error instead;
+            4xx/5xx text is not cut, as before). Show the
             following :class:`FinalEvent` to end users instead.
         context: Structured debugging payload forwarded verbatim from the
             originating error (when applicable). Always a ``dict``,
