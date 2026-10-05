@@ -18,18 +18,26 @@ What this does NOT pin: the event stream. FR-001 D12 intentionally changes
 ``ThoughtEvent.text`` on native tool turns (content is now carried as the
 thought), which is an event change, not a request change. Legacy event
 behaviour is pinned by the unmodified ``tests/loop`` and ``tests/runner``
-suites instead. Nor key order: the fixture is written with ``sort_keys=True``
-and :func:`_canonical` sorts too, so this pins keys, values and JSON types
-only. Key order is preserved by construction
-(``OpenAICompatibleClient._build_body`` is unchanged since 1.7.0). Nor
-non-ASCII text or U+007F in the JSON the SDK writes for the model, which
-1.10.2 changed (BR-020): no scenario's tool results, tool schemas or replayed
-arguments hold any. Nor any text the 64-level nesting check refuses
-(BR-019): it refuses no text in any scenario, whose tool arguments nest at
-most 1 level. Nor tool-result text holding a surrogate code point before
-the escape, or a non-string tool result that cannot be rendered (BR-022):
-no scenario's tool-result text holds one, and every successful tool result
-in the scenarios is a non-string value that renders as JSON.
+suites instead. Nor key order: the fixture is written with
+``sort_keys=True`` and :func:`_canonical` sorts too, so this pins keys,
+values and JSON types only. Key order holds by construction (by reading; not
+pinned here): ``OpenAICompatibleClient._build_body`` adds its keys in the
+1.7.0 order (FR-002 added one trailing key, set only with
+``reasoning_effort``), and BR-024 escapes three values in
+``_serialize_message`` without moving a key (the ``model_dump`` branch
+re-assigns the existing key; the envelope builds its keys in the same
+order). Nor non-ASCII text or U+007F in the JSON the SDK writes for the
+model, which 1.10.2 changed (BR-020): no scenario's tool results, tool
+schemas or replayed arguments hold any. Nor any text the 64-level nesting
+check refuses (BR-019): it refuses no text in any scenario, whose tool
+arguments nest at most 1 level. Nor tool-result text holding a surrogate
+code point before the escape, or a non-string tool result that cannot be
+rendered (BR-022): no scenario's tool-result text holds one, and every
+successful tool result in the scenarios is a non-string value that renders
+as JSON. Nor model-written text the client sends (an assistant message's
+content, a tool call's name, a tool reply's name) holding a surrogate code
+point (BR-024): no scenario's text in those fields holds one (BR-024
+evidence, P5).
 """
 
 from __future__ import annotations

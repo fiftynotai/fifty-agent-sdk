@@ -39,10 +39,13 @@ the real client builds, non-streamed (W3) and streamed (W4).
 What these do NOT pin: HTTP bytes; how another ``openai``/``httpx`` release
 encodes the body (W3's docstring); the time or memory ``json.dumps`` and
 ``repr`` spend before they fail (BR-022 evidence, P4, measured outside the
-suite); surrogate code points in text the loop does not build (the model's
-own completion and tool names, messages passed to ``run()``), which still
-make the shipped client raise (BR-022 evidence, P1c); and CPython 3.12 or
-Linux, where I1's depth was not measured before CI.
+suite); surrogate code points in text the loop does not build: the model's
+own completion and tool names, which the shipped client escapes since BR-024
+(pinned in ``tests/loop/test_loop_provider_text_replay.py``; L2 checks the
+tool name through the client's serialiser), and a user or system message
+passed to ``run()``, which still makes the shipped client raise (BR-024
+evidence, P4); and CPython 3.12 or Linux, where I1's depth was not measured
+before CI.
 """
 
 from __future__ import annotations
@@ -533,6 +536,7 @@ class _Source(NamedTuple):
     for_tool_role: str  # the expected content in the "tool" role, escaped
     for_other_role: str  # the expected content in the "user"/"assistant" roles, escaped
     raw_event_error: str | None  # the ToolFailedEvent.error the run must carry, raw
+    wire_name: str  # the name the shipped client sends for tool_name (BR-024), escaped
 
 
 def _source(name: str) -> _Source:
@@ -547,6 +551,7 @@ def _source(name: str) -> _Source:
             "Tool error: upstream \\ud800",
             "Tool lookup failed: upstream \\ud800",
             error,
+            "lookup",
         )
     if name == "after_tool_note":
         hooks = Interventions(after_tool=lambda *_: "note " + chr(0xDC80))
@@ -557,6 +562,7 @@ def _source(name: str) -> _Source:
             "ok\n\nnote \\udc80",
             "Tool lookup returned: ok\n\nnote \\udc80",
             None,
+            "lookup",
         )
     if name == "denial_reason":
         hooks = Interventions(before_tool=lambda *_: DenyToolCall(reason="denied " + chr(0xD800)))
@@ -567,6 +573,7 @@ def _source(name: str) -> _Source:
             "Tool call denied: denied \\ud800",
             "Tool lookup failed: Tool call denied: denied \\ud800",
             "Tool call denied: denied " + chr(0xD800),
+            "lookup",
         )
     if name == "repr_fallback":
         return _Source(
@@ -576,6 +583,7 @@ def _source(name: str) -> _Source:
             "r\\ud800",
             "Tool lookup returned: r\\ud800",
             None,
+            "lookup",
         )
     assert name == "tool_not_found_text"
     not_found = "ToolNotFound: tool 'find\\ud800' is not registered."
@@ -586,6 +594,7 @@ def _source(name: str) -> _Source:
         not_found,
         f"Tool find\\ud800 failed: {not_found}",
         None,
+        "find\\ud800",
     )
 
 
@@ -601,9 +610,12 @@ async def test_every_tool_message_source_is_escaped(row: _Row, source_name: str)
     result, a ``before_tool`` denial reason, a ``repr`` fallback that returns
     U+D800, and the ``ToolNotFound`` text for a tool name the model wrote.
     Before BR-022 each made the shipped client raise ``UnicodeEncodeError`` on
-    the next request (BR-022 evidence, P1b). Not escaped, and not pinned as a
-    fix: the ``name`` field of the ``"tool"``-role reply and the model's own
-    assistant turn, which carry the model's tool name (a documented residual).
+    the next request (BR-022 evidence, P1b). The ``name`` field of the
+    ``"tool"``-role reply and the native assistant turn carry the model's
+    tool name: the loop keeps it as the model wrote it, and since BR-024
+    ``OpenAICompatibleClient._serialize_message`` writes it escaped (the
+    ``wire_name`` assertions), so every message of the second request
+    serialises to text that encodes as UTF-8.
     """
     source = _source(source_name)
     llm = FakeLLMClient([_tool_turn(row, source.tool_name, {"q": "x"}), _final_turn(row)])
@@ -616,8 +628,16 @@ async def test_every_tool_message_source_is_escaped(row: _Row, source_name: str)
     expected = source.for_tool_role if row.expected_role == "tool" else source.for_other_role
     assert message.content == expected
     message.content.encode("utf-8")  # must not raise
+    serialize = OpenAICompatibleClient._serialize_message
     if row.expected_role == "tool":
-        assert message.name == source.tool_name  # the model's name, not escaped (residual)
+        # The loop keeps the model's name; the shipped client escapes it on the wire (BR-024).
+        assert message.name == source.tool_name
+        assert serialize(message)["name"] == source.wire_name
+    if _is_native(row):
+        turn = serialize(llm.calls[1].messages[-2])
+        assert turn["tool_calls"][0]["function"]["name"] == source.wire_name
+    for sent in llm.calls[1].messages:
+        json.dumps(serialize(sent), ensure_ascii=False).encode("utf-8")  # must not raise
     if source.raw_event_error is not None:
         failure = next(e for e in events if isinstance(e, ToolFailedEvent))
         assert failure.error == source.raw_event_error
@@ -912,10 +932,13 @@ async def test_str_result_with_surrogate_completes_through_the_real_client(
     the client encodes the request body as strict UTF-8, and before BR-022 this
     run raised ``UnicodeEncodeError`` out of ``run()`` after one request (P1).
     On a release whose encoder escaped the body itself, removing the loop's
-    escape would not make this test raise, but the exact-content assertion
-    would still see it (by reading; not run);
-    ``test_str_result_with_surrogate_reaches_the_model_escaped``
-    pins the loop on any release.
+    escape would not make the ``native`` row raise, but its exact-content
+    assertion would still see it (by reading; not run). The ``json`` row
+    sends the result in an ``"assistant"`` message, whose content the shipped
+    client also escapes since BR-024, so with the loop's escape removed that
+    row stays green (BR-024 evidence, X1).
+    ``test_str_result_with_surrogate_reaches_the_model_escaped`` (L1), through
+    ``FakeLLMClient``, pins the loop's escape in every row, on any release.
     """
     first = _native_tool_body() if _is_native(row) else _text_body(_json_tool("lookup", {"q": "x"}))
     final = _text_body("done" if _is_native(row) else _json_final("done"))
@@ -970,10 +993,12 @@ async def test_str_result_with_surrogate_completes_through_the_real_client_strea
     The request body is encoded by the ``create()`` call that opens each
     stream. On ``1a2832e`` this run raised ``UnicodeEncodeError`` raw from
     that call after one request (``openai`` 2.43.0 and 2.54.0; BR-022
-    evidence, round 2). The release dependence is W3's: on a release whose
-    encoder escaped the body itself, the run would not raise, but the
-    exact-content assertion would still see a missing escape (by reading;
-    not run).
+    evidence, round 2). The result goes out in an ``"assistant"`` message
+    (``ToolMode.JSON``), whose content the shipped client also escapes since
+    BR-024, so this test no longer detects a missing loop escape (BR-024
+    evidence, X1); L1 and L2, through ``FakeLLMClient``, pin the loop. It
+    still pins the streamed request: the second ``create()`` sends the
+    escaped text and the run ends on the model's answer.
     """
     for content in (_json_tool("lookup", {"q": "x"}), _json_final("done")):
         httpx_mock.add_response(

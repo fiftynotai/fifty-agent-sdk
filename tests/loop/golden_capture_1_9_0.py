@@ -5,7 +5,8 @@ a loop built WITHOUT ``interventions`` sends the same request bodies (same
 keys, values and JSON types) and emits the same event stream as 1.9.0 (since
 1.10.2 claimed only for the runs :mod:`fifty_agent_sdk.loop` scopes it to:
 "Non-ASCII text (BR-020)", "Error-path final text (BR-021)",
-"Tool-argument nesting (BR-019)" and "Tool-result text (BR-022)"). The two
+"Tool-argument nesting (BR-019)", "Tool-result text (BR-022)" and
+"Model-written text in requests (BR-024)"). The two
 earlier fixtures (``legacy_1_7_0.json``, ``requests_1_8_0.json``) pin request
 bodies only, and none of their scenarios drives the branches FR-003 edits:
 
@@ -43,7 +44,10 @@ tool arguments nest at most 1 level. Nor tool-result text holding a
 surrogate code point before the escape, or a non-string tool result that
 cannot be rendered (BR-022): no scenario's tool-result text holds one, and
 every successful tool result in the scenarios is a non-string value that
-renders as JSON.
+renders as JSON. Nor model-written text the client sends (an assistant
+message's content, a tool call's name, a tool reply's name) holding a
+surrogate code point (BR-024): no scenario's text in those fields holds one
+(BR-024 evidence, P5).
 
 Running ``python -m tests.loop.golden_capture_1_9_0`` from the repo root writes
 ``tests/loop/golden/requests_1_9_0.json``. The fixture in the tree was written

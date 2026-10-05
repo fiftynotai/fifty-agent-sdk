@@ -39,7 +39,8 @@ Legacy path
     and sends the same request bodies (same keys, values and JSON types),
     for the runs :mod:`fifty_agent_sdk.loop` scopes that claim to ("Non-ASCII
     text (BR-020)", "Error-path final text (BR-021)", "Tool-argument
-    nesting (BR-019)" and "Tool-result text (BR-022)").
+    nesting (BR-019)", "Tool-result text (BR-022)" and "Model-written text
+    in requests (BR-024)").
     That includes the half-native combination ``native_tools_enabled=True``
     + a text parser, kept for compatibility.
     ``tool_mode=ToolMode.NATIVE`` is the documented way to close that hole.

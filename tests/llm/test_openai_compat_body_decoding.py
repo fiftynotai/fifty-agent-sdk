@@ -28,7 +28,7 @@ from __future__ import annotations
 
 import json
 import sys
-from typing import Any
+from typing import Any, Literal
 
 import pytest
 from pytest_httpx import HTTPXMock
@@ -64,8 +64,8 @@ def _client(*, api_key: str = "test-key") -> OpenAICompatibleClient:
     return OpenAICompatibleClient(api_key=api_key, base_url=BASE_URL, timeout=5.0, max_retries=0)
 
 
-def _request(content: str = "hi") -> ChatRequest:
-    return ChatRequest(messages=[ChatMessage(role="user", content=content)], model=MODEL)
+def _request(content: str = "hi", *, role: Literal["user", "system"] = "user") -> ChatRequest:
+    return ChatRequest(messages=[ChatMessage(role=role, content=content)], model=MODEL)
 
 
 def _completion(**message: Any) -> dict[str, Any]:  # noqa: ANN401 - free-form test payload
@@ -500,14 +500,22 @@ async def test_complete_text_body_under_a_non_text_charset_still_raises_raw(
 
 @pytest.mark.parametrize("call", ["complete", "stream"])
 @pytest.mark.parametrize(
-    ("api_key", "content", "encoding"),
+    ("api_key", "role", "content", "encoding"),
     [
-        pytest.param("مفتاح", "hi", "ascii", id="non_ascii_api_key"),
-        pytest.param("test-key", "a\ud800b", "utf-8", id="surrogate_in_user_message"),
+        pytest.param("مفتاح", "user", "hi", "ascii", id="non_ascii_api_key"),
+        pytest.param("test-key", "user", "a\ud800b", "utf-8", id="surrogate_in_user_message"),
+        pytest.param(
+            "test-key", "system", "s" + chr(0xD800), "utf-8", id="surrogate_in_system_message"
+        ),
     ],
 )
 async def test_request_encoding_errors_stay_raw_through_the_real_client(
-    httpx_mock: HTTPXMock, call: str, api_key: str, content: str, encoding: str
+    httpx_mock: HTTPXMock,
+    call: str,
+    api_key: str,
+    role: Literal["user", "system"],
+    content: str,
+    encoding: str,
 ) -> None:
     """A request that cannot be encoded raises UnicodeEncodeError raw, with nothing sent (BR-023 D8).
 
@@ -516,16 +524,19 @@ async def test_request_encoding_errors_stay_raw_through_the_real_client(
     header encode, BR-022 probe P7b) and a surrogate code point in a user
     message (the ``openai`` client's strict UTF-8 body encode, BR-022 P1 c1)
     raise in the request step, which keeps only the ``openai`` arms. The
-    surrogate row pins a documented gap (host text), not a decision.
+    surrogate rows pin a documented gap (host text), not a decision.
     Measured on ``openai`` 2.43.0 and 2.54.0 (BR-023 evidence P2 iii).
+    BR-024 escapes only an assistant message's content, a tool call's name
+    and a tool reply's name, so a user or system message is still sent as it
+    is (BR-024 AC-4); BR-024 added the system row (its evidence, P4 c1).
     """
     client = _client(api_key=api_key)
 
     with pytest.raises(UnicodeEncodeError) as exc:
         if call == "complete":
-            await client.complete(_request(content))
+            await client.complete(_request(content, role=role))
         else:
-            async for _ in client.stream(_request(content)):
+            async for _ in client.stream(_request(content, role=role)):
                 pass
 
     assert exc.value.encoding == encoding

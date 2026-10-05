@@ -913,7 +913,9 @@ async def test_json_decode_arm_does_not_wrap_other_value_errors(
     A ``UnicodeEncodeError`` (a ``ValueError``) from encoding the request
     would be reported as a provider body by a ``ValueError`` arm. BR-022
     escapes surrogate code points in the tool-result messages the loop
-    builds and adds no arm here. Since BR-023 ``complete()`` calls the
+    builds and adds no arm here; BR-024 escapes the model-written fields in
+    ``_serialize_message``, before this step, and adds no arm either. Since
+    BR-023 ``complete()`` calls the
     patched ``create`` through ``with_raw_response`` (BR-023 evidence P2 iv),
     and its decode arms wrap only the separate decode step, so the error
     raised here, before any body exists, still escapes raw. The real-client

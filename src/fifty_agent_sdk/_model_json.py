@@ -1,4 +1,4 @@
-"""Text that the SDK writes for a model to read: JSON (BR-020) and tool-result message text (BR-022).
+"""Text the SDK writes for a model to read, and to a log line: JSON (BR-020) and surrogate escapes (BR-022, BR-024).
 
 Routing rule: every ``json.dumps`` whose output reaches a model prompt goes
 through :func:`dumps_for_model`. Since 1.10.2 those are the three call sites
@@ -7,11 +7,18 @@ of a replayed native tool call. JSON that is stored, hashed or used as a key
 (for example the Redis branch metadata in ``state/redis.py``) never goes
 through it and keeps the stdlib defaults, so stored bytes do not change.
 
-:func:`escape_surrogates` (BR-022) runs once on the text of every
-tool-result message the loop builds (``AgentLoop._build_tool_message``), so
-a surrogate code point in it reaches the model as its ``\\udXXX`` escape.
-The same rule holds for it: never use it on text that is stored, hashed or
-used as a key.
+:func:`escape_surrogates` writes each surrogate code point as its
+``\\udXXX`` escape. The loop runs it once on the text of every tool-result
+message it builds (``AgentLoop._build_tool_message``, BR-022), and on the
+model's tool name in its ``tool_invoked`` debug log line (BR-024). The
+shipped client runs it when it serialises a request, on the three fields
+that carry text the model wrote: an assistant message's content, each tool
+call's name and a ``"tool"`` message's name
+(``OpenAICompatibleClient._serialize_message``, BR-024). The BR-024 escapes
+exist only in the request and the log line, so the loop's messages and
+events, and the messages the Runner passes to its state store, keep the
+model's text. The same rule holds for it: never use it on text that is
+stored, hashed or used as a key.
 
 This module is private and carries no semver protection.
 """
@@ -87,14 +94,18 @@ def dumps_for_model(
 
 
 def escape_surrogates(text: str) -> str:
-    """Write each surrogate code point in model-facing text as its ``\\udXXX`` escape (BR-022).
+    """Write each surrogate code point in model-facing or logged text as its ``\\udXXX`` escape (BR-022, BR-024).
 
     UTF-8 can encode every code point except the surrogates, U+D800-U+DFFF.
     A Python ``str`` can still hold them (``json.loads('"\\ud800"')`` or a
     ``surrogateescape`` decode makes one), and the ``openai`` releases BR-022
     measured (2.43.0 and 2.54.0) encode the request body as strict UTF-8, so
     one surrogate code point in a tool-result message made the next request
-    raise ``UnicodeEncodeError`` before it was sent.
+    raise ``UnicodeEncodeError`` before it was sent. BR-024 measured the same
+    for text the model wrote and the SDK sent back (an echoed completion, a
+    tool name), and the shipped client's request serialiser and the loop's
+    ``tool_invoked`` log line call this function too (see the module
+    docstring).
 
     The function tries ``text.encode("utf-8")``, which fails exactly when the
     text holds a surrogate code point. If it succeeds, ``text`` itself is
@@ -117,7 +128,9 @@ def escape_surrogates(text: str) -> str:
     this on text that is stored, hashed or used as a key.
 
     Args:
-        text: The text of a message the SDK is about to send to a model.
+        text: The text of a message, or of a message field such as a tool
+            name, that the SDK is about to send to a model or write to a
+            log line.
 
     Returns:
         ``text`` itself when it encodes as UTF-8, else a copy in which every

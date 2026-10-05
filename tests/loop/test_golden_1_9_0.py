@@ -57,6 +57,10 @@ What this does NOT pin:
   non-string tool result that cannot be rendered (BR-022). No scenario's
   tool-result text holds one, and every successful tool result in the
   scenarios is a non-string value that renders as JSON.
+* Model-written text the client sends (an assistant message's content, a
+  tool call's name, a tool reply's name) holding a surrogate code point
+  (BR-024). No scenario's text in those fields holds one (BR-024 evidence,
+  P5).
 """
 
 from __future__ import annotations

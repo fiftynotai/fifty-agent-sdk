@@ -140,7 +140,18 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   BR-023 adds no scope: apart from runs whose call stack is already near the interpreter's
   recursion limit (see its Not covered item), its new outcomes are runs that end on an
   `LLMError`, which these statements already exclude, and its one change to the request is
-  a header, which is not part of the request bodies they compare. (BR-023)
+  a header, which is not part of the request bodies they compare. (BR-023) Since BR-024 they
+  also hold only for runs in which no text that goes into an assistant message's content, a
+  tool call's name or a `"tool"` message's name holds a surrogate code point. With the
+  shipped client such a run, when a request carried that text (a later one in the run, or
+  the first for an assistant message passed to `run()`), used to end with a raw
+  `UnicodeEncodeError` at that request, or, for a tool name the default renderer writes as it
+  is (one without a space, tab, `=`, a quote or a line break) under structlog's default
+  configuration with a strict UTF-8 stdout, earlier, at the loop's `tool_invoked` debug line
+  (measured on `openai` 2.43.0 and 2.54.0 with CPython 3.14.3, and 2.54.0 with 3.11.15 and
+  3.13.2). It now sends the escape and continues, measured with structlog silenced and under
+  its default configuration (see the BR-024 items). No golden scenario holds such text.
+  (BR-024)
 - Tool-result message text no longer holds a surrogate code point (U+D800-U+DFFF), which
   UTF-8 cannot encode:
   - Each one is written as its six-character `\udXXX` escape, the spelling `json.dumps`
@@ -154,7 +165,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   - A custom `LLMClient` used to receive the code point itself.
   - `ObservationEvent.result` and `ToolFailedEvent.error` still carry the tool's own value
     and text. The `name` field of a `"tool"`-role reply, which is the model's tool name, is
-    not escaped.
+    not escaped by the loop; since BR-024 the shipped client escapes it when it sends the
+    request.
   - A non-string tool result is now rendered once per call; it was rendered twice, so a
     `default=str` conversion (the value's `__str__`) now runs once. The `"tool"` role used
     the first rendering and the `"user"`/`"assistant"` roles the second, so in those two
@@ -185,7 +197,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   returned the same value or raised the same exception as `create()` did for every body
   compared. `stream()` still
   calls `create()`, and its requests do not carry the header. A request that cannot be
-  encoded (a non-ASCII API key, or a message holding a surrogate code point) still raises
+  encoded (a non-ASCII API key, or a surrogate code point in a field the client sends as it
+  is, such as a user or system message; see the BR-024 items) still raises
   `UnicodeEncodeError` unwrapped, with nothing sent (measured on both releases). A test
   double that replaces the private `client._client.chat.completions.create` and returns a
   `ChatCompletion` no longer works: set before the client's first `complete()`, it makes
@@ -238,6 +251,41 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     old type is now in `decode_error`, and the message, which was the exception's text,
     now has the prefix. Measured for 1.10.1 on CPython 3.14.3 with `openai` 2.43.0, and for
     1.10.2 on 3.14.3 with 2.43.0 and on 3.11.15 and 3.13.2 with 2.54.0. (BR-023)
+- `OpenAICompatibleClient` writes each surrogate code point (U+D800-U+DFFF) as its
+  six-character `\udXXX` escape, the spelling `json.dumps` uses, in three fields of the
+  request it sends: an assistant message's content, the name of each tool call an assistant
+  message carries, and a `"tool"` message's name.
+  - The text can come from the model (its completion echoed back, a native tool call's
+    name, a tool name `JsonModeParser` decoded from an escape and sent as the tool reply's
+    name) or from an assistant message passed to `run()`, such as a final answer the Runner
+    stored. The rule follows the role, so a host-supplied assistant message is escaped too.
+  - Every other field is sent as it is (the `arguments` string keeps BR-020's form, escaped
+    in full when a value holds one), and so is a message without a surrogate code point in
+    those three fields. For 16 requests (8 request shapes through `complete()` and
+    `stream()`, among them histories holding Arabic text, an astral emoji, U+007F or the six
+    characters of an escape typed literally, in every role and in a native tool-call turn),
+    the request body bytes were identical before and after BR-024, on `openai` 2.43.0 and
+    2.54.0 with CPython 3.14.3 and 2.54.0 with 3.11.15 and 3.13.2. User and system messages
+    are sent as they are (see Not covered).
+  - `ChatResponse`, events and the messages the Runner passes to its state store still carry
+    the provider's text, and a custom `LLMClient` receives it as before. The escape cannot be
+    told apart from those six characters typed literally.
+  - The loop's `tool_invoked` debug log line writes the tool name with the same escape, so
+    its `name` field shows the six characters where it held the code point (a name the
+    default renderer writes with `repr` shows that escape's backslash doubled; measured).
+    Under structlog's default configuration, which the SDK does not change, the line used to
+    make a strict UTF-8 stdout raise for a name it writes as it is (see Fixed). With a JSON renderer (`structlog.processors.JSONRenderer`)
+    the line did not raise, because the renderer escaped the code point itself; it now
+    escapes the escape's backslash again, so a reader that decodes the line gets the six
+    characters, not the code point (both measured). No other log call passes text the model
+    wrote as a top-level value (by reading every logging call in the package).
+    `ConsoleAuditSink` logs the Runner's audit `payload`, a dict that holds the model's tool
+    name; the default renderer writes a dict with `repr`, which escapes the code point, and
+    that line did not raise (measured).
+  - Building a request now checks each of those fields with one UTF-8 encode (two, and a
+    decode, when it holds a surrogate code point). For 52 messages holding 260,000 Arabic
+    characters in assistant turns, building the request body took about 0.3-0.45 ms instead
+    of about 0.05 ms (CPython 3.11.15, 3.13.2 and 3.14.3 on one machine, best of 7). (BR-024)
 
 ### Fixed
 - JSON that the SDK writes for the model now carries non-ASCII text as literal UTF-8
@@ -361,9 +409,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `MCPClient`'s result. In-process tools and other `Tool` implementations can return
   such values.
 - Not covered:
-  - A surrogate code point in text the loop does not build, such as the model's own
-    completion or tool names echoed back (open as BR-024), or a message passed to `run()`,
-    still makes the shipped client raise `UnicodeEncodeError` raw (measured).
+  - A surrogate code point in a user or system message passed to `run()` still makes the
+    shipped client raise `UnicodeEncodeError` raw (measured). The model's own completion and
+    tool names echoed back did too before BR-024 (see its items).
   - A tool whose exception's own `__str__` raises still escapes `AgentLoop.run()` from
     `Registry.invoke` (measured).
   - Serialising an event that carries such a value with pydantic, as a consumer may,
@@ -454,6 +502,62 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   - A custom `LLMClient` decodes its own responses.
 
   No public API changes. (BR-023)
+
+- Text the model wrote, or an assistant message passed to `run()`, holding a surrogate code
+  point made the request that carried it raise `UnicodeEncodeError` out of
+  `AgentLoop.run()`, with no `ErrorEvent` or `FinalEvent`, with the shipped client on
+  `openai` 2.43.0 and 2.54.0 (CPython 3.14.3) and 2.54.0 (CPython 3.11.15 and 3.13.2), which
+  encode the request body as strict UTF-8. For a tool name, under structlog's default
+  configuration it raised earlier, before that request, from the loop's `tool_invoked` debug
+  line, which printed the name to stdout as it was unless it held a space, tab, `=`, a quote
+  or a line break (those the default renderer writes with `repr`, so the run raised at the
+  request instead; measured with structlog 26.1.0 for each of them). The earlier raise was
+  measured for U+D800 with stdout a file under a UTF-8 locale and under the C locale, and a
+  TTY for a native call, a native batch and the `JsonModeParser` case below; under the C
+  locale `surrogateescape` wrote a name holding U+DC80 as a raw byte, so that run raised at
+  the request instead. Measured before BR-024:
+  - a JSON-mode completion holding one, echoed back on a tool step (streamed or not, and
+    without `tool_mode`), a parser retry or a require-tool re-ask (each streamed or not), and
+    a PROSE completion echoed back on a tool step, a parser retry or a require-tool re-ask;
+  - a native tool call whose name holds one (one call, the second of two, or with
+    `SafetyConfig(native_tools_enabled=True)` and no `tool_mode`), or a native tool turn
+    whose content holds one;
+  - without `tool_mode` and with the default `tool_message_role`, a JSON-mode tool name
+    written as the six-character escape, which `JsonModeParser` decodes into a surrogate code
+    point that goes out as the tool reply's name;
+  - an assistant message passed to `run()` holding one, such as a NATIVE final answer that
+    `AgentRunner` stored in `MemoryStateStore` and replays on the next turn (raised at that
+    turn's first request, with nothing sent).
+- Each now sends the request with the escape, and the run continues (see Changed), on the
+  same releases and interpreters: measured with structlog silenced, under its default
+  configuration with stdout a file (every case above), and with stdout a TTY (a native call,
+  a native batch and the `JsonModeParser` case).
+- Not covered:
+  - User and system messages are sent as they are: a surrogate code point in one passed to
+    `run()` still raises `UnicodeEncodeError` with nothing sent. So does one in a `"tool"`
+    message's content passed to `run()`, in the `name` of a user, assistant or system
+    message, in the system prompt (`PromptSections.persona`) or in a tool's description
+    (measured; the description in `ToolMode.JSON` and `ToolMode.NATIVE`). `SafetyConfig`
+    refuses one in `parser_retry_reminder` or `tool_required_reminder` with a pydantic
+    `ValidationError` when it is built (measured).
+  - A character outside the Basic Multilingual Plane whose two surrogate halves arrive in
+    two stream chunks, each as a JSON escape, now completes where it raised, but stays two
+    surrogate code points: the events carry both, as before, and the request carries two
+    six-character escapes, not the character (measured for an emoji in a streamed JSON-mode
+    tool turn).
+  - Events, `ChatResponse` and the messages the Runner passes to its state store keep the
+    provider's text. `model_dump_json()` of an event holding one (`ThoughtEvent`,
+    `ActionEvent`, `ToolStartedEvent`, `ToolFailedEvent`, `FinalEvent`) raises
+    `PydanticSerializationError`; `model_dump(mode="json")` returns. When `AgentRunner`
+    persists a final answer holding one, `SqlStateStore` (SQLite through aiosqlite) raises
+    `UnicodeEncodeError` and `RedisStateStore` (fakeredis) `PydanticSerializationError`, out
+    of `AgentRunner.run()` after the `FinalEvent`, not as `StateStoreError`, and the answer
+    is not stored; `MemoryStateStore` stores it (measured, pydantic 2.13.4 and 2.13.5).
+  - A custom `LLMClient` encodes its own requests.
+  - Other `openai` releases, and CPython 3.12, were not measured. Log output was measured
+    with structlog 26.1.0, under its default configuration and with a JSON renderer only.
+
+  No public API changes. (BR-024)
 
 ## [1.10.1] - 2026-09-28
 

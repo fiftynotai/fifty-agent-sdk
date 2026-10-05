@@ -25,6 +25,9 @@ nest at most 1 level. Nor tool-result text holding a surrogate code point
 before the escape, or a non-string tool result that cannot be rendered
 (BR-022): no scenario's tool-result text holds one, and every successful
 tool result in the scenarios is a non-string value that renders as JSON.
+Nor model-written text the client sends (an assistant message's content, a
+tool call's name, a tool reply's name) holding a surrogate code point
+(BR-024): no scenario's text in those fields holds one (BR-024 evidence, P5).
 
 Running ``python -m tests.loop.golden_capture`` from the repo root writes
 ``tests/loop/golden/legacy_1_7_0.json``. The fixture in the tree was written

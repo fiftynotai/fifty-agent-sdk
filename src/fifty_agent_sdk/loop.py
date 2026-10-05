@@ -108,7 +108,8 @@ Tool-result text (BR-022)
     written as its six-character ``\\udXXX`` escape
     (:func:`fifty_agent_sdk._model_json.escape_surrogates`), whatever
     produced the text: a string result, an ``is_error`` text, an
-    ``after_tool`` note, a denial reason or the ``repr`` fallback. A
+    ``after_tool`` note, a denial reason or the ``repr`` fallback. The model
+    cannot tell that escape from the same six characters typed. A
     non-string result that ``json.dumps`` cannot render because it nests
     too deeply, or whose ``repr`` fallback raises, is sent as a fixed
     sentence, a WARNING ``tool_output_not_rendered`` is logged, and the run
@@ -135,9 +136,49 @@ Tool-result text (BR-022)
     ``"user"`` and ``"assistant"`` roles show its first text where they
     showed its second. No golden scenario's tool-result text held a
     surrogate code point before the escape, and every successful tool
-    result in them renders as JSON. Text the loop does not build (the
-    model's own completion and tool names, messages passed to ``run()``)
-    is not escaped.
+    result in them renders as JSON. The loop passes text it does not build
+    to the ``LLMClient`` as it is (the model's own completion, its tool
+    names in an assistant turn or a tool reply's ``name``, messages passed
+    to ``run()``); a tool name the loop quotes in tool-result text is
+    escaped with that text, and so is the name in its ``tool_invoked``
+    debug log line. The shipped client escapes the fields the model writes
+    when it sends them (see "Model-written text in requests (BR-024)").
+
+Model-written text in requests (BR-024)
+    Since 1.10.2 the shipped
+    :class:`~fifty_agent_sdk.llm.openai_compat.OpenAICompatibleClient`
+    writes each surrogate code point in an assistant message's content, a
+    tool call's name and a ``"tool"`` message's name as its ``\\udXXX``
+    escape when it sends a request. That text comes from the model (a
+    completion echoed back on a tool step, a parser retry or a require-tool
+    re-ask; a native tool call's name or its turn's content; a tool name
+    :class:`~fifty_agent_sdk.parser.json_mode.JsonModeParser` decoded from
+    an escape and sent as the tool reply's name) or from an assistant
+    message passed to :meth:`AgentLoop.run`, such as a final answer the
+    Runner stored. Before, the request carrying it was not sent and
+    ``run()`` ended with a raw ``UnicodeEncodeError`` and no ``ErrorEvent``
+    or ``FinalEvent`` (BR-024 probe P4, ``openai`` 2.43.0 and 2.54.0 on
+    CPython 3.14.3, 2.54.0 on 3.11.15 and 3.13.2, structlog silenced). The
+    ``tool_invoked`` debug log line writes the model's tool name with the
+    same escape: under structlog's default configuration, which prints to
+    stdout, a strict UTF-8 stdout (a file or a TTY under a UTF-8 locale)
+    made that line raise ``UnicodeEncodeError`` first, before the request,
+    unless the name held a space, tab, ``=``, a quote or a line break, which
+    the default renderer writes with ``repr`` (BR-024 evidence, rounds 2 and
+    3); with a JSON renderer the line now shows the
+    escape's backslash escaped again. Otherwise the escape exists only in
+    the request, and the model cannot tell it from the same six characters
+    typed: the messages the loop builds, its events and the messages the
+    Runner passes to its state store keep the model's text, and a custom
+    ``LLMClient`` receives it as before. User and system messages
+    are sent as they are. The release-equivalence statements in
+    this module (above, in :class:`AgentLoop`'s Args and in its
+    ``__init__`` comments), and the matching ones in
+    :mod:`fifty_agent_sdk.tool_mode` and :mod:`fifty_agent_sdk.interventions`,
+    are claimed only for runs in which no text that goes into an assistant
+    message's content, a tool call's name or a ``"tool"`` message's name
+    holds a surrogate code point. No golden scenario holds such text
+    (BR-024 probe P5).
 
 Statelessness
     Every :meth:`AgentLoop.run` call is its own scoped iteration. The
@@ -1365,9 +1406,12 @@ class AgentLoop:
                     if call_denial is not None:
                         _log.debug("tool_denied", call_id=cid, run_id=run_id)
                     else:
+                        # BR-024: the model's tool name, escaped as on the wire, so a
+                        # surrogate code point cannot make a strict UTF-8 log stream
+                        # (structlog's default configuration prints to stdout) raise.
                         _log.debug(
                             "tool_invoked",
-                            name=tc.name,
+                            name=escape_surrogates(tc.name),
                             call_id=cid,
                             run_id=run_id,
                         )
@@ -1716,9 +1760,10 @@ class AgentLoop:
                     )
                 )
                 continue
+            # BR-024: escaped as on the wire (see the batch path above).
             _log.debug(
                 "tool_invoked",
-                name=tool_name,
+                name=escape_surrogates(tool_name),
                 call_id=call_id,
                 run_id=run_id,
             )
@@ -1908,7 +1953,9 @@ class AgentLoop:
         with each surrogate code point (U+D800-U+DFFF) written as its
         six-character ``\\udXXX`` escape. Content without one is unchanged.
         The model-facing message is the only thing that changes: events keep
-        the tool's own text.
+        the tool's own text. The ``name`` field of the ``"tool"``-role
+        message is the model's tool name and is not escaped here; the shipped
+        client escapes it when it sends the request (BR-024).
 
         Args:
             tool_name: The name of the tool that was invoked (only used in

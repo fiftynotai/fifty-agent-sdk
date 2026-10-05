@@ -88,10 +88,11 @@ Provider bodies and context-window errors (BR-021, BR-023)
     ``ValueError`` and ``RecursionError`` become provider-body errors. An
     error while encoding the request propagates unchanged, with nothing
     sent: ``UnicodeEncodeError`` for a non-ASCII API key (``httpx`` encodes
-    headers as ASCII) or for a surrogate code point in a message (the
-    ``openai`` client encodes the body as strict UTF-8; for the model's own
-    text echoed back this is open as BR-024). In that mode the ``openai``
-    client adds the header ``X-Stainless-Raw-Response: true`` to each
+    headers as ASCII) or for a surrogate code point in a field the adapter
+    sends as it is, such as a user or system message (the ``openai`` client
+    encodes the body as strict UTF-8; the fields the model writes are escaped
+    first, see "Model-written text in requests (BR-024)"). In that mode the
+    ``openai`` client adds the header ``X-Stainless-Raw-Response: true`` to each
     non-streamed request. BR-023's probe P2 compared requests with and
     without it on ``openai`` 2.43.0 and 2.54.0: every other header had the
     same value, the header order differed (the new header comes before
@@ -225,6 +226,30 @@ Tool-call arguments (BR-019)
     and re-encoding them for the next request could raise a raw
     :class:`RecursionError`; past ``json.loads``'s own limit, the decode
     itself raised it, out of ``complete()``.
+
+Model-written text in requests (BR-024)
+    When it builds a request, the adapter writes each surrogate code point
+    (U+D800-U+DFFF) as its six-character ``\\udXXX`` escape
+    (:func:`fifty_agent_sdk._model_json.escape_surrogates`) in three fields:
+    an assistant message's ``content``, the ``name`` of each tool call an
+    assistant message carries, and a ``"tool"`` message's ``name``. UTF-8
+    cannot encode those code points, and the ``openai`` releases measured
+    (2.43.0 and 2.54.0 on CPython 3.14.3, 2.54.0 on 3.11.15 and 3.13.2;
+    BR-024 probe P4) encode the request body as strict UTF-8, so before
+    BR-024 such a request was not sent: ``UnicodeEncodeError`` propagated
+    out of ``complete()`` and ``stream()``. The rule follows the message's
+    role, not where the text came from, so an assistant message the caller
+    passes in is escaped too. A message without a surrogate code point in
+    those fields serialises to the same dict as before, keys in the same
+    order. Every other field is sent as it is (the ``arguments`` string
+    keeps BR-020's form, escaped in full when a value holds one): a
+    surrogate code point in a user or system message, in a ``"tool"``
+    message's content, or in the ``name`` of a user, assistant or system
+    message still raises ``UnicodeEncodeError`` with nothing sent (BR-024
+    probe P4). The returned
+    :class:`ChatResponse` and the caller's messages are not changed; the
+    escape exists only in the request, and the model cannot tell it from
+    the same six characters typed.
 """
 
 from __future__ import annotations
@@ -245,7 +270,7 @@ from openai import (
 )
 
 from fifty_agent_sdk._json_depth import MAX_TOOL_ARGS_DEPTH, json_nesting_exceeds
-from fifty_agent_sdk._model_json import dumps_for_model
+from fifty_agent_sdk._model_json import dumps_for_model, escape_surrogates
 from fifty_agent_sdk.errors import LLMError
 from fifty_agent_sdk.llm.types import (
     ChatMessage,
@@ -576,8 +601,11 @@ class OpenAICompatibleClient:
                 docstring).
             UnicodeEncodeError: Not wrapped. The request could not be
                 encoded, and nothing was sent: a non-ASCII ``api_key``, or a
-                message holding a surrogate code point (BR-023 probe P2,
-                ``openai`` 2.43.0 and 2.54.0; see the module docstring).
+                surrogate code point in a field the adapter sends as it is,
+                such as a user or system message (BR-023 probe P2 and
+                BR-024 probe P4, ``openai`` 2.43.0 and 2.54.0). The fields
+                the model writes are escaped since BR-024; see the module
+                docstring.
         """
         model = request.model or self._default_model
         if not model:
@@ -592,10 +620,11 @@ class OpenAICompatibleClient:
             # `with_raw_response` makes the openai client return the response
             # without decoding its body. Only the four openai arms below cover
             # it, never `ValueError`: encoding raises `UnicodeEncodeError` (a
-            # ValueError) for a surrogate code point in a message the loop did
-            # not build (open for the model's echoed text as BR-024), and httpx
-            # raises it for a non-ASCII API key, and neither is a provider body
-            # (BR-021 D9; BR-022 added no arm).
+            # ValueError) for a surrogate code point in a field
+            # `_serialize_message` sends as it is (a user or system message;
+            # BR-024 escapes the model-written fields before this step), and
+            # httpx raises it for a non-ASCII API key, and neither is a
+            # provider body (BR-021 D9; BR-022 and BR-024 added no arm).
             raw_response = await self._client.chat.completions.with_raw_response.create(**body)
             # The decode step (`parse()`) decodes the provider's bytes and
             # builds the openai model from them; it encodes nothing, so a
@@ -838,9 +867,11 @@ class OpenAICompatibleClient:
             # such as `'abc'` from `int()`). The iterator's
             # other decode failures are typed by the inner arm above (BR-023).
             # Encoding the request happens in the `create()` call above,
-            # outside this `try`: a surrogate code point in a message raises
-            # `UnicodeEncodeError` raw there (measured for BR-022 on openai
-            # 2.43.0 and 2.54.0).
+            # outside this `try`: a surrogate code point in a field
+            # `_serialize_message` sends as it is (a user or system message)
+            # raises `UnicodeEncodeError` raw there (measured for BR-022 on
+            # openai 2.43.0 and 2.54.0; pinned for user and system messages by
+            # test_request_encoding_errors_stay_raw_through_the_real_client).
             raise _provider_body_error(
                 e.doc,
                 model=model,
@@ -864,7 +895,8 @@ class OpenAICompatibleClient:
 
         For every message EXCEPT an assistant turn carrying native
         ``tool_calls``, this is byte-for-byte ``msg.model_dump(exclude_none=True)``
-        (the pre-BR-008 behavior). For an assistant turn carrying
+        (the pre-BR-008 behavior), apart from the surrogate escape described
+        below (BR-024). For an assistant turn carrying
         ``tool_calls`` (only set when native function-calling is on), the
         message is translated into the OpenAI envelope:
 
@@ -888,13 +920,32 @@ class OpenAICompatibleClient:
         string keeps non-ASCII text literal rather than as ``\\uXXXX``
         escapes (a value holding a surrogate code point keeps the escaped
         form; :func:`fifty_agent_sdk._model_json.dumps_for_model`, BR-020);
-        it decodes to the same value the 1.10.1 string did. Only
-        ``arguments`` changed: the ``id`` expression above is untouched.
+        it decodes to the same value the 1.10.1 string did. BR-020 changed
+        only ``arguments``: the ``id`` expression above is untouched.
 
         Flag-OFF proof: ``ChatMessage.tool_calls`` defaults to ``None`` and is
         only populated on a native turn (which requires
         ``native_tools_enabled=True`` to even reach the provider), so every
-        flag-OFF message takes the ``else`` branch — identical to today.
+        flag-OFF message takes the ``model_dump`` branch — identical to the
+        pre-BR-008 form apart from the surrogate escape described next.
+
+        BR-024: three fields carry text the model writes, and each surrogate
+        code point (U+D800-U+DFFF) in them is written as its six-character
+        ``\\udXXX`` escape (:func:`fifty_agent_sdk._model_json.escape_surrogates`):
+        an assistant message's ``content`` (in the envelope and in the
+        ``model_dump`` branch), each ``tool_calls[].function.name``, and a
+        ``"tool"`` message's ``name``. The rule follows the role, not where
+        the text came from: an assistant message the host passes in (history,
+        a few-shot example, a turn the Runner stored) is escaped too. User and
+        system messages, a ``"tool"`` message's ``content`` (the loop escapes
+        the content it builds, BR-022), every other ``name`` and the ids are
+        left as they are, and ``arguments`` keeps the form described above.
+        The escape is not reversible: the model cannot tell it from the same
+        six characters typed. ``escape_surrogates`` returns its argument itself
+        when the text holds no surrogate code point, and the ``model_dump``
+        branch re-assigns the existing key, so a message without a surrogate
+        code point in those fields serialises to the same dict, keys in the
+        same order.
         """
         if msg.role == "assistant" and msg.tool_calls:
             tool_calls_envelope = [
@@ -902,7 +953,7 @@ class OpenAICompatibleClient:
                     "id": tc.id if tc.id is not None else msg.tool_call_id,
                     "type": "function",
                     "function": {
-                        "name": tc.name,
+                        "name": escape_surrogates(tc.name),
                         "arguments": dumps_for_model(tc.args),
                     },
                 }
@@ -910,10 +961,16 @@ class OpenAICompatibleClient:
             ]
             return {
                 "role": "assistant",
-                "content": msg.content,
+                "content": escape_surrogates(msg.content),
                 "tool_calls": tool_calls_envelope,
             }
-        return msg.model_dump(exclude_none=True)
+        dumped = msg.model_dump(exclude_none=True)
+        # BR-024: re-assign the existing key, so the key order is unchanged.
+        if msg.role == "assistant":
+            dumped["content"] = escape_surrogates(msg.content)
+        elif msg.role == "tool" and msg.name is not None:
+            dumped["name"] = escape_surrogates(msg.name)
+        return dumped
 
     def _max_tokens_key(self, model: str) -> _MaxTokensParam:
         """Resolve the body key for ``max_tokens`` (see ``max_tokens_param``)."""
