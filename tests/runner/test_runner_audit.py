@@ -21,6 +21,10 @@ Covers BR-011's Runner-integration surface:
   ``AgentRunner.run()``, with or without an audit sink; I2 drives a real value
   nested past the limits the running interpreter measures. A ``BaseException``
   that is not an ``Exception`` still propagates from the summary.
+* BR-027: through a real :class:`ConsoleAuditSink`, under structlog's
+  default processors (JSON renderer) and under a ``TimeStamper(fmt="iso")``
+  chain, each of a one-tool run's three ``audit.event`` lines carries its
+  event's own time under ``event_timestamp`` (A2).
 """
 
 from __future__ import annotations
@@ -37,6 +41,7 @@ from fifty_agent_sdk import (
     ActionEvent,
     AuditEvent,
     AuditSink,
+    ConsoleAuditSink,
     FinalEvent,
     Registry,
     SafetyConfig,
@@ -53,6 +58,7 @@ from tests.loop.conftest import (
     measured_unrenderable_depth,
 )
 from tests.runner.conftest import collect, final_json, make_runner, tool_json
+from tests.structlog_chains import CHAINS, audit_json_lines, configured_structlog
 
 # ---------------------------------------------------------------------------
 # Test doubles
@@ -842,3 +848,59 @@ async def test_iteration_cap_error_is_audited() -> None:
     error_event = spy.events[-1]
     assert error_event.payload["error_type"] == "MaxIterationsExceeded"
     assert all(e.event_type != "final_answer" for e in spy.events)
+
+
+# ---------------------------------------------------------------------------
+# BR-027: ConsoleAuditSink's lines under a host's TimeStamper
+# ---------------------------------------------------------------------------
+
+
+class _ConsoleTee:
+    """Records each event, then logs it through a real :class:`ConsoleAuditSink`."""
+
+    def __init__(self) -> None:
+        self.events: list[AuditEvent] = []
+        self._sink = ConsoleAuditSink()
+
+    async def record(self, event: AuditEvent) -> None:
+        self.events.append(event)
+        await self._sink.record(event)
+
+
+@pytest.mark.parametrize("chain", ["default_processors_json", "timestamper_iso"])
+async def test_console_audit_lines_carry_each_event_time_under_a_timestamper(chain: str) -> None:
+    """A2: every ``audit.event`` line of a run carries its own event's time as ``event_timestamp`` (BR-027).
+
+    The chains are structlog's default processors with a JSON renderer and
+    ``[add_log_level, TimeStamper(fmt="iso"), JSONRenderer()]``. Before BR-027
+    each of the run's three lines logged its event's time as ``timestamp``,
+    where the ``TimeStamper`` then wrote the log time (BR-027 evidence, P2
+    row j). Each line's ``timestamp`` is now the log time, whose format
+    differs from the event's ``isoformat()`` (a space or a ``Z``, never
+    ``+00:00``).
+    """
+    tool = FakeTool("search", result=ToolResult(output={"x": 1}))
+    registry = Registry()
+    registry.register(tool)
+    llm = FakeLLMClient(
+        replies=[
+            make_response(tool_json("look up", "search", {"q": "weather"})),
+            make_response(final_json("got it")),
+        ]
+    )
+    tee = _ConsoleTee()
+    runner, _store = make_runner(llm=llm, registry=registry, audit=tee)
+
+    with configured_structlog(CHAINS[chain]) as buffer:
+        await collect(runner.run("s1", "Hi"))
+
+    lines = audit_json_lines(buffer)
+    assert [event.event_type for event in tee.events] == [
+        "session_start",
+        "tool_invocation",
+        "final_answer",
+    ]
+    assert [(line["event_type"], line["event_timestamp"]) for line in lines] == [
+        (event.event_type, event.timestamp.isoformat()) for event in tee.events
+    ]
+    assert all(line["timestamp"] != line["event_timestamp"] for line in lines)

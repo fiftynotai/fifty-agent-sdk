@@ -162,7 +162,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `ToolMode.PROSE` and `before_tool` cases, on 1.7.0, 1.8.0 and 1.9.0 with CPython 3.14.3
   and `openai` 2.43.0), and now continues. The renamed log keys (see Changed) are not part
   of what these statements compare: the golden tests capture no log lines, and no golden
-  scenario routes structlog through stdlib (by reading). (BR-026)
+  scenario routes structlog through stdlib (by reading). (BR-026) BR-027 adds no scope (by
+  reading): it changes SDK code only in `audit/console.py`, no golden scenario uses
+  `AgentRunner` or an audit sink, and these statements compare request bodies and, in some,
+  the system prompt or the event stream, not log lines. (BR-027)
 - Tool-result message text no longer holds a surrogate code point (U+D800-U+DFFF), which
   UTF-8 cannot encode:
   - Each one is written as its six-character `\udXXX` escape, the spelling `json.dumps`
@@ -327,6 +330,48 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   loggers (one imported, or received as a parameter) when that logger is used without a
   logging-style call, for example through `getattr` or a stored method, or code it cannot
   parse, such as `eval`. Before this change it reported these five calls. (BR-026)
+- `ConsoleAuditSink`'s `audit.event` line logs the audit event's time under
+  `event_timestamp`, not `timestamp`, because `timestamp` is the key structlog's
+  `TimeStamper` processor writes by default (see Fixed). The value is unchanged
+  (`AuditEvent.timestamp` as an ISO-8601 string), and so are the line's other keys
+  (`session_id`, `user_id`, `event_type`, `payload`), its event name, its level and its
+  logger name (`fifty_agent_sdk.audit`). What the line's `timestamp` and `event_timestamp`
+  hold, by host configuration, measured with structlog 26.1.0 and 24.1.0 on CPython
+  3.11.15, 3.13.2 and 3.14.3 (`render_to_log_args_and_kwargs` with 26.1.0 only: 24.1.0 has
+  none):
+
+  | Host configuration | `timestamp` before | `timestamp` now | `event_timestamp` now |
+  |---|---|---|---|
+  | structlog's default configuration, which the SDK does not change; `structlog.stdlib.recreate_defaults()`; a `TimeStamper` at its default key (measured: `fmt="iso"` and the default `fmt` with `JSONRenderer`, the default processors with `JSONRenderer`, and `fmt="iso"` ahead of `render_to_log_kwargs`, `render_to_log_args_and_kwargs` or `ProcessorFormatter.wrap_for_formatter`) | the log time | the log time | the event's time |
+  | `structlog.processors.MaybeTimeStamper`, which adds a time only when the event has none | the event's time | the log time | the event's time |
+  | no processor that writes `timestamp` or `event_timestamp` (measured: `structlog.testing.capture_logs()`, and a `TimeStamper` with `key="ts"`) | the event's time | absent | the event's time |
+  | a `TimeStamper` with `key="event_timestamp"` (structlog 26.1.0) | the event's time | absent | the log time |
+
+  Under the default configuration, and under `recreate_defaults()`, the renderer
+  (`ConsoleRenderer`) writes `timestamp` as the line's first column, without its key name.
+  A query, alert or parser that reads the event's time from `timestamp` on this line needs
+  `event_timestamp`. `AuditEvent`, `SqlAuditSink` (its `timestamp` column included) and
+  the `AuditSink` protocol are unchanged. The test BR-026 added now also fails on a logging
+  call that passes one of these 28 keys, which structlog 26.1.0's own processors, renderers
+  or logger methods write into the event, remove from it or read with a meaning of their
+  own, under their default names (by reading structlog 26.1.0; the test also runs 18 probes
+  of these writers on the installed structlog, and fails if a probe touches a key outside
+  the set or, on structlog 26.1.0, if the probes leave a key in the set untouched): `event`
+  (the logger methods, `EventRenamer`, `ConsoleRenderer`); `timestamp` (`TimeStamper`,
+  `MaybeTimeStamper`); `level` (`add_log_level`); `level_number` (`add_log_level_number`);
+  `logger` (`add_logger_name`); `logger_name` (a `ConsoleRenderer` column); `exception`,
+  `exc_info`, `stack` and `stack_info` (`format_exc_info`, `set_exc_info`, the loggers'
+  `exception()`, `StackInfoRenderer`); `stacklevel` and `positional_args` (`render_to_log_kwargs`,
+  `render_to_log_args_and_kwargs`, the stdlib `BoundLogger`, `PositionalArgumentsFormatter`);
+  `log_level` (`capture_logs`); `_record`, `_from_structlog`, `_logger` and `_name`
+  (`ProcessorFormatter`, `ExtraAdder`); and the eleven `CallsiteParameterAdder` keys
+  (`pathname`, `filename`, `module`, `qual_module`, `func_name`, `qual_name`, `lineno`,
+  `thread`, `thread_name`, `process`, `process_name`). For both of its key sets the test
+  now also reads the keyword arguments of a call whose name ends in `get_logger` or
+  `wrap_logger` (for `wrap_logger`, apart from its own parameters), because structlog binds
+  the other keyword arguments as values on every line that logger writes (by reading); the
+  package's 11 such calls pass only a name. Before this change the processor-key check
+  reported this one call. (BR-027)
 
 ### Fixed
 - JSON that the SDK writes for the model now carries non-ASCII text as literal UTF-8
@@ -768,6 +813,58 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     other than 24.1.0 and 26.1.0 were not measured.
 
   No public API changes; the renamed log keys are listed under Changed. (BR-026)
+
+- `ConsoleAuditSink` lost the audit event's time under structlog's default configuration
+  and with `structlog.processors.TimeStamper` at its default key in the processor chain.
+  The sink logged the time as `timestamp`; the `TimeStamper`, which runs after the log call
+  has built the event and writes its key whatever the key holds (by reading structlog
+  26.1.0), wrote the log time there, so the line carried the log time instead, with no
+  error. structlog's default configuration, which the SDK does not change, includes a
+  `TimeStamper` with `fmt="%Y-%m-%d %H:%M:%S"` and `utc=False` (measured on structlog 24.1.0
+  and 26.1.0), so a host that never configures structlog got the log time in local time,
+  to the second and with no zone, as the line's first column. Measured before BR-027 with
+  structlog 26.1.0 and 24.1.0 on CPython 3.11.15, 3.13.2 and 3.14.3, for an `AuditEvent`
+  stamped 2000-01-02 03:04:05 UTC:
+  - under the default configuration, and under `structlog.stdlib.recreate_defaults()`,
+    which reuses the same `TimeStamper`, the event's time appeared nowhere on the line;
+  - with the default processors and `JSONRenderer`, with `TimeStamper(fmt="iso")`, with
+    `TimeStamper()` (a UNIX time), and with `render_to_log_kwargs`,
+    `render_to_log_args_and_kwargs` (26.1.0 only) or `ProcessorFormatter.wrap_for_formatter`
+    after a `TimeStamper(fmt="iso")`, `timestamp` held the log time and the event's time
+    appeared nowhere;
+  - in an `AgentRunner` run with one tool call and an audit sink that passes each event to
+    `ConsoleAuditSink`, none of the three audit lines showed its event's time, under the
+    default configuration, under its processors with `JSONRenderer` and under
+    `TimeStamper(fmt="iso")`;
+  - with `structlog.processors.MaybeTimeStamper`, with `TimeStamper(fmt="iso", key="ts")`,
+    and under `structlog.testing.capture_logs()`, the line kept the event's time under
+    `timestamp`.
+
+  1.10.1 gave the same results, the stdlib recipes included, with structlog 26.1.0 and
+  24.1.0 on CPython 3.14.3 and 3.11.15 (`render_to_log_args_and_kwargs` on 26.1.0 only).
+  The line has logged the time as `timestamp` since `ConsoleAuditSink` was added: the
+  keyword is in the commit that added the sink and at every release tag from v1.1.0 to
+  v1.10.1 (the repository has no v1.0.0 tag). It now
+  carries the event's time under `event_timestamp` in each of these configurations,
+  measured the same way.
+- Not covered:
+  - The key check (see Changed) reads structlog's keys under their default names, so a name
+    a host chooses is not checked (`TimeStamper(key=...)`, `MaybeTimeStamper(key=...)`,
+    `EventRenamer(to=..., replace_by=...)`,
+    `ConsoleRenderer(timestamp_key=..., event_key=...)`). With
+    `TimeStamper(key="event_timestamp")` the line now loses the event's time, where before
+    it kept it under `timestamp` (measured with structlog 26.1.0 on the three interpreters).
+  - `structlog.stdlib.ExtraAdder`, without an `allow` list, copies into the event every
+    attribute of a stdlib record that a fresh record lacks (by reading): the host's own
+    `extra` keys, `_logger` and `_name` (in the check's set), and `message` and `asctime`
+    once an earlier formatter has set them (measured; both are keys BR-026's check already
+    refuses).
+  - Processors a host writes, processors from other packages, and `structlog.twisted` are
+    not checked.
+  - structlog releases other than 24.1.0 and 26.1.0 were not measured, and CPython 3.12
+    runs in CI but was not measured for this item.
+
+  No public API changes; the renamed log key is listed under Changed. (BR-027)
 
 ## [1.10.1] - 2026-09-28
 

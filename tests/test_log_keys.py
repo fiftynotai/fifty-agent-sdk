@@ -1,4 +1,4 @@
-"""No logging call in the package passes a key stdlib ``logging`` refuses as ``extra`` (BR-026, AC-1).
+"""No logging call in the package passes a key stdlib ``logging`` refuses as ``extra`` (BR-026, AC-1) or a :data:`PROCESSOR_OWNED` key (BR-027, AC-2).
 
 When a host routes structlog through stdlib ``logging`` with
 ``structlog.stdlib.render_to_log_kwargs`` or
@@ -18,9 +18,9 @@ can replace), plus ``message`` and ``asctime``, which ``makeRecord``
 refuses by name, plus :data:`_ADDED_IN_LATER_PYTHONS`. CPython 3.12 added
 ``LogRecord.taskName``: measured, CPython 3.11.15 sets 20 attributes and
 accepts ``extra={"taskName": ...}``, while 3.13.2 and 3.14.3 set 21 and
-refuse it (P0). The union refuses ``taskName`` on every interpreter, so
-CI's 3.11 job fails on a key that would raise on a 3.12 or later host
-(K6). ``exc_info`` and ``stack_info`` stay in the set although both
+refuse it (BR-026 evidence, P0). The union refuses ``taskName`` on
+every interpreter, so CI's 3.11 job fails on a key that would raise on a
+3.12 or later host (K6). ``exc_info`` and ``stack_info`` stay in the set although both
 recipes pass them to stdlib as arguments, not ``extra``: a recipe written
 by hand could put them in ``extra``, and no SDK call passes them (the
 sweep does not see the ``exc_info`` that structlog's ``exception()`` adds
@@ -38,9 +38,22 @@ a fixpoint, so ``log = _log.bind(...)`` and ``log2 = _log`` count). A
 (``debug``, ``info``, ``warning``, ``warn``, ``error``, ``exception``,
 ``critical``, ``fatal``, ``msg``, ``log`` and their ``a``-prefixed async
 forms), ``bind`` or ``new`` on a receiver or on a chain that builds one,
-or a call ending in ``bind_contextvars`` or ``bound_contextvars``. Its keys
-are the keyword names wherever they sit in a multi-line call, and the
-string keys of a ``**{...}`` literal. It fails closed: a ``**`` of
+a call ending in ``bind_contextvars`` or ``bound_contextvars``, or (since
+BR-027) a call ending in ``get_logger`` or ``wrap_logger`` that passes
+keyword arguments. Its keys are the keyword names wherever they sit in a
+multi-line call, and the string keys of a ``**{...}`` literal. A
+``wrap_logger`` call's own parameters (``logger``, ``processors``,
+``wrapper_class``, ``context_class``, ``cache_logger_on_first_use``,
+``logger_factory_args``) are left out: structlog binds its other keywords
+as initial values on every line the logger writes (by reading structlog
+26.1.0 ``_config.py``). ``get_logger`` passes its keywords on to
+``wrap_logger`` (``_config.py:143``), so none of those parameters is an
+initial value there (four become ``wrap_logger``'s arguments; ``logger``
+and ``logger_factory_args`` raise ``TypeError``); the sweep reads every
+``get_logger`` keyword,
+which can over-report a key but cannot miss one. A logger-factory call is
+reported under the factory's name. The package's 11 calls to a logger
+factory pass only a name (BR-027 evidence, P1). It fails closed: a ``**`` of
 anything but a literal with string keys is *unverifiable*; a
 logging-style call (a log method called with a constant string first
 argument or with keywords, or ``bind``/``new`` called with keywords) on
@@ -61,34 +74,115 @@ must find, and K7-K9 feed it synthetic sources: each sweep mutant in
 BR-026's battery (M11-M18, M21-M27) turned at least one of them red, M16
 on CPython 3.11 only (BR-026 evidence).
 
+**The processor-owned set** (:data:`PROCESSOR_OWNED`, BR-027) holds these
+28 keys, which structlog 26.1.0's own processors, renderers and logger
+methods write into the event, remove from it or read with a meaning of
+their own, under their default names (by reading structlog 26.1.0; the
+literal maps each key to its writer): ``event`` (the logger methods,
+``EventRenamer``, ``ConsoleRenderer``); ``timestamp`` (``TimeStamper``,
+``MaybeTimeStamper``); ``level``, ``level_number`` and ``logger``
+(``add_log_level``, ``add_log_level_number``, ``add_logger_name``);
+``logger_name`` (a ``ConsoleRenderer`` column); ``exception``,
+``exc_info``, ``stack`` and ``stack_info`` (``format_exc_info``,
+``set_exc_info``, the loggers' ``exception()``, ``StackInfoRenderer``);
+``stacklevel`` and ``positional_args`` (``render_to_log_kwargs``,
+``render_to_log_args_and_kwargs``, the stdlib ``BoundLogger``,
+``PositionalArgumentsFormatter``); ``log_level`` (``capture_logs``);
+``_record``, ``_from_structlog``, ``_logger`` and ``_name``
+(``ProcessorFormatter``, ``ExtraAdder``); and the eleven
+``CallsiteParameterAdder`` keys (``pathname``, ``filename``, ``module``,
+``qual_module``, ``func_name``, ``qual_name``, ``lineno``, ``thread``,
+``thread_name``, ``process``, ``process_name``). A processor that owns one
+replaces, removes or reinterprets the SDK's value, for ``timestamp`` with
+no error (for some values of other keys a processor raises instead: under
+structlog's default configuration ``ConsoleRenderer`` raises ``TypeError``
+for an ``exception`` that is neither a string nor ``None``, unless that
+call's ``exc_info`` resolves to an exception (by reading structlog 26.1.0
+``dev.py:954-958``; measured for ``False``)): before
+BR-027, ``audit.event`` logged the audit event's time as ``timestamp``,
+which a ``TimeStamper`` replaced with the log time
+(``tests/audit/test_console.py``). The set is a literal, so it can be
+checked against its source line by line. K11 runs 18 probes of these
+writers on the installed structlog and checks that every key a probe
+touches is in the set, that the set holds a floor and every
+``CallsiteParameter`` of the installed release, and that the probes
+together touch the whole set apart from the keys whose writer the
+installed release predates
+(:data:`_WRITER_SINCE`: none on 26.1.0; ``qual_name``, ``qual_module`` and
+``stacklevel`` on 24.1.0, measured). Eight keys are in both sets
+(``exc_info``, ``stack_info``, ``pathname``, ``filename``, ``module``,
+``lineno``, ``thread``, ``process``): :data:`RESERVED` holds them because
+``makeRecord`` refuses them, this set because a processor owns them, and
+the sets stay separate because K5 requires ``makeRecord`` to refuse every
+:data:`RESERVED` key, which it does not for ``timestamp``. K10 fails on a
+processor-owned key in a swept call and names its writer; K12 anchors the
+``audit.event`` call and its five keys; K13 feeds the shared sweep
+synthetic sources, with near misses as its control; K14 passes every
+swept key through structlog's key-writing processors and
+``render_to_log_kwargs``, independently of the literal, as K2 does for
+:data:`RESERVED`.
+
 What this does NOT pin: keys a host's own processor adds (six of the keys
 structlog 26.1.0's ``CallsiteParameterAdder`` can add are record
 attributes, and with it before ``render_to_log_kwargs`` the registry's
-overwrite warning still raises; P5), attributes a host's ``LogRecord``
-factory adds, and keys a host binds with ``bind_contextvars``; a logger
+overwrite warning still raises; BR-026 evidence, P5), attributes a
+host's ``LogRecord`` factory adds, and keys a host binds with ``bind_contextvars``; a logger
 the module neither builds with a call ending in ``get_logger`` or
 ``wrap_logger`` nor takes from one of its own receivers (a host factory's
 logger, or one received as a parameter) when it is used without a
 logging-style call, for example ``getattr(logger, level)(...)`` or a
-stored ``logger.info``; keyword arguments passed to ``get_logger(...)`` or
-``wrap_logger(...)``, which become initial values on every line that
-logger writes (no SDK logger is built that way: grep of ``src/``); and
-code the AST cannot read, such as ``eval``.
-The behavioural pins are ``tests/loop/test_loop_stdlib_logging.py`` and
-``tests/tools/test_tools_stdlib_logging.py``.
+stored ``logger.info``; and code the AST cannot read, such as ``eval``.
+For the processor-owned set: a name a host chooses for a configurable key
+(``TimeStamper(key=...)``, ``MaybeTimeStamper(key=...)``,
+``EventRenamer(to=..., replace_by=...)``, ``ConsoleRenderer(timestamp_key=...,
+event_key=...)``); the other keys ``ExtraAdder`` (without an ``allow``
+list) copies from a stdlib record: a host's own ``extra`` keys, and
+``message`` and ``asctime`` once an earlier formatter set them (measured,
+BR-027 evidence, P0; :data:`RESERVED` holds both); processors a
+host writes or another package ships; and ``structlog.twisted``. K14
+reports 21 of the 28 keys on structlog 26.1.0; the other seven rest on
+K10 (K14's docstring lists them).
+The behavioural pins are ``tests/loop/test_loop_stdlib_logging.py``,
+``tests/tools/test_tools_stdlib_logging.py`` and, for BR-027,
+``tests/audit/test_console.py`` and ``tests/runner/test_runner_audit.py``.
 """
 
 from __future__ import annotations
 
 import ast
+import contextlib
+import io
 import logging
+import re
 import sys
 import textwrap
-from dataclasses import dataclass, field
+import warnings
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass, field, replace
+from importlib import metadata
 from pathlib import Path
-from typing import Final
+from typing import Any, Final
 
 import pytest
+import structlog
+from structlog.dev import ConsoleRenderer, set_exc_info
+from structlog.processors import (
+    CallsiteParameter,
+    CallsiteParameterAdder,
+    MaybeTimeStamper,
+    StackInfoRenderer,
+    TimeStamper,
+    format_exc_info,
+)
+from structlog.stdlib import (
+    ExtraAdder,
+    PositionalArgumentsFormatter,
+    ProcessorFormatter,
+    add_log_level,
+    add_log_level_number,
+    add_logger_name,
+    render_to_log_kwargs,
+)
 
 import fifty_agent_sdk
 
@@ -105,6 +199,43 @@ _REFUSED_BY_NAME: Final = frozenset({"message", "asctime"})
 _ADDED_IN_LATER_PYTHONS: Final = frozenset({"taskName"})  # LogRecord.taskName, CPython 3.12+
 RESERVED: Final = _RUNTIME_RECORD_KEYS | _REFUSED_BY_NAME | _ADDED_IN_LATER_PYTHONS
 
+# --- The processor-owned set (BR-027) -----------------------------------------------------
+
+# The keys structlog 26.1.0's own processors, renderers and logger methods write into the event,
+# remove from it or read with a meaning of their own, under their default names, each with its
+# writer (by reading structlog 26.1.0; BR-027 plan section 1.2). A literal, not derived at
+# runtime; K11 runs each writer against the running structlog.
+PROCESSOR_OWNED: Final[dict[str, str]] = {
+    "event": "the logger method's event argument; EventRenamer; ConsoleRenderer column",
+    "timestamp": "TimeStamper, MaybeTimeStamper; ConsoleRenderer column",
+    "level": "add_log_level; ConsoleRenderer column",
+    "level_number": "add_log_level_number",
+    "logger": "add_logger_name; ConsoleRenderer column",
+    "logger_name": "ConsoleRenderer column",
+    "exception": "format_exc_info, dict_tracebacks (ExceptionRenderer); ConsoleRenderer",
+    "exc_info": "set_exc_info, the loggers' exception(); ExceptionRenderer, render_to_log_kwargs",
+    "stack": "StackInfoRenderer; ConsoleRenderer",
+    "stack_info": "StackInfoRenderer, render_to_log_kwargs",
+    "stacklevel": "render_to_log_kwargs, render_to_log_args_and_kwargs",
+    "positional_args": "stdlib BoundLogger; PositionalArgumentsFormatter",
+    "log_level": "capture_logs (LogCapture)",
+    "_record": "ProcessorFormatter",
+    "_from_structlog": "ProcessorFormatter",
+    "_logger": "ProcessorFormatter.wrap_for_formatter, ExtraAdder",
+    "_name": "ProcessorFormatter.wrap_for_formatter, ExtraAdder",
+    "pathname": "CallsiteParameterAdder",
+    "filename": "CallsiteParameterAdder",
+    "module": "CallsiteParameterAdder",
+    "qual_module": "CallsiteParameterAdder",
+    "func_name": "CallsiteParameterAdder",
+    "qual_name": "CallsiteParameterAdder",
+    "lineno": "CallsiteParameterAdder",
+    "thread": "CallsiteParameterAdder",
+    "thread_name": "CallsiteParameterAdder",
+    "process": "CallsiteParameterAdder",
+    "process_name": "CallsiteParameterAdder",
+}
+
 # --- The sweep ----------------------------------------------------------------------------
 
 _SYNC_LOG_METHODS: Final = frozenset(
@@ -115,6 +246,21 @@ _BINDERS: Final = frozenset({"bind", "new"})
 _KEYLESS_METHODS: Final = frozenset({"unbind", "try_unbind"})
 _CONTEXTVAR_BINDERS: Final = ("bind_contextvars", "bound_contextvars")
 _LOGGER_FACTORIES: Final = ("get_logger", "wrap_logger")
+# ``wrap_logger``'s own parameters; every other keyword is an initial value (structlog 26.1.0
+# and 24.1.0 ``_config.py``, by reading). ``get_logger`` passes its keywords on to
+# ``wrap_logger``, so none of these is an initial value there (four become its arguments;
+# ``logger`` and ``logger_factory_args`` raise ``TypeError``); the sweep still reads every
+# ``get_logger`` keyword (it can over-report, never miss one).
+_WRAP_LOGGER_PARAMETERS: Final = frozenset(
+    {
+        "logger",
+        "processors",
+        "wrapper_class",
+        "context_class",
+        "cache_logger_on_first_use",
+        "logger_factory_args",
+    }
+)
 _STDLIB_FACTORY: Final = "getLogger"
 
 
@@ -230,6 +376,16 @@ def sweep_source(source: str, path: str) -> ModuleSweep:
             method = name.rsplit(".", 1)[-1]
             result.calls.append(_swept_call(node, path, name, method, result.findings))
             continue
+        if name is not None and name.endswith(_LOGGER_FACTORIES):
+            # BR-027: keywords to a logger factory are initial values on every line the logger
+            # writes. Before the ``ast.Attribute`` filter, so a bare ``get_logger(...)`` counts.
+            if node.keywords:
+                method = name.rsplit(".", 1)[-1]
+                call = _swept_call(node, path, name, method, result.findings)
+                own = _WRAP_LOGGER_PARAMETERS if method == "wrap_logger" else frozenset()
+                keys = tuple((key, line) for key, line in call.keys if key not in own)
+                result.calls.append(replace(call, event=None, keys=keys))
+            continue
         if not isinstance(node.func, ast.Attribute):
             continue
         method = node.func.attr
@@ -332,6 +488,14 @@ def reserved_key_findings(calls: list[LogCall], reserved: frozenset[str] = RESER
         for call in calls
         for key, line in call.keys
         if key in reserved
+    ]
+
+
+def processor_owned_findings(calls: list[LogCall]) -> list[str]:
+    """``path:line event key (writer)`` for every :data:`PROCESSOR_OWNED` key a swept call passes."""
+    return [
+        f"{finding} ({PROCESSOR_OWNED[finding.rsplit(' ', 1)[1]]})"
+        for finding in reserved_key_findings(calls, frozenset(PROCESSOR_OWNED))
     ]
 
 
@@ -558,6 +722,21 @@ def _sweep(body: str) -> ModuleSweep:
         pytest.param(
             'log2 = _log\nlog2.info("e", name=1)\n', ["probe.py:5 e name"], id="aliased_logger"
         ),
+        pytest.param(
+            "structlog.get_logger(name=1)\n",
+            ["probe.py:4 get_logger name"],
+            id="get_logger_initial_value",
+        ),
+        pytest.param(
+            'get_logger("x", levelname=1)\n',
+            ["probe.py:4 get_logger levelname"],
+            id="bare_get_logger_initial_value",
+        ),
+        pytest.param(
+            "structlog.wrap_logger(None, processors=[], msg=1)\n",
+            ["probe.py:4 wrap_logger msg"],
+            id="wrap_logger_initial_value",
+        ),
     ],
 )
 def test_sweep_reports_reserved_keys_in_every_call_shape(body: str, expected: list[str]) -> None:
@@ -597,6 +776,9 @@ def test_sweep_reports_reserved_keys_in_every_call_shape(body: str, expected: li
         pytest.param(
             "helper(structlog.get_logger())\n", "logger used as a value", id="built_and_passed"
         ),
+        pytest.param(
+            "structlog.get_logger(**kw)\n", "unverifiable", id="get_logger_splat_of_a_name"
+        ),
     ],
 )
 def test_sweep_fails_closed_on_calls_it_cannot_verify(body: str, kind: str) -> None:
@@ -628,3 +810,347 @@ def test_sweep_ignores_near_miss_keys_and_non_logger_calls() -> None:
     assert sweep.findings == []
     (call,) = [call for call in sweep.calls if call.event == "e"]
     assert call.key_names == {"task_name", "processname", "Name", "name_", "message_id"}
+
+
+# --- K10-K14: the processor-owned set (BR-027) --------------------------------------------
+
+
+def test_no_sdk_log_call_passes_a_key_a_structlog_processor_owns(
+    package_sweep: list[ModuleSweep],
+) -> None:
+    """K10: no swept call passes a key in :data:`PROCESSOR_OWNED` (BR-027, AC-2).
+
+    Before BR-027 this listed one key: ``timestamp`` in ``audit.event``
+    (``fifty_agent_sdk/audit/console.py:64``). The sweep is K1's, and K1
+    reports what it cannot read.
+    """
+    offenders = processor_owned_findings(_all_calls(package_sweep))
+    assert offenders == [], "logging keys a structlog processor owns:\n" + "\n".join(offenders)
+
+
+# K11's writer rows. Each runs a real structlog object and returns the keys it wrote, removed,
+# replaced or treated as its own, or ``None`` when this structlog release lacks the writer.
+
+_PROBE_LOGGER: Final = logging.Logger("probe")  # not registered with stdlib's manager
+
+
+def _touched(before: dict[str, Any], after: dict[str, Any]) -> set[str]:
+    """Keys a processor added, removed or replaced (compared by identity)."""
+    return {
+        key
+        for key in before.keys() | after.keys()
+        if key not in before or key not in after or after[key] is not before[key]
+    }
+
+
+def _run(
+    processor: Callable[..., Any], event_dict: dict[str, Any], method: str = "info"
+) -> set[str]:
+    return _touched(event_dict, processor(_PROBE_LOGGER, method, dict(event_dict)))
+
+
+def _logged(log: Callable[[Any], object], *, stdlib: bool = False) -> dict[str, Any]:
+    """The event dict a logger method builds, before any processor changes it."""
+    captured: list[dict[str, Any]] = []
+
+    def capture(_: Any, __: str, event_dict: dict[str, Any]) -> dict[str, Any]:
+        captured.append(dict(event_dict))
+        raise structlog.DropEvent
+
+    logger: Any
+    if stdlib:
+        stdlib_logger = logging.Logger("probe")
+        stdlib_logger.setLevel(logging.DEBUG)
+        logger = structlog.stdlib.BoundLogger(stdlib_logger, [capture], {})
+    else:
+        wrapper = structlog.make_filtering_bound_logger(logging.DEBUG)
+        logger = wrapper(structlog.PrintLogger(io.StringIO()), [capture], {})
+    log(logger)
+    (event_dict,) = captured
+    return event_dict
+
+
+def _exc_info_tuple() -> Any:
+    try:
+        raise ValueError("probe")
+    except ValueError:
+        return sys.exc_info()
+
+
+def _row_exception_methods() -> set[str]:
+    native = _logged(lambda log: log.exception("e"))
+    via_stdlib = _logged(lambda log: log.exception("e"), stdlib=True)
+    return (set(native) | set(via_stdlib)) - {"event"}
+
+
+def _row_render_to_log_kwargs() -> set[str]:
+    sent = {"event": "e", "exc_info": object(), "stack_info": object(), "stacklevel": object()}
+    out = render_to_log_kwargs(_PROBE_LOGGER, "info", dict(sent))
+    return set(sent) - set(out["extra"])
+
+
+def _row_render_to_log_args_and_kwargs() -> set[str] | None:
+    render = getattr(structlog.stdlib, "render_to_log_args_and_kwargs", None)
+    if render is None:  # added in structlog 25.1.0
+        return None
+    sent = {
+        "event": "e",
+        "positional_args": (),
+        "exc_info": object(),
+        "stack_info": object(),
+        "stacklevel": object(),
+    }
+    _, kwargs = render(_PROBE_LOGGER, "info", dict(sent))
+    return set(sent) - set(kwargs.get("extra", {}))
+
+
+def _row_positional_arguments() -> set[str]:
+    logged = _logged(lambda log: log.info("e %s", "x"), stdlib=True)
+    formatted = PositionalArgumentsFormatter()(_PROBE_LOGGER, "info", dict(logged))
+    return (set(logged) - {"event"}) | _touched(logged, formatted)
+
+
+def _row_log_capture() -> set[str]:
+    capture = structlog.testing.LogCapture()
+    with contextlib.suppress(structlog.DropEvent):
+        capture(_PROBE_LOGGER, "info", {"event": "e"})
+    (entry,) = capture.entries
+    return set(entry) - {"event"}
+
+
+def _row_processor_formatter() -> set[str]:
+    """The keys ``wrap_for_formatter`` passes as ``extra``, and those ``ProcessorFormatter`` and ``ExtraAdder`` add."""
+    seen: list[set[str]] = []
+
+    def grab(_: Any, __: str, event_dict: dict[str, Any]) -> dict[str, Any]:
+        seen.append(set(event_dict))
+        return event_dict
+
+    args, kwargs = ProcessorFormatter.wrap_for_formatter(_PROBE_LOGGER, "info", {"event": "e"})
+    record = logging.makeLogRecord({"msg": args[0], **kwargs["extra"]})
+    ProcessorFormatter(processors=[grab, ExtraAdder(), grab, lambda *_: "x"]).format(record)
+    before_extra_adder, after_extra_adder = seen
+    return set(kwargs["extra"]) | (before_extra_adder - {"event"}) | after_extra_adder
+
+
+def _row_console_renderer_columns() -> set[str] | None:
+    columns = getattr(ConsoleRenderer(colors=False), "columns", None)
+    if columns is None:  # structlog 24.1.0 keeps them private
+        return None
+    return {column.key for column in columns} - {""}  # "" is the column for the other keys
+
+
+_RENDER_CONTROLS: Final = ("payload", "event_timestamp", "levels", "Timestamp")
+
+
+def _row_console_renderer_output() -> set[str]:
+    """Keys ``ConsoleRenderer`` writes as a column or removes, not as ``key=value``."""
+    owned = set()
+    for key in [*PROCESSOR_OWNED, *_RENDER_CONTROLS]:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            line = ConsoleRenderer(colors=False)(_PROBE_LOGGER, "info", {"event": "e", key: "v"})
+        if f" {key}=" not in line:
+            owned.add(key)
+    return owned
+
+
+def _row_bound_event() -> set[str]:
+    """A logger method sets ``event`` after applying the bound context, so a bound ``event`` is replaced."""
+    logged = _logged(lambda log: log.bind(event="bound").info("call"))
+    return {"event"} if logged["event"] == "call" else set()
+
+
+_WRITER_ROWS: Final[dict[str, Callable[[], set[str] | None]]] = {
+    "TimeStamper": lambda: _run(TimeStamper(), {"event": "e"}),
+    "MaybeTimeStamper": lambda: _run(MaybeTimeStamper(), {"event": "e"}),
+    "add_log_level": lambda: _run(add_log_level, {"event": "e"}),
+    "add_log_level_number": lambda: _run(add_log_level_number, {"event": "e"}),
+    "add_logger_name": lambda: _run(add_logger_name, {"event": "e"}),
+    "format_exc_info": lambda: _run(format_exc_info, {"event": "e", "exc_info": _exc_info_tuple()}),
+    "StackInfoRenderer": lambda: _run(StackInfoRenderer(), {"event": "e", "stack_info": True}),
+    "set_exc_info": lambda: _run(set_exc_info, {"event": "e"}, "exception"),
+    "exception_methods": _row_exception_methods,
+    "CallsiteParameterAdder": lambda: _run(CallsiteParameterAdder(), {"event": "e"}),
+    "render_to_log_kwargs": _row_render_to_log_kwargs,
+    "render_to_log_args_and_kwargs": _row_render_to_log_args_and_kwargs,
+    "PositionalArgumentsFormatter": _row_positional_arguments,
+    "LogCapture": _row_log_capture,
+    "ProcessorFormatter": _row_processor_formatter,
+    "ConsoleRenderer_columns": _row_console_renderer_columns,
+    "ConsoleRenderer_output": _row_console_renderer_output,
+    "bound_event": _row_bound_event,
+}
+
+# Keys whose earliest writer among the rows arrived after structlog 24.1.0, the floor
+# (``pyproject.toml``): ``CallsiteParameter.QUAL_NAME`` in 25.5.0 and ``QUAL_MODULE`` in 26.1.0,
+# and ``render_to_log_kwargs`` taking ``stacklevel`` out of ``extra`` in 24.2.0 (``stackLevel``
+# before). By reading structlog 26.1.0's version notes; measured on 24.1.0 (BR-027 evidence, P0).
+_WRITER_SINCE: Final = {"qual_name": (25, 5), "qual_module": (26, 1), "stacklevel": (24, 2)}
+
+
+def _structlog_version() -> tuple[int, int]:
+    match = re.match(r"(\d+)\.(\d+)", metadata.version("structlog"))
+    assert match is not None
+    return int(match[1]), int(match[2])
+
+
+def _keys_without_a_writer_here() -> set[str]:
+    return {key for key, since in _WRITER_SINCE.items() if _structlog_version() < since}
+
+
+@pytest.mark.parametrize("row", list(_WRITER_ROWS))
+def test_processor_owned_set_is_what_structlog_writes(row: str) -> None:
+    """K11: each probe runs a real structlog writer here and touches only keys in :data:`PROCESSOR_OWNED` (BR-027)."""
+    keys = _WRITER_ROWS[row]()
+    if keys is None:
+        pytest.skip(f"structlog {metadata.version('structlog')} has no {row}")
+    assert keys, f"{row} touched no key"
+    assert keys <= PROCESSOR_OWNED.keys(), sorted(keys - PROCESSOR_OWNED.keys())
+
+
+def test_processor_owned_set_is_covered_and_complete() -> None:
+    """K11: a floor, every ``CallsiteParameter`` of this structlog, and the set equals what the rows touch.
+
+    Exactness allows only the keys of :data:`_WRITER_SINCE` whose writer
+    this structlog release predates; on structlog 26.1.0 that is none.
+    """
+    floor = {"event", "timestamp", "level", "logger", "exception", "exc_info", "stack"}
+    assert floor <= PROCESSOR_OWNED.keys()
+    assert {parameter.value for parameter in CallsiteParameter} <= PROCESSOR_OWNED.keys()
+    seen: set[str] = set()
+    for probe in _WRITER_ROWS.values():
+        seen |= probe() or set()
+    assert seen <= PROCESSOR_OWNED.keys()
+    assert PROCESSOR_OWNED.keys() - seen == _keys_without_a_writer_here()
+
+
+def test_sweep_finds_the_audit_event_call_and_its_keys(package_sweep: list[ModuleSweep]) -> None:
+    """K12: the sweep reaches ``audit.event`` and reads its five keys, the event's time as ``event_timestamp`` (BR-027)."""
+    (call,) = _calls(package_sweep, "fifty_agent_sdk/audit/console.py", "audit.event", "info")
+    assert call.key_names == {"session_id", "user_id", "event_type", "event_timestamp", "payload"}
+    assert len(call.keys) == 5
+
+
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        pytest.param('_log.info("e", timestamp=1)\n', "probe.py:4 e timestamp", id="log_method"),
+        pytest.param("_log.bind(level=1)\n", "probe.py:4 bind level", id="bind_key"),
+        pytest.param("_log.new(logger=1)\n", "probe.py:4 new logger", id="new_key"),
+        pytest.param(
+            "structlog.contextvars.bind_contextvars(func_name=1)\n",
+            "probe.py:4 bind_contextvars func_name",
+            id="bind_contextvars",
+        ),
+        pytest.param(
+            '_log.info("e", **{"stacklevel": 1})\n', "probe.py:4 e stacklevel", id="dict_splat"
+        ),
+        pytest.param(
+            'log = _log.bind(a=1)\nlog.info("e", log_level=1)\n',
+            "probe.py:5 e log_level",
+            id="bound_logger",
+        ),
+        pytest.param('_log.info("e", _record=1)\n', "probe.py:4 e _record", id="formatter_key"),
+        pytest.param(
+            "structlog.get_logger(exception=1)\n",
+            "probe.py:4 get_logger exception",
+            id="get_logger_initial_value",
+        ),
+    ],
+)
+def test_processor_owned_keys_are_reported_in_every_call_shape(body: str, expected: str) -> None:
+    """K13: the shared sweep reports a processor-owned key in each call shape, with its writer (BR-027)."""
+    sweep = _sweep(body)
+    key = expected.rsplit(" ", 1)[1]
+    assert processor_owned_findings(sweep.calls) == [f"{expected} ({PROCESSOR_OWNED[key]})"]
+    assert sweep.findings == []
+
+
+def test_processor_owned_findings_ignore_near_miss_keys() -> None:
+    """K13 (control): near misses are not reported; matching is exact and case-sensitive."""
+    near_misses = {
+        "event_type",
+        "event_timestamp",
+        "timestamps",
+        "Timestamp",
+        "levels",
+        "logger_id",
+        "stack_depth",
+        "func",
+    }
+    sweep = _sweep(f'_log.info("e", {", ".join(f"{key}=1" for key in sorted(near_misses))})\n')
+    assert processor_owned_findings(sweep.calls) == []
+    assert sweep.findings == []
+    (call,) = sweep.calls
+    assert call.key_names == near_misses
+
+
+def _key_writing_chain() -> list[Callable[..., Any]]:
+    """structlog's processors that write a key on every call, plus its exception, stack and positional-argument ones."""
+    return [
+        add_log_level,
+        add_log_level_number,
+        add_logger_name,
+        TimeStamper(),
+        CallsiteParameterAdder(),
+        StackInfoRenderer(),
+        format_exc_info,
+        set_exc_info,
+        PositionalArgumentsFormatter(),
+    ]
+
+
+def keys_structlog_processors_replace(keys: Iterable[str]) -> list[str]:
+    """The keys whose value does not reach ``render_to_log_kwargs``'s ``extra`` as it was passed.
+
+    Each key goes alone, with a fresh sentinel, through
+    :func:`_key_writing_chain` for an ``exception`` call and then
+    ``render_to_log_kwargs``. A processor that raises counts as replacing it.
+    """
+    replaced = []
+    for key in keys:
+        sentinel = object()
+        event_dict: Any = {"event": "probe", key: sentinel}
+        try:
+            for processor in _key_writing_chain():
+                event_dict = processor(_PROBE_LOGGER, "exception", event_dict)
+            extra = render_to_log_kwargs(_PROBE_LOGGER, "exception", event_dict)["extra"]
+            survived = extra.get(key) is sentinel
+        except Exception:
+            survived = False
+        if not survived:
+            replaced.append(key)
+    return replaced
+
+
+def test_every_swept_key_survives_structlog_processors(package_sweep: list[ModuleSweep]) -> None:
+    """K14: every key the package's logging calls pass survives structlog's key-writing processors (BR-027).
+
+    Independent of :data:`PROCESSOR_OWNED`, like K2 for :data:`RESERVED`.
+    ``event`` is left out (K10 covers it). Of the 28 keys in the set it
+    reports 21 on structlog 26.1.0 (18 on 24.1.0, which lacks
+    ``qual_module``, ``qual_name`` and the ``stacklevel`` pop). It cannot
+    see ``logger_name`` (a renderer column), ``exception`` and ``stack``
+    (written only when an exception or ``stack_info`` is there),
+    ``log_level`` (``capture_logs``), or ``_from_structlog``, ``_logger`` and
+    ``_name`` (``ProcessorFormatter`` and ``ExtraAdder`` are not in its
+    chain); K10 covers those through the literal (BR-027 evidence, K14
+    scope).
+    """
+    keys = sorted({key for call in _all_calls(package_sweep) for key in call.key_names} - {"event"})
+    assert keys, "the sweep collected no keys"
+    assert keys_structlog_processors_replace(keys) == []
+
+
+def test_structlog_processor_cross_check_reports_replaced_keys() -> None:
+    """K14 (self-test): the cross-check reports a written key, a call-site key and, from structlog 24.2.0, ``stacklevel``.
+
+    ``render_to_log_kwargs`` takes ``stacklevel`` out of ``extra`` from
+    structlog 24.2.0 (``stackLevel`` before; BR-027 evidence, P0).
+    """
+    expected = ["timestamp", "func_name"]
+    if "stacklevel" not in _keys_without_a_writer_here():
+        expected.append("stacklevel")
+    probe = ["timestamp", "func_name", "stacklevel", "event_timestamp", "event_type"]
+    assert keys_structlog_processors_replace(probe) == expected

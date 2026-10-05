@@ -49,9 +49,17 @@ class ConsoleAuditSink:
     async def record(self, event: AuditEvent) -> None:
         """Emit ``event`` as a single ``INFO`` structlog record.
 
-        The record's event name is ``audit.event``; the
-        :class:`AuditEvent` fields are spread as structured key/values
-        (``timestamp`` rendered as an ISO-8601 string).
+        The record's event name is ``audit.event``. The :class:`AuditEvent`
+        fields are spread as structured key/values under their own names
+        (``session_id``, ``user_id``, ``event_type``, ``payload``), except
+        :attr:`AuditEvent.timestamp`, which is logged as ``event_timestamp``,
+        an ISO-8601 string. It is not logged as ``timestamp``: that is the
+        key structlog's ``TimeStamper`` processor writes by default, after
+        the call has built the event, and structlog's default configuration,
+        which the SDK does not change, includes one, so under that key the
+        log time replaced the event's time (BR-027). With a ``TimeStamper`` at
+        its default key the record carries both: ``event_timestamp`` is when
+        the action occurred, ``timestamp`` is when the record was logged.
 
         Args:
             event: The :class:`AuditEvent` to log.
@@ -61,7 +69,9 @@ class ConsoleAuditSink:
             session_id=event.session_id,
             user_id=event.user_id,
             event_type=event.event_type,
-            timestamp=event.timestamp.isoformat(),
+            # BR-027: not `timestamp`, which structlog's TimeStamper writes by default;
+            # structlog's default configuration has one.
+            event_timestamp=event.timestamp.isoformat(),
             payload=event.payload,
         )
 
