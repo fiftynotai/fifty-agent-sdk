@@ -44,8 +44,10 @@ class Registry:
         Subsequent registrations with the same ``tool.name`` overwrite the
         previous entry (last write wins). This is deliberate: tests, fixtures,
         and providers commonly re-register tools when reconfiguring. A
-        ``structlog`` warning is emitted on overwrite so unintended
-        collisions in production are still visible.
+        ``structlog`` WARNING ``tool overwritten``, with the name under
+        ``tool_name``, is emitted on overwrite so unintended collisions in
+        production are still visible. (The key is not ``name``, which
+        stdlib's ``LogRecord`` reserves; BR-026.)
 
         Args:
             tool: An object satisfying the :class:`Tool` protocol.
@@ -59,7 +61,7 @@ class Registry:
         if not isinstance(tool, Tool):
             raise TypeError(f"register() requires a Tool; got {type(tool).__name__}")
         if tool.name in self._tools:
-            _log.warning("tool overwritten", name=tool.name)
+            _log.warning("tool overwritten", tool_name=tool.name)
         self._tools[tool.name] = tool
 
     def list(self) -> list[Tool]:

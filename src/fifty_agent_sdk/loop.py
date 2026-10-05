@@ -180,6 +180,24 @@ Model-written text in requests (BR-024)
     holds a surrogate code point. No golden scenario holds such text
     (BR-024 probe P5).
 
+Log keys under stdlib logging (BR-026)
+    Since 1.10.2 the loop's ``tool_invoked`` debug line logs the tool name
+    under ``tool_name``, not ``name``, which stdlib's ``LogRecord`` reserves.
+    When structlog passed the loop's log keys to stdlib ``logging`` as a
+    record's ``extra``, as ``structlog.stdlib.render_to_log_kwargs`` and
+    ``render_to_log_args_and_kwargs`` do, with DEBUG enabled for the
+    ``fifty_agent_sdk.loop`` logger, that line raised ``KeyError`` at the
+    run's first dispatched tool call, with no ``FinalEvent``, on 1.7.0,
+    1.8.0, 1.9.0 and 1.10.1 (measured with those two recipes and structlog
+    26.1.0; the CHANGELOG names the interpreters and the cases run on each
+    release). Such a run now continues. The release-equivalence statements
+    in this module (above, in :class:`AgentLoop`'s Args and in its
+    ``__init__`` comments), and the matching ones in
+    :mod:`fifty_agent_sdk.tool_mode` and :mod:`fifty_agent_sdk.interventions`,
+    are claimed only for runs that do not dispatch a tool call under such a
+    configuration. No golden scenario routes structlog through stdlib (by
+    reading).
+
 Statelessness
     Every :meth:`AgentLoop.run` call is its own scoped iteration. The
     loop holds no state across calls — conversation persistence and
@@ -1409,9 +1427,13 @@ class AgentLoop:
                         # BR-024: the model's tool name, escaped as on the wire, so a
                         # surrogate code point cannot make a strict UTF-8 log stream
                         # (structlog's default configuration prints to stdout) raise.
+                        # BR-026: under `tool_name`, not `name`, which stdlib's
+                        # LogRecord reserves: with structlog routed through stdlib
+                        # (`render_to_log_kwargs`) and DEBUG enabled, `name=` raised
+                        # KeyError here.
                         _log.debug(
                             "tool_invoked",
-                            name=escape_surrogates(tc.name),
+                            tool_name=escape_surrogates(tc.name),
                             call_id=cid,
                             run_id=run_id,
                         )
@@ -1761,9 +1783,10 @@ class AgentLoop:
                 )
                 continue
             # BR-024: escaped as on the wire (see the batch path above).
+            # BR-026: under `tool_name`, not `name` (see the batch path above).
             _log.debug(
                 "tool_invoked",
-                name=escape_surrogates(tool_name),
+                tool_name=escape_surrogates(tool_name),
                 call_id=call_id,
                 run_id=run_id,
             )

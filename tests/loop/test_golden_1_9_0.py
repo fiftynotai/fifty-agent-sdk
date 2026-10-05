@@ -61,6 +61,10 @@ What this does NOT pin:
   tool call's name, a tool reply's name) holding a surrogate code point
   (BR-024). No scenario's text in those fields holds one (BR-024 evidence,
   P5).
+* A run that dispatches a tool call while structlog passes the SDK's log keys
+  to stdlib ``logging`` as ``extra`` with DEBUG enabled (BR-026). No scenario
+  routes structlog through stdlib, and the fixtures hold no log lines (by
+  reading).
 """
 
 from __future__ import annotations

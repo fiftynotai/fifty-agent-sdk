@@ -20,8 +20,8 @@ Wiring
     stream as 1.9.0 (timestamps and minted ids aside), for the runs
     :mod:`fifty_agent_sdk.loop` scopes that claim to ("Non-ASCII text
     (BR-020)", "Error-path final text (BR-021)", "Tool-argument nesting
-    (BR-019)", "Tool-result text (BR-022)" and "Model-written text in
-    requests (BR-024)").
+    (BR-019)", "Tool-result text (BR-022)", "Model-written text in
+    requests (BR-024)" and "Log keys under stdlib logging (BR-026)").
 
 ``before_tool(session_id, call_id, tool_name, args)``
     Runs once per model tool call (the single call, and each member of a

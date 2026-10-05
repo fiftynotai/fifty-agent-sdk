@@ -25,7 +25,10 @@ request (BR-024 evidence, round 2). Since BR-024 that line writes the name
 escaped too. B13 and B14 pin it on their own strict stream; under pytest's
 default output capture, the other tests here log to its capture stream,
 which writes with ``errors="replace"``, so they cannot see a log line
-raise.
+raise. Since BR-026 the line carries the name under ``tool_name``
+(``name`` before, a key stdlib's ``LogRecord`` reserves); B15 pins the
+escaped value on the stdlib record under structlog's
+``render_to_log_kwargs`` recipe.
 
 Every test drives a real ``AgentLoop`` (or ``AgentRunner``) over the real
 ``OpenAICompatibleClient`` (``max_retries=0``) on pytest-httpx, because
@@ -48,14 +51,16 @@ on any release.
 
 What these do NOT pin: HTTP bytes; a custom ``LLMClient`` (it receives the
 text as before); user and system messages, pinned here as a raw raise (a
-documented gap, B9); log output under any structlog configuration other
-than the default one B13 and B14 use.
+documented gap, B9); log output under structlog configurations other
+than the default one B13 and B14 use and the ``render_to_log_kwargs``
+stdlib recipe B15 uses.
 """
 
 from __future__ import annotations
 
 import io
 import json
+import logging
 import re
 from collections.abc import Iterator
 from typing import Any
@@ -84,6 +89,7 @@ from fifty_agent_sdk import (
     ToolMode,
 )
 from tests.loop.conftest import FakeTool
+from tests.stdlib_routing import records_for, stdlib_routed_structlog
 
 _ENDPOINT = "https://example.com/v1/chat/completions"
 _SURROGATE = chr(0xD800)
@@ -569,16 +575,45 @@ def strict_log_stream() -> Iterator[io.TextIOWrapper]:
 
 
 def _logged_tool_names(stream: io.TextIOWrapper) -> list[str]:
-    """The ``name`` value of every ``tool_invoked`` line, ANSI colour codes removed."""
+    """The ``tool_name`` value (``name`` before BR-026) of every ``tool_invoked`` line, ANSI colour codes removed.
+
+    Also asserts that no ``tool_invoked`` line still writes a ``name`` key.
+    """
     assert isinstance(stream.buffer, io.BytesIO)
     text = re.sub(r"\x1b\[[0-9;]*m", "", stream.buffer.getvalue().decode("utf-8"))
     lines = [line for line in text.splitlines() if " tool_invoked " in line]
     names = []
     for line in lines:
-        match = re.search(r" name=(\S+)", line)
+        assert " name=" not in line, line
+        match = re.search(r" tool_name=(\S+)", line)
         assert match is not None, line
         names.append(match.group(1))
     return names
+
+
+# The ``tool_invoked`` names B13 and B15 expect per row: the escape where the model's name held U+D800.
+_ESCAPED_NAMES = {
+    "single": ["find" + _ESCAPE],
+    "batch": ["lookup", "find" + _ESCAPE],
+    "legacy_json_parser": ["find" + _ESCAPE],
+}
+
+
+def _queue_surrogate_name_row(httpx_mock: HTTPXMock, row: str) -> AgentLoop:
+    """Queue ``row``'s two responses (a tool call to ``find`` plus U+D800, then ``done``) and build its loop."""
+    if row == "legacy_json_parser":
+        completion = (
+            '{"thought": "calling", "action": "tool", "tool_name": "find\\ud800", '
+            '"tool_args": {"q": "x"}, "answer": null}'
+        )
+        _respond(httpx_mock, json.dumps(_completion(completion)).encode())
+        _respond(httpx_mock, json.dumps(_completion(_JSON_FINAL)).encode())
+        return _loop(None)
+    name = "find" + _SURROGATE
+    calls = [_call("lookup", "call_1"), _call(name, "call_2")] if row == "batch" else [_call(name)]
+    _respond(httpx_mock, _escaped_body(_completion(None, calls)))
+    _respond(httpx_mock, json.dumps(_completion("done")).encode())
+    return _loop(ToolMode.NATIVE)
 
 
 @pytest.mark.parametrize("row", ["single", "batch", "legacy_json_parser"])
@@ -597,34 +632,20 @@ async def test_tool_invoked_log_line_writes_the_tool_name_escaped(
     raised ``UnicodeEncodeError`` from structlog's ``print`` before the
     second request, with stdout a file or a TTY under a UTF-8 locale (BR-024
     evidence, round 2). The name is now
-    written as it goes out on the wire. This test writes to its own strict
+    written as it goes out on the wire, as the line's ``tool_name`` value
+    (``name`` before BR-026; the helper also asserts no line writes
+    ``name``). This test writes to its own strict
     stream (``strict_log_stream``), so pytest's output capture cannot hide
     the raise. Release dependence: see the module docstring.
     """
-    name = "find" + _SURROGATE
-    if row == "legacy_json_parser":
-        completion = (
-            '{"thought": "calling", "action": "tool", "tool_name": "find\\ud800", '
-            '"tool_args": {"q": "x"}, "answer": null}'
-        )
-        _respond(httpx_mock, json.dumps(_completion(completion)).encode())
-        _respond(httpx_mock, json.dumps(_completion(_JSON_FINAL)).encode())
-        loop = _loop(None)
-    else:
-        calls = (
-            [_call("lookup", "call_1"), _call(name, "call_2")] if row == "batch" else [_call(name)]
-        )
-        _respond(httpx_mock, _escaped_body(_completion(None, calls)))
-        _respond(httpx_mock, json.dumps(_completion("done")).encode())
-        loop = _loop(ToolMode.NATIVE)
+    loop = _queue_surrogate_name_row(httpx_mock, row)
 
     events = await _run(loop)
 
-    expected = ["lookup", "find" + _ESCAPE] if row == "batch" else ["find" + _ESCAPE]
-    assert _logged_tool_names(strict_log_stream) == expected
+    assert _logged_tool_names(strict_log_stream) == _ESCAPED_NAMES[row]
     assert len(httpx_mock.get_requests()) == 2
     action = [e.tool_name for e in events if isinstance(e, ActionEvent)]
-    assert action[-1] == name  # the event keeps the model's name
+    assert action[-1] == "find" + _SURROGATE  # the event keeps the model's name
     _ends_on(events, "done")
 
 
@@ -638,8 +659,8 @@ async def test_tool_invoked_log_line_keeps_other_names_as_they_are(
     registered, so a ``ToolNotFound`` observation), which reaches the batch
     ``tool_invoked`` line, and a native call to ``بحث`` alone, which reaches
     the single-call line. Under structlog's default configuration each line
-    carries the name unchanged: the escape touches only surrogate code
-    points.
+    carries the name unchanged under ``tool_name``: the escape touches only
+    surrogate code points.
     """
     calls = (
         [_call("lookup", "call_1"), _call("بحث", "call_2")] if row == "batch" else [_call("بحث")]
@@ -651,4 +672,28 @@ async def test_tool_invoked_log_line_keeps_other_names_as_they_are(
 
     expected = ["lookup", "بحث"] if row == "batch" else ["بحث"]
     assert _logged_tool_names(strict_log_stream) == expected
+    _ends_on(events, "done")
+
+
+@pytest.mark.parametrize("row", ["single", "batch", "legacy_json_parser"])
+async def test_tool_invoked_record_carries_the_escaped_tool_name_under_stdlib_routing(
+    httpx_mock: HTTPXMock, row: str
+) -> None:
+    """B15: under structlog's ``render_to_log_kwargs`` recipe at DEBUG, the ``tool_invoked`` record's ``tool_name`` attribute holds the escape, and the run ends on ``done`` (BR-024 AC-6, BR-026 AC-3).
+
+    B13's rows and responses, through the real client. Before BR-026 each
+    run raised ``KeyError`` for ``'name'`` at the line instead (BR-026
+    evidence, P2). The record's ``name`` is the logger's name.
+    """
+    loop = _queue_surrogate_name_row(httpx_mock, row)
+
+    with stdlib_routed_structlog("render_to_log_kwargs", logging.DEBUG) as records:
+        events = await _run(loop)
+
+    invoked = records_for(records, "tool_invoked")
+    assert [record.__dict__["tool_name"] for record in invoked] == _ESCAPED_NAMES[row]
+    assert all(record.name == "fifty_agent_sdk.loop" for record in invoked)
+    assert len(httpx_mock.get_requests()) == 2
+    action = [e.tool_name for e in events if isinstance(e, ActionEvent)]
+    assert action[-1] == "find" + _SURROGATE
     _ends_on(events, "done")

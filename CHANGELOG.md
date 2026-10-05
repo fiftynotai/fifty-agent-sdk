@@ -152,7 +152,17 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   3.13.2). It now sends the escape and continues, measured with structlog silenced and under
   its default configuration (see the BR-024 items). No golden scenario holds such text.
   (BR-024) BR-025 adds no scope (by reading): it changes SDK code only in `state/`, and no
-  golden scenario uses `AgentRunner` or a state store. (BR-025)
+  golden scenario uses `AgentRunner` or a state store. (BR-025) Since BR-026 they also hold
+  only for runs that do not dispatch a tool call while structlog passes the SDK's log keys
+  to stdlib `logging` as a record's `extra` (as `render_to_log_kwargs` and
+  `render_to_log_args_and_kwargs` do) with DEBUG enabled for the `fifty_agent_sdk.loop`
+  logger. On the paths Fixed lists, such a run used to end with a raw `KeyError` at the
+  loop's `tool_invoked` debug line (measured with those two recipes and structlog 26.1.0 on
+  1.10.1 on the library sets named there, and, apart from the `ToolMode.JSON`,
+  `ToolMode.PROSE` and `before_tool` cases, on 1.7.0, 1.8.0 and 1.9.0 with CPython 3.14.3
+  and `openai` 2.43.0), and now continues. The renamed log keys (see Changed) are not part
+  of what these statements compare: the golden tests capture no log lines, and no golden
+  scenario routes structlog through stdlib (by reading). (BR-026)
 - Tool-result message text no longer holds a surrogate code point (U+D800-U+DFFF), which
   UTF-8 cannot encode:
   - Each one is written as its six-character `\udXXX` escape, the spelling `json.dumps`
@@ -272,8 +282,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     the provider's text, and a custom `LLMClient` receives it as before. The escape cannot be
     told apart from those six characters typed literally.
   - The loop's `tool_invoked` debug log line writes the tool name with the same escape, so
-    its `name` field shows the six characters where it held the code point (a name the
-    default renderer writes with `repr` shows that escape's backslash doubled; measured).
+    its tool-name field (`tool_name` since BR-026, `name` before) shows the six characters
+    where it held the code point (a name the default renderer writes with `repr` shows that
+    escape's backslash doubled; measured).
     Under structlog's default configuration, which the SDK does not change, the line used to
     make a strict UTF-8 stdout raise for a name it writes as it is (see Fixed). With a JSON renderer (`structlog.processors.JSONRenderer`)
     the line did not raise, because the renderer escaped the code point itself; it now
@@ -287,6 +298,35 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     decode, when it holds a surrogate code point). For 52 messages holding 260,000 Arabic
     characters in assistant turns, building the request body took about 0.3-0.45 ms instead
     of about 0.05 ms (CPython 3.11.15, 3.13.2 and 3.14.3 on one machine, best of 7). (BR-024)
+- Four log lines (five logging calls) carry a field under a new key, because the old key is
+  one that stdlib `logging` refuses in a record's `extra` (see Fixed):
+
+  | Line | Level | Old key | New key |
+  |---|---|---|---|
+  | `tool_invoked` (the loop's batch and single-call lines, once per dispatched tool call) | DEBUG | `name` | `tool_name` |
+  | `tool overwritten` (`Registry.register`) | WARNING | `name` | `tool_name` |
+  | `mcp.tool_overwrite` (`MCPProvider.attach` and `refresh()`) | WARNING | `name` | `tool_name` |
+  | `mcp.refresh_failed` (`MCPProvider`'s periodic refresh) | WARNING | `message` | `error_message` |
+
+  The values are unchanged: `tool_invoked` still writes the tool name with BR-024's escape.
+  A query, alert or parser that reads one of the old keys on these lines needs the new one.
+  Other SDK log lines already use `tool_name` for a tool's name (`mcp.tool_error_hook_failed`
+  and `mcp.tool_error_hook_invalid`) and `error_message` for an exception's text
+  (`audit.emit_failed` and `runner.persist_failed`). BR-026 changes no other log key and no
+  event name. A new test parses the package's source. It fails on a logging call it can
+  read (a log method, `bind` or `new` called on a logger the module builds with `get_logger`
+  or `wrap_logger`, binds or aliases, or a call to `bind_contextvars` or
+  `bound_contextvars`) that passes a key that is a `LogRecord` attribute on the interpreter
+  it runs on, `message`, `asctime` or `taskName` (a `LogRecord` attribute on CPython 3.13.2
+  and 3.14.3, not on 3.11.15). It also fails, rather than passing, on these uses, whose
+  keys it cannot read: a `**` argument other than a dict literal with string keys, a
+  logging-style call on an object it does not know as a logger, a call to a method it does
+  not know on a logger, a call to `getLogger`, a logger method used without being called
+  (`meth = _log.info`), `getattr` on a logger, and a logger passed, returned or stored as a
+  value. It does not see a logger that a module neither builds nor takes from its own
+  loggers (one imported, or received as a parameter) when that logger is used without a
+  logging-style call, for example through `getattr` or a stored method, or code it cannot
+  parse, such as `eval`. Before this change it reported these five calls. (BR-026)
 
 ### Fixed
 - JSON that the SDK writes for the model now carries non-ASCII text as literal UTF-8
@@ -646,6 +686,88 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     covered* item on events stands.
 
   No public API changes. (BR-025)
+
+- When a host routes structlog through stdlib `logging` with
+  `structlog.stdlib.render_to_log_kwargs` or `render_to_log_args_and_kwargs`, which pass the
+  event dict's keys apart from `event`, `exc_info`, `stack_info` and `stacklevel` (and
+  `positional_args` for the second) to stdlib as the record's `extra` (by reading structlog
+  26.1.0), stdlib's `Logger.makeRecord` refuses a key that is a `LogRecord` attribute,
+  `message` or `asctime`. Four SDK log lines passed one (`name`, or `message` in
+  `mcp.refresh_failed`; see Changed), so the log call raised `KeyError: "Attempt to
+  overwrite 'name' in LogRecord"` (`'message'` for `mcp.refresh_failed`), which escaped the
+  SDK call that logged it. In the periodic refresh, the task's `except` arm caught a
+  refresh's exception, that `KeyError` included, and its own log call then raised for
+  `'message'`. Measured before BR-026 with structlog 26.1.0 and both recipes, on CPython
+  3.14.3 with `openai` 2.43.0 and 2.54.0 and on CPython 3.13.2 and 3.11.15 with 2.54.0:
+  - With DEBUG enabled for the SDK's loggers, `AgentLoop.run()` raised it at the first tool
+    call it dispatched, with no `ErrorEvent` or `FinalEvent`: for a single native call (to a
+    registered tool, to an unregistered one, with an Arabic name and with a name holding
+    U+D800) and a native batch, with a scripted client and with the shipped client; and,
+    with a scripted client, a `ToolMode.JSON` call, a `ToolMode.PROSE` call and a call
+    parsed by `JsonModeParser` without a tool mode (that one also with the shipped client).
+    Those runs have no `before_tool` hook, and each raised after one request. A call a
+    `before_tool` hook denies logs `tool_denied` instead, which passes no such key: with the
+    shipped client and a hook that denied one tool, a native batch of the denied call and an
+    allowed one raised at the allowed call, after one request, and a run whose first turn
+    held only the denied call raised in its second turn, after two requests. With the SDK's
+    loggers at INFO, or with no level set anywhere (stdlib's default passes WARNING and
+    above), the runs without a hook completed.
+  - With the SDK's loggers at DEBUG, at INFO, or with no level set anywhere:
+    `Registry.register` of a name already registered raised it, and the registry kept the
+    earlier tool. `MCPProvider.attach` raised it at a server tool whose name was already
+    registered: with a local `search` registered and the catalog `[alpha, search, zeta]`,
+    `alpha` was registered, `search` stayed the local tool and `zeta` was not registered.
+    `refresh()` of a catalog that still held an attached tool raised it (measured for an
+    unchanged one-tool catalog; by reading, it raises at the first catalog tool already in
+    the registry). The periodic refresh task (`start_periodic_refresh`) ended at its first
+    tick with `KeyError` for `'message'`, whether that tick's refresh failed (measured with
+    an `MCPError`, with an attached tool and with an empty catalog) or refreshed an attached
+    tool (by reading, that refresh raised at `mcp.tool_overwrite`, and the task's `except`
+    arm then raised at `mcp.refresh_failed`), and no later refresh ran. With an empty
+    catalog and no failed refresh, the task kept running.
+  - Each of these raises happened the same way on 1.10.1 on the same library sets. At DEBUG
+    and with no level set, they also happened on 1.8.0 and 1.9.0, and on 1.7.0 through
+    `SafetyConfig(native_tools_enabled=True)` and `JsonModeParser` (it has no `tool_mode`),
+    with CPython 3.14.3 and `openai` 2.43.0; the `ToolMode.JSON`, `ToolMode.PROSE` and
+    `before_tool` cases were not run on those three.
+  - With a hand-written processor instead of either recipe, one that returns the event's
+    keys as `extra`, and the root logger at DEBUG, a single native call (scripted client)
+    and a registry overwrite raised the same way, on the same library sets, and on 1.7.0
+    (through `SafetyConfig(native_tools_enabled=True)`) and 1.10.1 with CPython 3.14.3 and
+    `openai` 2.43.0.
+- Each now logs and continues, measured the same way: the runs end on the model's answer
+  (the runs with a `before_tool` hook included), `register`, `attach` and `refresh()`
+  return, and the periodic task keeps refreshing after a failed tick and after a tick that
+  refreshed an attached tool. Under these two recipes the records carry the value as a
+  `tool_name` or `error_message` attribute, and their `name` is the SDK logger's name
+  (`fifty_agent_sdk.loop`, `fifty_agent_sdk.tools.registry` or
+  `fifty_agent_sdk.tools.mcp_provider`). Under structlog's default configuration and with
+  `structlog.stdlib.ProcessorFormatter.wrap_for_formatter`, which passes the event dict as
+  the record's `msg`, none of these cases raised just before BR-026, and they still do not.
+  On 1.10.1, before BR-024, the runs with a tool name holding U+D800 raised
+  `UnicodeEncodeError` under those configurations instead (with either client under the
+  default configuration, with the shipped client under `wrap_for_formatter`). structlog
+  24.1.0, the lowest release the SDK accepts, gave the same results as 26.1.0 on the tree
+  just before BR-026 and after it, with `render_to_log_kwargs`, `wrap_for_formatter` and
+  its default configuration, on the same four library sets; it was not run on 1.10.1 or
+  earlier, and it has no `render_to_log_args_and_kwargs`.
+- Not covered:
+  - stdlib refuses these keys whatever adds them. Six of the keys structlog's
+    `CallsiteParameterAdder` can add are `LogRecord` attributes (`pathname`, `filename`,
+    `module`, `lineno`, `thread` and `process`, in structlog 26.1.0). With its default
+    parameters before `render_to_log_kwargs`, `Registry.register`'s overwrite warning still
+    raises `KeyError` for one of those keys; which one depends on the interpreter's string
+    hash seed (with `PYTHONHASHSEED` 0 to 19 every seed raised, and each of the six keys
+    appeared, on the four library sets). An attribute that a host's `LogRecord` factory
+    adds can do the same (by reading). The SDK never configures structlog.
+  - The periodic refresh logs a failed tick with an unguarded log call, so a logging
+    configuration that makes that call raise still ends the task: with a processor that
+    raises on `mcp.refresh_failed`, the task ended with that processor's exception at its
+    first failed tick (measured on the four library sets).
+  - CPython 3.12 runs in CI but was not measured for this item, and structlog releases
+    other than 24.1.0 and 26.1.0 were not measured.
+
+  No public API changes; the renamed log keys are listed under Changed. (BR-026)
 
 ## [1.10.1] - 2026-09-28
 

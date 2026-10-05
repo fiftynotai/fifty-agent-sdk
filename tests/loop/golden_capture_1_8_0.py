@@ -47,6 +47,10 @@ tool result in the scenarios is a non-string value that renders as JSON.
 Nor model-written text the client sends (an assistant message's content, a
 tool call's name, a tool reply's name) holding a surrogate code point
 (BR-024): no scenario's text in those fields holds one (BR-024 evidence, P5).
+Nor a run that dispatches a tool call while structlog passes the SDK's log
+keys to stdlib ``logging`` as ``extra`` with DEBUG enabled (BR-026): no
+scenario routes structlog through stdlib, and the fixtures hold no log lines
+(by reading).
 
 This file is deliberately NOT named ``test_*.py`` so pytest does not collect
 it; :mod:`tests.loop.test_golden_1_8_0` imports it.

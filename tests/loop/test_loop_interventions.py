@@ -35,8 +35,9 @@ What these pin:
   edits at any depth never leak, also in args nested 5000 levels deep
   (TD-010); uncopyable args take the one-level fallback without ever being
   treated as a hook failure.
-* Dispatch log lines: ``tool_invoked`` per call as in 1.9.0, ``tool_denied``
-  for a denied call.
+* Dispatch log lines: ``tool_invoked`` per call as in 1.9.0 (its tool name
+  under ``tool_name`` since BR-026, ``name`` before), ``tool_denied`` for a
+  denied call.
 
 What these do NOT pin: how a real model reads a note (in the ``"assistant"``
 versus ``"user"`` role), or whether it stops reading rows back. That is the
@@ -1727,7 +1728,7 @@ def _two_call_loop(batch: bool, interventions: Interventions | None) -> AgentLoo
 async def test_dispatch_logs_tool_invoked_per_call_and_tool_denied_for_a_denied_call(
     batch: bool, deny_second: bool
 ) -> None:
-    """Each call logs one DEBUG dispatch line: ``tool_invoked`` (name, call_id, run_id), as 1.9.0 did, or ``tool_denied`` (call_id, run_id, no tool name) when ``before_tool`` denied it (FR-003 D4, D5)."""
+    """Each call logs one DEBUG dispatch line: ``tool_invoked`` (tool_name, call_id, run_id), as 1.9.0 did apart from the key, renamed from ``name`` by BR-026, or ``tool_denied`` (call_id, run_id, no tool name) when ``before_tool`` denied it (FR-003 D4, D5)."""
 
     def before_tool(_sid: object, _cid: object, name: str, _args: object) -> DenyToolCall | None:
         return DenyToolCall(reason="not this one") if name == "ok2" else None
@@ -1743,7 +1744,7 @@ async def test_dispatch_logs_tool_invoked_per_call_and_tool_denied_for_a_denied_
     first = {
         "event": "tool_invoked",
         "log_level": "debug",
-        "name": "ok",
+        "tool_name": "ok",
         "call_id": ids["ok"],
         "run_id": run_id,
     }
@@ -1755,7 +1756,7 @@ async def test_dispatch_logs_tool_invoked_per_call_and_tool_denied_for_a_denied_
             "run_id": run_id,
         }
     else:
-        second = {**first, "name": "ok2", "call_id": ids["ok2"]}
+        second = {**first, "tool_name": "ok2", "call_id": ids["ok2"]}
     assert dispatch_lines == [first, second]
 
 
