@@ -20,6 +20,12 @@ commitments from BR-010:
 * Every backend failure (:class:`redis.exceptions.RedisError`) is wrapped
   into :class:`StateStoreError` with the documented context shape.
 * :class:`RedisStateStore` satisfies the :class:`StateStore` protocol.
+* A surrogate code point in ``content``, ``name`` or ``tool_call_id`` is
+  stored as its six-character escape, which reads back exactly like the
+  same six characters typed; a message without one, or one holding a
+  non-``str`` value set without validation, is stored as its own
+  ``model_dump_json()``; ``tool_calls`` are serialised as before; a
+  ``session_id`` holding one still raises ``UnicodeEncodeError`` (BR-025).
 
 Fixture seam
     The ``store`` fixture builds a real :class:`RedisStateStore` and then
@@ -34,15 +40,19 @@ Fixture seam
 from __future__ import annotations
 
 import json
+import warnings
 from collections.abc import AsyncIterator
 from typing import Any
 
 import fakeredis
 import pytest
 import pytest_asyncio
+from pydantic import ValidationError
+from pydantic_core import PydanticSerializationError
 from redis.exceptions import RedisError, WatchError
 
-from fifty_agent_sdk import ChatMessage, RedisStateStore, StateStore, StateStoreError
+from fifty_agent_sdk import ChatMessage, RedisStateStore, StateStore, StateStoreError, ToolCall
+from fifty_agent_sdk.state.protocol import TRUNK_BRANCH_ID
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -621,3 +631,317 @@ async def test_redis_store_satisfies_state_store_protocol(
 ) -> None:
     """:class:`RedisStateStore` matches the :class:`StateStore` runtime protocol."""
     assert isinstance(store, StateStore)
+
+
+# ---------------------------------------------------------------------------
+# Text UTF-8 cannot encode (BR-025)
+# ---------------------------------------------------------------------------
+#
+# ChatMessage.model_dump_json() raises PydanticSerializationError for a
+# surrogate code point (U+D800-U+DFFF), and append called it before its
+# RedisError wrapping, so before BR-025 such a message raised out of append
+# as it was, with nothing stored (BR-025 evidence, P2). Since BR-025 append
+# dumps a copy whose content, name and tool_call_id carry the six-character
+# escape, which cannot be told apart from the same six characters typed
+# (pinned below). Expected escapes are literals, never computed with
+# escape_surrogates.
+
+_SURROGATE = chr(0xD800)
+_ESCAPE = "\\ud800"  # the six characters written for chr(0xD800)
+_ARABIC = "مرحبا بالعالم "
+
+# Messages with no surrogate code point anywhere: BR-025 probe P4's corpus
+# without its last message, which holds one in tool_calls (see the
+# tool_calls tests below).
+_PLAIN_MESSAGES = [
+    pytest.param(ChatMessage(role="user", content="hello world"), id="user_ascii"),
+    pytest.param(ChatMessage(role="assistant", content=_ARABIC * 100), id="arabic_x100"),
+    pytest.param(
+        ChatMessage(role="assistant", content="smile " + chr(0x1F600) + " ok"), id="astral_emoji"
+    ),
+    pytest.param(ChatMessage(role="assistant", content="del" + chr(0x7F) + "end"), id="u007f"),
+    pytest.param(ChatMessage(role="assistant", content="a\\ud800b"), id="typed_escape"),
+    pytest.param(
+        ChatMessage(role="user", content="q\"'\\\n\t\\\\end"), id="quotes_backslashes_newline_tab"
+    ),
+    pytest.param(ChatMessage(role="assistant", content=""), id="empty"),
+    pytest.param(
+        ChatMessage(role="tool", content="result", name="بحث", tool_call_id="call_1"),
+        id="tool_nonascii_name",
+    ),
+    pytest.param(ChatMessage(role="user", content="hi", name="مستخدم"), id="user_named_nonascii"),
+    pytest.param(
+        ChatMessage(role="tool", content="r", name="find\\ud800", tool_call_id="c\\udfff"),
+        id="tool_typed_escape_name",
+    ),
+    pytest.param(
+        ChatMessage(
+            role="assistant",
+            content="",
+            tool_calls=[
+                ToolCall(
+                    name="search",
+                    args={"q": {"n": [1e16, 0.1, None], "مفتاح": "قيمة", "e": None}},
+                    id="call_a",
+                ),
+                ToolCall(name="lookup", args={"id": 7}),
+            ],
+        ),
+        id="tool_calls",
+    ),
+    pytest.param(ChatMessage(role="assistant", content="x", tool_calls=[]), id="empty_tool_calls"),
+    pytest.param(
+        ChatMessage(role="system", content=("You are a helpful agent. " * 410)[:10240]),
+        id="system_10kb",
+    ),
+    pytest.param(
+        ChatMessage(
+            role="assistant",
+            content=(
+                '{"thought": "t", "action": "final", "tool_name": null, '
+                '"tool_args": null, "answer": "' + _ARABIC + '"}'
+            ),
+        ),
+        id="json_envelope",
+    ),
+]
+
+
+@pytest_asyncio.fixture
+async def store_and_raw() -> AsyncIterator[tuple[RedisStateStore, Any]]:
+    """A store and a ``decode_responses=False`` client on the same, fresh ``FakeServer``.
+
+    The raw client reads the list entries as the bytes Redis holds.
+    """
+    server = fakeredis.FakeServer()
+    s = RedisStateStore("redis://localhost:6379/0")
+    s._client = fakeredis.aioredis.FakeRedis(server=server, decode_responses=True)
+    raw = fakeredis.aioredis.FakeRedis(server=server, decode_responses=False)
+    try:
+        yield s, raw
+    finally:
+        await raw.aclose()
+        await s.aclose()
+
+
+async def _raw_entries(store: RedisStateStore, raw: Any) -> list[bytes]:
+    """The trunk list's entries for session ``s1``, through the store's own key helper."""
+    entries: list[bytes] = await raw.lrange(store._msgs_key("s1", TRUNK_BRANCH_ID), 0, -1)
+    return entries
+
+
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    [
+        pytest.param(
+            ChatMessage(role="assistant", content="a" + _SURROGATE + "b"),
+            ChatMessage(role="assistant", content="a" + _ESCAPE + "b"),
+            id="content_assistant",
+        ),
+        pytest.param(
+            ChatMessage(role="user", content="a" + _SURROGATE + "b"),
+            ChatMessage(role="user", content="a" + _ESCAPE + "b"),
+            id="content_user",
+        ),
+        pytest.param(
+            ChatMessage(role="system", content="a" + _SURROGATE + "b"),
+            ChatMessage(role="system", content="a" + _ESCAPE + "b"),
+            id="content_system",
+        ),
+        pytest.param(
+            ChatMessage(role="tool", content="r", name="find" + _SURROGATE, tool_call_id="call_1"),
+            ChatMessage(role="tool", content="r", name="find" + _ESCAPE, tool_call_id="call_1"),
+            id="name_tool",
+        ),
+        pytest.param(
+            ChatMessage(role="tool", content="r", name="find", tool_call_id="c" + _SURROGATE),
+            ChatMessage(role="tool", content="r", name="find", tool_call_id="c" + _ESCAPE),
+            id="tool_call_id_tool",
+        ),
+    ],
+)
+async def test_append_text_holding_a_surrogate_is_stored_escaped(
+    store_and_raw: tuple[RedisStateStore, Any], message: ChatMessage, expected: ChatMessage
+) -> None:
+    """A surrogate code point in ``content``, ``name`` or ``tool_call_id`` is stored as its six-character escape (BR-025, AC-1/AC-4).
+
+    ``append`` does not raise; the list entry is the escaped message's
+    ``model_dump_json()``, and ``get_messages`` returns the escaped text. On
+    the ``cd4b811`` ``src`` ``append`` raised ``PydanticSerializationError``
+    (BR-025 evidence, P2).
+    """
+    store, raw = store_and_raw
+
+    await store.append("s1", message)
+
+    assert await _raw_entries(store, raw) == [expected.model_dump_json().encode("utf-8")]
+    assert await store.get_messages("s1") == [expected]
+
+
+@pytest.mark.parametrize("message", _PLAIN_MESSAGES)
+async def test_append_without_surrogates_stores_the_same_entry(
+    store_and_raw: tuple[RedisStateStore, Any], message: ChatMessage
+) -> None:
+    """A message with no surrogate code point is stored as before BR-025: the entry is its own ``model_dump_json()`` (AC-3).
+
+    BR-025 probe P4 compared these entries' bytes before and after the
+    change for the same messages and found them identical.
+    """
+    store, raw = store_and_raw
+
+    await store.append("s1", message)
+
+    assert await _raw_entries(store, raw) == [message.model_dump_json().encode("utf-8")]
+    assert await store.get_messages("s1") == [message]
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        pytest.param(ToolCall(name="find" + _SURROGATE, args={"q": "x"}, id="call_1"), id="name"),
+        pytest.param(ToolCall(name="find", args={"q": "x"}, id="c" + _SURROGATE), id="id"),
+        pytest.param(
+            ToolCall(name="find", args={"q": "v" + _SURROGATE}, id="call_1"), id="args_value"
+        ),
+    ],
+)
+async def test_tool_calls_holding_a_surrogate_still_raise_raw(
+    store_and_raw: tuple[RedisStateStore, Any], call: ToolCall
+) -> None:
+    """A surrogate code point in a tool call's name, id or argument value still raises ``PydanticSerializationError``, not ``StateStoreError`` (BR-025 decision D3).
+
+    Pins a documented gap, not a decision: BR-025 escapes only ``content``,
+    ``name`` and ``tool_call_id``, and nothing is stored. ``AgentRunner``
+    persists no ``tool_calls``. If this test changes, the CHANGELOG's BR-025
+    *Not covered* item changes with it.
+    """
+    store, raw = store_and_raw
+
+    with pytest.raises(PydanticSerializationError) as exc:
+        await store.append("s1", ChatMessage(role="assistant", content="", tool_calls=[call]))
+
+    assert not isinstance(exc.value, StateStoreError)
+    assert await _raw_entries(store, raw) == []
+    assert await store.get_messages("s1") == []
+
+
+async def test_tool_call_argument_key_holding_a_surrogate_is_stored_as_replacement_characters(
+    store_and_raw: tuple[RedisStateStore, Any],
+) -> None:
+    """A surrogate code point in an argument's key does not raise: the key is stored with three U+FFFD (BR-025 decision D3; pre-existing).
+
+    Pins a documented gap, not a decision: pydantic's ``model_dump_json()``
+    writes such a key so (pydantic 2.13.4 and 2.13.5, BR-025 evidence, P2).
+    If this test changes, the CHANGELOG's BR-025 *Not covered* item changes
+    with it.
+    """
+    store, _raw = store_and_raw
+    call = ToolCall(name="find", args={"k" + _SURROGATE: 1}, id="call_1")
+
+    await store.append("s1", ChatMessage(role="assistant", content="", tool_calls=[call]))
+
+    got = await store.get_messages("s1")
+    assert got[0].tool_calls == [
+        ToolCall(name="find", args={"k" + chr(0xFFFD) * 3: 1}, id="call_1")
+    ]
+
+
+@pytest.mark.parametrize(
+    "content",
+    [pytest.param("a" + _ESCAPE, id="typed"), pytest.param("a" + _SURROGATE, id="code_point")],
+)
+async def test_escaped_and_typed_text_read_back_the_same(
+    store_and_raw: tuple[RedisStateStore, Any], content: str
+) -> None:
+    """The six characters typed and a surrogate code point both read back as the six characters (BR-025, AC-4).
+
+    Nothing decodes the escape on read, so the two cannot be told apart.
+    """
+    store, _raw = store_and_raw
+
+    await store.append("s1", ChatMessage(role="assistant", content=content))
+
+    got = await store.get_messages("s1")
+    assert got[0].content == "a" + _ESCAPE
+
+
+@pytest.mark.parametrize(
+    "session_id",
+    [
+        pytest.param("s" + _SURROGATE, id="d800"),
+        pytest.param("s" + chr(0xD83D) + chr(0xDE00), id="pair_halves"),
+    ],
+)
+async def test_session_id_holding_a_surrogate_still_raises_raw(
+    store_and_raw: tuple[RedisStateStore, Any], session_id: str
+) -> None:
+    """A ``session_id`` holding a surrogate code point still raises ``UnicodeEncodeError``, not ``StateStoreError``, from ``append`` and ``get_messages`` (BR-025).
+
+    Pins a documented gap, not a decision: BR-025 escapes no ``session_id``.
+    An id is part of every key, and its escape would be the same key as the
+    six characters typed, so two sessions would become one (the battery's
+    X1, which escapes the id in ``append``, turns this test red). Nothing is
+    stored. If this test changes, the CHANGELOG's BR-025 *Not covered* item
+    changes with it.
+    """
+    store, raw = store_and_raw
+
+    with pytest.raises(UnicodeEncodeError) as appended:
+        await store.append(session_id, ChatMessage(role="user", content="hello"))
+    with pytest.raises(UnicodeEncodeError) as read:
+        await store.get_messages(session_id)
+
+    assert not isinstance(appended.value, StateStoreError)
+    assert not isinstance(read.value, StateStoreError)
+    assert await raw.keys("*") == []
+    assert await store.get_messages("s" + _ESCAPE) == []
+
+
+def _assigned(**fields: object) -> ChatMessage:
+    """A validated message whose fields are then replaced by assignment, which skips validation."""
+    message = ChatMessage(role="assistant", content="x", name="n", tool_call_id="t")
+    for key, value in fields.items():
+        setattr(message, key, value)
+    return message
+
+
+@pytest.mark.parametrize(
+    ("message", "read_back"),
+    [
+        pytest.param(_assigned(content=123), None, id="content_int"),
+        pytest.param(_assigned(content=None), None, id="content_none"),
+        pytest.param(
+            ChatMessage.model_construct(role="assistant", content=b"by"), "by", id="content_bytes"
+        ),
+        pytest.param(_assigned(name=5), None, id="name_int"),
+        pytest.param(_assigned(tool_call_id=7), None, id="tool_call_id_int"),
+    ],
+)
+async def test_append_of_an_unvalidated_non_str_field_is_stored_as_before(
+    store_and_raw: tuple[RedisStateStore, Any], message: ChatMessage, read_back: str | None
+) -> None:
+    """A message built or changed without validation, holding something other than a ``str`` in a text field, is stored as before BR-025.
+
+    The entry is the message's own ``model_dump_json()``. Reading it back
+    raises pydantic's ``ValidationError`` unless the value still validates
+    as a ``str`` (bytes do), as before: the store does not wrap that
+    corruption signal. BR-025's escape passes such a value through:
+    ``escape_surrogates`` would raise ``AttributeError`` on it out of
+    ``append`` (BR-025 evidence, round 2, M2). The ``cd4b811`` ``src``
+    behaved as this test asserts. pydantic's serializer warnings for the
+    unexpected types are silenced here.
+    """
+    store, raw = store_and_raw
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        await store.append("s1", message)
+        expected = message.model_dump_json().encode("utf-8")
+
+    assert await _raw_entries(store, raw) == [expected]
+    if read_back is None:
+        with pytest.raises(ValidationError):
+            await store.get_messages("s1")
+    else:
+        got = await store.get_messages("s1")
+        assert got[0].content == read_back

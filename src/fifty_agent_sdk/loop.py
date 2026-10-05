@@ -165,13 +165,13 @@ Model-written text in requests (BR-024)
     made that line raise ``UnicodeEncodeError`` first, before the request,
     unless the name held a space, tab, ``=``, a quote or a line break, which
     the default renderer writes with ``repr`` (BR-024 evidence, rounds 2 and
-    3); with a JSON renderer the line now shows the
-    escape's backslash escaped again. Otherwise the escape exists only in
-    the request, and the model cannot tell it from the same six characters
-    typed: the messages the loop builds, its events and the messages the
-    Runner passes to its state store keep the model's text, and a custom
-    ``LLMClient`` receives it as before. User and system messages
-    are sent as they are. The release-equivalence statements in
+    3); with a JSON renderer the line now shows the escape's backslash escaped again.
+    Otherwise the client's escape exists only in the request, and the model cannot
+    tell it from the same six characters typed: the messages the loop builds, its
+    events and the messages the Runner passes to its state store keep the model's
+    text (since BR-025 ``SqlStateStore`` and ``RedisStateStore`` store such text with
+    the same escape), and a custom ``LLMClient`` receives it as before. User and
+    system messages are sent as they are. The release-equivalence statements in
     this module (above, in :class:`AgentLoop`'s Args and in its
     ``__init__`` comments), and the matching ones in
     :mod:`fifty_agent_sdk.tool_mode` and :mod:`fifty_agent_sdk.interventions`,

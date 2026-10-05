@@ -1,4 +1,4 @@
-"""Text the SDK writes for a model to read, and to a log line: JSON (BR-020) and surrogate escapes (BR-022, BR-024).
+"""Text the SDK writes for a model to read, to a log line and to two state stores: JSON (BR-020) and surrogate escapes (BR-022, BR-024, BR-025).
 
 Routing rule: every ``json.dumps`` whose output reaches a model prompt goes
 through :func:`dumps_for_model`. Since 1.10.2 those are the three call sites
@@ -17,8 +17,18 @@ call's name and a ``"tool"`` message's name
 (``OpenAICompatibleClient._serialize_message``, BR-024). The BR-024 escapes
 exist only in the request and the log line, so the loop's messages and
 events, and the messages the Runner passes to its state store, keep the
-model's text. The same rule holds for it: never use it on text that is
-stored, hashed or used as a key.
+model's text. The same rule holds for it as for :func:`dumps_for_model`:
+text that is stored, hashed or used as a key never goes through it, with
+one exception. ``SqlStateStore.append`` and ``RedisStateStore.append`` run
+it on a message's ``content``, ``name`` and ``tool_call_id``
+(``state/_surrogates.py``, BR-025), because before BR-025 those stores
+could not store those fields holding a surrogate code point at all
+(measured with SQLite through aiosqlite and with fakeredis; Postgres not
+measured): SQLite's driver and pydantic's ``model_dump_json()`` raised.
+Text without one is returned as the same object, so it is stored as before.
+There too the escape cannot be reversed: reading the message back returns
+the six characters, which cannot be told apart from the same six characters
+typed.
 
 This module is private and carries no semver protection.
 """
@@ -94,7 +104,7 @@ def dumps_for_model(
 
 
 def escape_surrogates(text: str) -> str:
-    """Write each surrogate code point in model-facing or logged text as its ``\\udXXX`` escape (BR-022, BR-024).
+    """Write each surrogate code point in model-facing, logged or stored message text as its ``\\udXXX`` escape (BR-022, BR-024, BR-025).
 
     UTF-8 can encode every code point except the surrogates, U+D800-U+DFFF.
     A Python ``str`` can still hold them (``json.loads('"\\ud800"')`` or a
@@ -105,7 +115,9 @@ def escape_surrogates(text: str) -> str:
     for text the model wrote and the SDK sent back (an echoed completion, a
     tool name), and the shipped client's request serialiser and the loop's
     ``tool_invoked`` log line call this function too (see the module
-    docstring).
+    docstring). Two state stores raised for such text too, and since
+    BR-025 they call it as well; whoever reads that text back cannot tell
+    the escape from the same six characters typed either (below).
 
     The function tries ``text.encode("utf-8")``, which fails exactly when the
     text holds a surrogate code point. If it succeeds, ``text`` itself is
@@ -125,12 +137,18 @@ def escape_surrogates(text: str) -> str:
     length BR-020 removed (six characters per Arabic letter).
 
     Only ``UnicodeEncodeError`` from the encode check is caught. Never use
-    this on text that is stored, hashed or used as a key.
+    this on text that is stored, hashed or used as a key, except where a
+    store cannot hold a surrogate code point in that field at all: BR-025
+    runs it on the ``content``, ``name`` and ``tool_call_id`` that
+    ``SqlStateStore`` and ``RedisStateStore`` write (see the module
+    docstring). There it changes only text those stores could not store in
+    those fields before, and whoever reads it back cannot tell the escape
+    from the same six characters typed.
 
     Args:
         text: The text of a message, or of a message field such as a tool
-            name, that the SDK is about to send to a model or write to a
-            log line.
+            name, that the SDK is about to send to a model, write to a log
+            line or, in ``SqlStateStore`` and ``RedisStateStore``, store.
 
     Returns:
         ``text`` itself when it encodes as UTF-8, else a copy in which every

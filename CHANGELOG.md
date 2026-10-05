@@ -151,7 +151,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (measured on `openai` 2.43.0 and 2.54.0 with CPython 3.14.3, and 2.54.0 with 3.11.15 and
   3.13.2). It now sends the escape and continues, measured with structlog silenced and under
   its default configuration (see the BR-024 items). No golden scenario holds such text.
-  (BR-024)
+  (BR-024) BR-025 adds no scope (by reading): it changes SDK code only in `state/`, and no
+  golden scenario uses `AgentRunner` or a state store. (BR-025)
 - Tool-result message text no longer holds a surrogate code point (U+D800-U+DFFF), which
   UTF-8 cannot encode:
   - Each one is written as its six-character `\udXXX` escape, the spelling `json.dumps`
@@ -548,16 +549,103 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   - Events, `ChatResponse` and the messages the Runner passes to its state store keep the
     provider's text. `model_dump_json()` of an event holding one (`ThoughtEvent`,
     `ActionEvent`, `ToolStartedEvent`, `ToolFailedEvent`, `FinalEvent`) raises
-    `PydanticSerializationError`; `model_dump(mode="json")` returns. When `AgentRunner`
-    persists a final answer holding one, `SqlStateStore` (SQLite through aiosqlite) raises
-    `UnicodeEncodeError` and `RedisStateStore` (fakeredis) `PydanticSerializationError`, out
-    of `AgentRunner.run()` after the `FinalEvent`, not as `StateStoreError`, and the answer
-    is not stored; `MemoryStateStore` stores it (measured, pydantic 2.13.4 and 2.13.5).
+    `PydanticSerializationError`; `model_dump(mode="json")` returns. Persisting a final
+    answer holding one through `SqlStateStore` or `RedisStateStore` raised outside
+    `StateStoreError`; since BR-025 (below) both store it, with an escape that cannot be told
+    apart from the same six characters typed.
   - A custom `LLMClient` encodes its own requests.
   - Other `openai` releases, and CPython 3.12, were not measured. Log output was measured
     with structlog 26.1.0, under its default configuration and with a JSON renderer only.
 
   No public API changes. (BR-024)
+
+- Persisting a message whose `content`, `name` or `tool_call_id` holds a surrogate code
+  point (U+D800-U+DFFF) through `SqlStateStore` (measured on SQLite through aiosqlite) or
+  `RedisStateStore` raised an exception that is not a `StateStoreError`.
+  When `AgentRunner` persisted a final answer holding one, `SqlStateStore` (SQLite through
+  aiosqlite) raised `UnicodeEncodeError` and `RedisStateStore` (fakeredis)
+  `PydanticSerializationError`, out of `AgentRunner.run()` after the `FinalEvent`. The
+  answer was not stored. The session kept the user turn without it, so the next run sent
+  two user messages in a row. Measured before BR-025 and on 1.10.1, for a NATIVE final
+  answer (the provider body carrying the JSON escape, or the UTF-8 encoded surrogate bytes)
+  and a `ToolMode.JSON` final answer (streamed or not), on CPython 3.14.3 (pydantic 2.13.4,
+  SQLAlchemy 2.0.51, redis 8.0.0 and fakeredis 2.36.2; and pydantic 2.13.5, SQLAlchemy
+  2.1.2, redis 8.1.0 and fakeredis 2.39.0) and on CPython 3.13.2 and 3.11.15 (pydantic
+  2.13.5, SQLAlchemy 2.1.3, redis 8.1.0 and fakeredis 2.39.0), all with aiosqlite 0.22.1.
+  `MemoryStateStore` stored the answer.
+- `SqlStateStore` and `RedisStateStore` now store such a message. Each surrogate code point
+  in its `content`, `name` and `tool_call_id` is written as its six-character `\udXXX`
+  escape, the spelling BR-022 and BR-024 use. Measured on the same versions (SQLite
+  through aiosqlite, and fakeredis), through `append` for each of the three fields and
+  through `AgentRunner` for the final answers above:
+  - The answer is stored, and the next run sends the user turn, the stored answer and the
+    new user turn. The body of that request was byte for byte the one sent with
+    `MemoryStateStore`, because the shipped client writes the same escape into an
+    assistant message's content (BR-024), with `openai` 2.43.0 on the first version set
+    above and 2.54.0 on the others.
+  - Reading the message back returns the escaped text. Nothing decodes it, and it cannot
+    be told apart from those six characters typed literally. `MemoryStateStore` is
+    unchanged: it keeps the code point and returns it. A JSON-mode final answer is stored
+    as its raw envelope, so the escape sits inside a JSON string there: the stdlib
+    `json.loads` of the stored envelope gives the code point back (two that form a pair
+    come back as the one character), and pydantic's JSON parser (`pydantic_core.from_json`)
+    joins such a pair too and rejects one that is not half of a pair with a `ValueError`
+    (measured on the same versions).
+  - A message with no surrogate code point in those three fields is stored as before: the
+    store writes the message object it was given (by reading), and for 15 messages (Arabic
+    text, an astral emoji, U+007F, the six characters of an escape typed literally, quotes,
+    backslashes, a newline and a tab, an empty content, a 10 KB system message, a JSON
+    envelope, every role, with and without `name`, `tool_call_id` and `tool_calls`, and one
+    holding a surrogate code point only in `tool_calls`) the stored SQLite column bytes and
+    Redis list entries were identical before and after BR-025, on the same versions
+    (`RedisStateStore` raised for the last one both times and stored nothing). A message
+    built with `model_construct`, or changed by assignment after validation, can hold
+    something other than a `str` in those fields; such a value is passed through as it is,
+    and for an int, a float, `None`, bytes and a list in `content`, an int or bytes in
+    `name` and an int in `tool_call_id`, both stores stored the same bytes or raised the
+    same exception before and after BR-025, on the same versions. Rows already stored are
+    not changed.
+  - The rule follows the field, not the role. A user message holding one, or a
+    `system_prompt` holding one on the first turn, is now stored escaped, where both stores
+    raised before and did not store it. The shipped client still sends user and system
+    text as it is, so that run now ends with the client's `UnicodeEncodeError`, with
+    nothing sent (see BR-024's *Not covered*). The user turn stays stored without an
+    answer, so the next run sends it (escaped, when it held one) and then the new user
+    turn, and completes: that request carries two user messages in a row. With a
+    `system_prompt` on the session, those two user turns follow the loop's own system
+    message and the stored `system_prompt` message (escaped, when it held one). With
+    `MemoryStateStore` the next run raises again, because the code point is replayed.
+    Measured through `AgentRunner` on the same versions, for a user message holding one
+    (with no `system_prompt`, and with one that holds none) and for a `system_prompt`
+    holding one.
+  - Both stores' `append` now checks each of `content`, `name` and `tool_call_id` that is
+    a `str` with one UTF-8 encode; a field holding a surrogate code point is encoded twice
+    and decoded once (by reading).
+- Not covered:
+  - `tool_calls` are stored as before. `RedisStateStore` still raises
+    `PydanticSerializationError`, not `StateStoreError`, for a surrogate code point in a
+    tool call's name, id or argument value, and stores nothing. `SqlStateStore` on SQLite
+    stores one there as a JSON escape and returns the code point; two in a row that form a
+    pair come back as the one character they pair to. One in an argument's key does not
+    raise in either store: pydantic writes it as three U+FFFD, and the message is stored
+    with those. Measured on the same versions, the same before and after BR-025.
+    `AgentRunner` persists no `tool_calls`.
+  - A `session_id` holding a surrogate code point still raises `UnicodeEncodeError`, not
+    `StateStoreError`, from `append` and `get_messages` in both stores (measured on SQLite
+    through aiosqlite and with fakeredis). An id is a key, and escaping it could make two
+    ids one.
+  - Postgres and a real Redis server were not measured. By reading only: on Postgres
+    `name` and `tool_call_id` are `VARCHAR(255)`, which rejects a longer string (PostgreSQL
+    16 documentation), and each escaped code point takes six characters, so a value that
+    holds one and is near that length could exceed it there; SQLAlchemy raises a driver
+    error as a `SQLAlchemyError` (2.0.51, `engine/base.py`), which `append` wraps as
+    `StateStoreError`. `tool_calls` are `jsonb` there, and the same documentation says
+    `jsonb` accepts a surrogate escape only as half of a correct pair, so a tool call
+    holding one, which BR-025 leaves as it was, could be rejected there.
+  - The SDK serialises no event with `model_dump_json()` (by reading), so BR-024's *Not
+    covered* item on events stands.
+
+  No public API changes. (BR-025)
 
 ## [1.10.1] - 2026-09-28
 

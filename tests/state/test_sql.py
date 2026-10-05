@@ -18,6 +18,12 @@ SQL-specific commitments from BR-009:
 * Constructor accepts both a URL string (engine owned) and an
   :class:`AsyncEngine` (engine NOT owned; not disposed on
   :meth:`SqlStateStore.aclose`).
+* A surrogate code point in ``content``, ``name`` or ``tool_call_id`` is
+  stored as its six-character escape, which reads back exactly like the
+  same six characters typed; a message without one is stored as its
+  fields' UTF-8 bytes, and one holding a non-``str`` value set without
+  validation as before; ``tool_calls`` are stored as before; a
+  ``session_id`` holding one still raises ``UnicodeEncodeError`` (BR-025).
 
 Engine fixture
     SQLite ``:memory:`` is connection-scoped. The fixture uses
@@ -33,6 +39,7 @@ Engine fixture
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
@@ -777,3 +784,354 @@ def test_metadata_foreign_key_cascades_at_schema_level() -> None:
         fk for fk in messages.foreign_keys if fk.column.table.name == "agent_sessions"
     )
     assert fk_session.ondelete == "CASCADE"
+
+
+# ---------------------------------------------------------------------------
+# Text UTF-8 cannot encode (BR-025)
+# ---------------------------------------------------------------------------
+#
+# SQLite's driver encodes bound text as strict UTF-8, so before BR-025 a
+# surrogate code point (U+D800-U+DFFF) in a message's content, name or
+# tool_call_id made append raise UnicodeEncodeError, outside the
+# StateStoreError wrapping, with nothing stored (BR-025 evidence, P2). Since
+# BR-025 append writes each one as its six-character escape, which cannot be
+# told apart from the same six characters typed (pinned below). Expected
+# escapes are literals, never computed with escape_surrogates.
+
+_SURROGATE = chr(0xD800)
+_ESCAPE = "\\ud800"  # the six characters written for chr(0xD800)
+_ARABIC = "مرحبا بالعالم "
+
+# Messages with no surrogate code point in content, name or tool_call_id:
+# BR-025 probe P4's corpus, the same 15 messages in the same order.
+_PLAIN_MESSAGES = [
+    pytest.param(ChatMessage(role="user", content="hello world"), id="user_ascii"),
+    pytest.param(ChatMessage(role="assistant", content=_ARABIC * 100), id="arabic_x100"),
+    pytest.param(
+        ChatMessage(role="assistant", content="smile " + chr(0x1F600) + " ok"), id="astral_emoji"
+    ),
+    pytest.param(ChatMessage(role="assistant", content="del" + chr(0x7F) + "end"), id="u007f"),
+    pytest.param(ChatMessage(role="assistant", content="a\\ud800b"), id="typed_escape"),
+    pytest.param(
+        ChatMessage(role="user", content="q\"'\\\n\t\\\\end"), id="quotes_backslashes_newline_tab"
+    ),
+    pytest.param(ChatMessage(role="assistant", content=""), id="empty"),
+    pytest.param(
+        ChatMessage(role="tool", content="result", name="بحث", tool_call_id="call_1"),
+        id="tool_nonascii_name",
+    ),
+    pytest.param(ChatMessage(role="user", content="hi", name="مستخدم"), id="user_named_nonascii"),
+    pytest.param(
+        ChatMessage(role="tool", content="r", name="find\\ud800", tool_call_id="c\\udfff"),
+        id="tool_typed_escape_name",
+    ),
+    pytest.param(
+        ChatMessage(
+            role="assistant",
+            content="",
+            tool_calls=[
+                ToolCall(
+                    name="search",
+                    args={"q": {"n": [1e16, 0.1, None], "مفتاح": "قيمة", "e": None}},
+                    id="call_a",
+                ),
+                ToolCall(name="lookup", args={"id": 7}),
+            ],
+        ),
+        id="tool_calls",
+    ),
+    pytest.param(ChatMessage(role="assistant", content="x", tool_calls=[]), id="empty_tool_calls"),
+    pytest.param(
+        ChatMessage(role="system", content=("You are a helpful agent. " * 410)[:10240]),
+        id="system_10kb",
+    ),
+    pytest.param(
+        ChatMessage(
+            role="assistant",
+            content=(
+                '{"thought": "t", "action": "final", "tool_name": null, '
+                '"tool_args": null, "answer": "' + _ARABIC + '"}'
+            ),
+        ),
+        id="json_envelope",
+    ),
+    pytest.param(
+        ChatMessage(
+            role="assistant",
+            content="plain",
+            tool_calls=[
+                ToolCall(name="f" + _SURROGATE, args={"q": "v" + chr(0xDFFF)}, id="call_s")
+            ],
+        ),
+        id="surrogate_only_in_tool_calls",
+    ),
+]
+
+
+async def _raw_text_columns(engine: AsyncEngine) -> list[tuple[Any, ...]]:
+    """Each row's ``content``, ``name``, ``tool_call_id`` and ``tool_calls`` as SQLite stores them."""
+    async with engine.connect() as conn:
+        result = await conn.execute(
+            text(
+                "SELECT CAST(content AS BLOB), CAST(name AS BLOB), "
+                "CAST(tool_call_id AS BLOB), CAST(tool_calls AS BLOB) "
+                "FROM agent_messages ORDER BY id"
+            )
+        )
+        return [tuple(row) for row in result.all()]
+
+
+@pytest.mark.parametrize(
+    ("message", "field", "expected"),
+    [
+        pytest.param(
+            ChatMessage(role="assistant", content="a" + _SURROGATE + "b"),
+            "content",
+            "a" + _ESCAPE + "b",
+            id="content_assistant",
+        ),
+        pytest.param(
+            ChatMessage(role="user", content="a" + _SURROGATE + "b"),
+            "content",
+            "a" + _ESCAPE + "b",
+            id="content_user",
+        ),
+        pytest.param(
+            ChatMessage(role="system", content="a" + _SURROGATE + "b"),
+            "content",
+            "a" + _ESCAPE + "b",
+            id="content_system",
+        ),
+        pytest.param(
+            ChatMessage(role="tool", content="r", name="find" + _SURROGATE, tool_call_id="call_1"),
+            "name",
+            "find" + _ESCAPE,
+            id="name_tool",
+        ),
+        pytest.param(
+            ChatMessage(role="tool", content="r", name="find", tool_call_id="c" + _SURROGATE),
+            "tool_call_id",
+            "c" + _ESCAPE,
+            id="tool_call_id_tool",
+        ),
+    ],
+)
+async def test_append_text_holding_a_surrogate_is_stored_escaped(
+    store: SqlStateStore,
+    engine: AsyncEngine,
+    message: ChatMessage,
+    field: str,
+    expected: str,
+) -> None:
+    """A surrogate code point in ``content``, ``name`` or ``tool_call_id`` is stored as its six-character escape (BR-025, AC-1/AC-4).
+
+    ``append`` does not raise; ``get_messages`` returns the escaped text,
+    and the column holds its UTF-8 bytes. On the ``cd4b811`` ``src``
+    ``append`` raised ``UnicodeEncodeError`` and stored nothing (BR-025
+    evidence, P2).
+    """
+    await store.append("s1", message)
+
+    got = await store.get_messages("s1")
+    assert got == [message.model_copy(update={field: expected})]
+    raw = (await _raw_text_columns(engine))[0]
+    assert raw[("content", "name", "tool_call_id").index(field)] == expected.encode("utf-8")
+
+
+@pytest.mark.parametrize("message", _PLAIN_MESSAGES)
+async def test_append_without_surrogates_stores_the_same_bytes(
+    store: SqlStateStore, engine: AsyncEngine, message: ChatMessage
+) -> None:
+    """A message with no surrogate code point in its three text fields is stored as before BR-025 (AC-3).
+
+    Each text column holds the field's UTF-8 bytes (``NULL`` for ``None``).
+    The ``tool_calls`` column holds ``json.dumps`` of the dumped calls at
+    the stdlib defaults, the serialiser SQLAlchemy's ``JSON`` type uses
+    when the dialect has no ``json_serializer`` (by reading ``sqltypes.py``
+    in SQLAlchemy 2.0.51, 2.1.2 and 2.1.3), so ``tool_calls=None`` is the
+    JSON text ``null``. BR-025 probe P4 compared these columns' bytes
+    before and after the change for the same messages and found them
+    identical.
+    """
+    await store.append("s1", message)
+
+    content, name, tool_call_id, tool_calls = (await _raw_text_columns(engine))[0]
+    assert content == message.content.encode("utf-8")
+    assert name == (message.name.encode("utf-8") if message.name is not None else None)
+    assert tool_call_id == (
+        message.tool_call_id.encode("utf-8") if message.tool_call_id is not None else None
+    )
+    dumped = (
+        [tc.model_dump(mode="json") for tc in message.tool_calls]
+        if message.tool_calls is not None
+        else None
+    )
+    assert tool_calls == json.dumps(dumped).encode("utf-8")
+    assert await store.get_messages("s1") == [message]
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        pytest.param(ToolCall(name="find" + _SURROGATE, args={"q": "x"}, id="call_1"), id="name"),
+        pytest.param(ToolCall(name="find", args={"q": "x"}, id="c" + _SURROGATE), id="id"),
+        pytest.param(
+            ToolCall(name="find", args={"q": "v" + _SURROGATE}, id="call_1"), id="args_value"
+        ),
+    ],
+)
+async def test_tool_calls_holding_a_surrogate_round_trip_unchanged(
+    store: SqlStateStore, call: ToolCall
+) -> None:
+    """A surrogate code point in a tool call's name, id or argument value is stored and read back as it was (BR-025 decision D3).
+
+    BR-025 leaves ``tool_calls`` as before: the stdlib ``json.dumps`` writes
+    the code point as a JSON escape, and the read decodes it back (BR-025
+    evidence, P2, the same before and after BR-025).
+    """
+    message = ChatMessage(role="assistant", content="", tool_calls=[call])
+
+    await store.append("s1", message)
+
+    assert await store.get_messages("s1") == [message]
+
+
+@pytest.mark.parametrize(
+    ("call", "read_back"),
+    [
+        pytest.param(
+            ToolCall(name="a" + chr(0xD83D) + chr(0xDE00) + "b", args={}, id="call_1"),
+            ToolCall(name="a" + chr(0x1F600) + "b", args={}, id="call_1"),
+            id="pair_halves_in_name",
+        ),
+        pytest.param(
+            ToolCall(name="find", args={"k" + _SURROGATE: 1}, id="call_1"),
+            ToolCall(name="find", args={"k" + chr(0xFFFD) * 3: 1}, id="call_1"),
+            id="surrogate_in_args_key",
+        ),
+    ],
+)
+async def test_tool_calls_the_json_column_does_not_round_trip(
+    store: SqlStateStore, call: ToolCall, read_back: ToolCall
+) -> None:
+    """Two tool-call cases read back changed (BR-025 decision D3; pre-existing).
+
+    Pins documented gaps, not decisions: the two halves of U+1F600 in a
+    name are written as two JSON escapes, which the read combines into the
+    one character. A surrogate code point in an argument's key comes back as
+    three U+FFFD, because pydantic's ``model_dump(mode="json")`` writes it
+    so (pydantic 2.13.4 and 2.13.5, BR-025 evidence, P2). If this test
+    changes, the CHANGELOG's BR-025 *Not covered* item changes with it.
+    """
+    await store.append("s1", ChatMessage(role="assistant", content="", tool_calls=[call]))
+
+    got = await store.get_messages("s1")
+    assert got[0].tool_calls == [read_back]
+
+
+@pytest.mark.parametrize(
+    "content",
+    [pytest.param("a" + _ESCAPE, id="typed"), pytest.param("a" + _SURROGATE, id="code_point")],
+)
+async def test_escaped_and_typed_text_read_back_the_same(
+    store: SqlStateStore, content: str
+) -> None:
+    """The six characters typed and a surrogate code point both read back as the six characters (BR-025, AC-4).
+
+    Nothing decodes the escape on read, so the two cannot be told apart.
+    """
+    await store.append("s1", ChatMessage(role="assistant", content=content))
+
+    got = await store.get_messages("s1")
+    assert got[0].content == "a" + _ESCAPE
+
+
+@pytest.mark.parametrize(
+    "session_id",
+    [
+        pytest.param("s" + _SURROGATE, id="d800"),
+        pytest.param("s" + chr(0xD83D) + chr(0xDE00), id="pair_halves"),
+    ],
+)
+async def test_session_id_holding_a_surrogate_still_raises_raw(
+    store: SqlStateStore, engine: AsyncEngine, session_id: str
+) -> None:
+    """A ``session_id`` holding a surrogate code point still raises ``UnicodeEncodeError``, not ``StateStoreError``, from ``append`` and ``get_messages`` (BR-025).
+
+    Pins a documented gap, not a decision: BR-025 escapes no ``session_id``.
+    An id is a key, and its escape would be the same key as the six
+    characters typed, so two sessions would become one (the battery's X1,
+    which escapes the id in ``append``, turns this test red). Nothing is
+    stored. If this test changes, the CHANGELOG's BR-025 *Not covered* item
+    changes with it.
+    """
+    with pytest.raises(UnicodeEncodeError) as appended:
+        await store.append(session_id, ChatMessage(role="user", content="hello"))
+    with pytest.raises(UnicodeEncodeError) as read:
+        await store.get_messages(session_id)
+
+    assert not isinstance(appended.value, StateStoreError)
+    assert not isinstance(read.value, StateStoreError)
+    async with engine.connect() as conn:
+        for table in ("agent_sessions", "agent_branches", "agent_messages"):
+            count = (await conn.execute(text(f"SELECT COUNT(*) FROM {table}"))).scalar_one()
+            assert count == 0, table
+    assert await store.get_messages("s" + _ESCAPE) == []
+
+
+def _assigned(**fields: object) -> ChatMessage:
+    """A validated message whose fields are then replaced by assignment, which skips validation."""
+    message = ChatMessage(role="assistant", content="x", name="n", tool_call_id="t")
+    for key, value in fields.items():
+        setattr(message, key, value)
+    return message
+
+
+@pytest.mark.parametrize(
+    ("message", "field", "stored", "read_back"),
+    [
+        pytest.param(_assigned(content=123), "content", b"123", "123", id="content_int"),
+        pytest.param(
+            ChatMessage.model_construct(role="assistant", content=b"by"),
+            "content",
+            b"by",
+            "by",
+            id="content_bytes",
+        ),
+        pytest.param(_assigned(name=5), "name", b"5", "5", id="name_int"),
+        pytest.param(_assigned(tool_call_id=7), "tool_call_id", b"7", "7", id="tool_call_id_int"),
+    ],
+)
+async def test_append_of_an_unvalidated_non_str_field_is_stored_as_before(
+    store: SqlStateStore,
+    engine: AsyncEngine,
+    message: ChatMessage,
+    field: str,
+    stored: bytes,
+    read_back: str,
+) -> None:
+    """A message built or changed without validation, holding something other than a ``str`` in a text field, is stored as before BR-025.
+
+    SQLite keeps the value it is given (an int as its text, bytes as a
+    blob), and ``get_messages`` returns it as a ``str``. BR-025's escape
+    passes such a value through: ``escape_surrogates`` would raise
+    ``AttributeError`` on it out of ``append`` (BR-025 evidence, round 2,
+    M2). The ``cd4b811`` ``src`` behaved as this test asserts.
+    """
+    await store.append("s1", message)
+
+    raw = (await _raw_text_columns(engine))[0]
+    assert raw[("content", "name", "tool_call_id").index(field)] == stored
+    got = await store.get_messages("s1")
+    assert getattr(got[0], field) == read_back
+
+
+async def test_append_of_an_unvalidated_none_content_is_still_wrapped(
+    store: SqlStateStore,
+) -> None:
+    """A ``content`` of ``None`` set after validation still fails the ``NOT NULL`` column as a wrapped ``IntegrityError`` (BR-025; as on ``cd4b811``)."""
+    with pytest.raises(StateStoreError) as exc:
+        await store.append("s1", _assigned(content=None))
+
+    assert exc.value.context["wrapped"] == "IntegrityError"
+    assert await store.get_messages("s1") == []

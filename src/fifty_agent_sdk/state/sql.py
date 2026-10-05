@@ -99,6 +99,46 @@ Additive columns & older databases
     together with the SDK (an unmigrated database fails the read with
     a wrapped ``OperationalError``, not with silent data loss).
 
+Text UTF-8 cannot encode (BR-025)
+    SQLite's driver encodes bound text as strict UTF-8, so a surrogate
+    code point (U+D800-U+DFFF) in a message's ``content``, ``name`` or
+    ``tool_call_id`` made :meth:`SqlStateStore.append` raise
+    ``UnicodeEncodeError``, outside the contract below, with nothing
+    stored (measured with aiosqlite 0.22.1 on CPython 3.14.3 with
+    SQLAlchemy 2.0.51 and 2.1.2, and on 3.13.2 and 3.11.15 with 2.1.3;
+    BR-025 evidence, P2). :meth:`~SqlStateStore.append` now writes each
+    surrogate code point in those three fields as its six-character
+    ``\\udXXX`` escape before binding, and
+    :meth:`~SqlStateStore.get_messages` returns that escaped text. Nothing
+    decodes it, and it cannot be told apart from the same six characters
+    typed. A message without one in those fields is bound from the same
+    object as before; its stored bytes were unchanged for every message
+    BR-025 compared (probe P4). A field holding something other than a ``str``
+    (or ``None`` in ``name`` and ``tool_call_id``), which a message holds only
+    when validation was bypassed (``model_construct``,
+    ``model_copy(update=...)`` or assignment after validation), is passed
+    through as it is: for the values BR-025 round 2 tried (an int, a float,
+    ``None``, bytes, a list), ``append`` stored the same bytes or raised the
+    same exception as before. Rows already stored are not changed.
+
+    ``tool_calls`` go through the JSON column as before. SQLAlchemy's
+    default serialiser, the stdlib ``json.dumps`` (by reading
+    ``sqltypes.py``), writes a surrogate code point in a tool call's name,
+    id or argument value as a JSON escape, and the read decodes it back to
+    the code point; two in a row that form a pair come back as the one
+    character they pair to. One in an argument's key comes back as three
+    U+FFFD, because pydantic's ``model_dump(mode="json")`` writes it so. A
+    ``session_id`` holding one still raises ``UnicodeEncodeError`` from
+    :meth:`~SqlStateStore.append` and :meth:`~SqlStateStore.get_messages`.
+    These were measured on SQLite with the versions above, the same before
+    and after BR-025. Postgres was not measured. By reading only: there
+    ``name`` and ``tool_call_id`` are ``VARCHAR(255)``, which rejects a
+    longer string (PostgreSQL 16 documentation), and each escaped code
+    point takes six characters, so a value that holds one and is near that
+    length could exceed it, and fail as a wrapped error; ``tool_calls`` is
+    ``JSONB``, which the same documentation says accepts a surrogate escape
+    only as half of a correct pair.
+
 Error wrapping contract
     Every public method wraps :class:`sqlalchemy.exc.SQLAlchemyError`
     (the SQLAlchemy base class) into
@@ -174,6 +214,7 @@ except ImportError as exc:  # pragma: no cover - exercised via importlib in test
 
 from fifty_agent_sdk.errors import StateStoreError
 from fifty_agent_sdk.llm.types import ChatMessage, ToolCall
+from fifty_agent_sdk.state._surrogates import escape_message_surrogates
 from fifty_agent_sdk.state.protocol import TRUNK_BRANCH_ID, BranchInfo
 
 _log: Final = structlog.get_logger(__name__)
@@ -349,7 +390,10 @@ class AgentMessage(Base):
 
     content: Mapped[str] = mapped_column(Text, nullable=False)
     """Arbitrary text; an empty string is permitted (see
-    :class:`ChatMessage`)."""
+    :class:`ChatMessage`). Since BR-025 :meth:`SqlStateStore.append`
+    writes a surrogate code point here as its ``\\udXXX`` escape, which
+    cannot be told apart from the same six characters typed (measured on
+    SQLite; see the module docstring)."""
 
     name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     """Optional named speaker / tool name."""
@@ -366,8 +410,14 @@ class AgentMessage(Base):
 
     Holds :class:`ChatMessage.tool_calls` as a list of JSON objects in the
     same shape the Redis backend persists via ``model_dump_json`` (one
-    ``{"name", "args", "id"}`` object per :class:`ToolCall`), so all three
-    backends round-trip identical payloads. ``JSONB`` on Postgres,
+    ``{"name", "args", "id"}`` object per :class:`ToolCall`), so SQL and Redis
+    read back the same payload when no tool call holds a surrogate code point
+    and every argument value is JSON-native.
+    :class:`~fifty_agent_sdk.state.memory.MemoryStateStore` keeps the objects
+    themselves: a tuple, a set, a ``datetime``, bytes, NaN or infinity come
+    back from SQL and Redis in pydantic's JSON form (BR-025 evidence, round
+    2). For a tool call holding a surrogate code point see the module
+    docstring's "Text UTF-8 cannot encode (BR-025)". ``JSONB`` on Postgres,
     JSON-encoded ``TEXT`` on SQLite. ``NULL`` — including every row written
     before this column existed — reads back as ``tool_calls=None``; see the
     module docstring's "Additive columns" section for the migration story.
@@ -663,6 +713,9 @@ class SqlStateStore:
             fifty_agent_sdk.errors.StateStoreError: If the backend operation
                 fails. ``context["wrapped"]`` carries the underlying
                 SQLAlchemy exception class name.
+            UnicodeEncodeError: If ``session_id`` holds a surrogate code
+                point (not wrapped; measured on SQLite through aiosqlite,
+                Postgres not measured).
         """
         try:
             async with self._session_factory() as session:
@@ -733,6 +786,12 @@ class SqlStateStore:
         ``(session_id, branch_id, sequence)`` unique constraint is the
         database-level safety net.
 
+        Each surrogate code point in ``content``, ``name`` and
+        ``tool_call_id`` is written as its ``\\udXXX`` escape, which
+        :meth:`get_messages` returns and which cannot be told apart from the
+        same six characters typed; ``message`` itself is not changed (BR-025;
+        see "Text UTF-8 cannot encode" in the module docstring).
+
         Args:
             session_id: Opaque session identifier.
             message: The :class:`ChatMessage` to append.
@@ -743,7 +802,20 @@ class SqlStateStore:
                 SQLAlchemy exception class name (e.g.,
                 ``"IntegrityError"`` if a hypothetical race reached the
                 unique-constraint check).
+            pydantic_core.PydanticSerializationError: If pydantic cannot
+                serialise a tool call, for example an argument value of an
+                arbitrary class (not wrapped; nothing is stored). A
+                surrogate code point in a tool call does not raise this
+                error (see the module docstring).
+            UnicodeEncodeError: If ``session_id`` holds a surrogate code
+                point (not wrapped; nothing is stored; measured on SQLite
+                through aiosqlite, Postgres not measured).
         """
+        # BR-025: SQLite's driver encodes bound text as strict UTF-8, so a
+        # surrogate code point is written as its \udXXX escape, which cannot
+        # be told apart from those six characters typed (module docstring).
+        # Without one, this is ``message`` itself.
+        stored = escape_message_surrogates(message)
         lock = await self._get_session_lock(session_id)
         try:
             async with lock, self._session_factory() as session, session.begin():
@@ -795,11 +867,12 @@ class SqlStateStore:
                         branch_id=active,
                         sequence=next_seq,
                         role=message.role,
-                        content=message.content,
-                        name=message.name,
-                        tool_call_id=message.tool_call_id,
+                        content=stored.content,
+                        name=stored.name,
+                        tool_call_id=stored.tool_call_id,
                         # Same JSON shape the Redis backend persists via
                         # model_dump_json, so all backends agree on the wire.
+                        # BR-025 leaves tool_calls as it was (decision D3).
                         tool_calls=(
                             [tc.model_dump(mode="json") for tc in message.tool_calls]
                             if message.tool_calls is not None
