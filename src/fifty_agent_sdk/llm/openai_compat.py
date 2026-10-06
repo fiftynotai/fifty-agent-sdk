@@ -8,6 +8,248 @@ The provider differences are absorbed by ``base_url``.
 All provider SDK exceptions are wrapped into :class:`fifty_agent_sdk.errors.LLMError`
 at the public method boundary, in line with the
 :class:`fifty_agent_sdk.llm.protocol.LLMClient` contract.
+
+Provider bodies and context-window errors (BR-021, BR-023)
+    An OpenAI-compatible endpoint can answer an error with HTTP 200 and a
+    body that is not a chat completion, for example plain text. Measured on
+    ``openai`` 2.43.0 and 2.54.0, such a body reaches the adapter as a
+    ``str``, as a :class:`json.JSONDecodeError` (a body labelled JSON whose
+    text is not JSON), as another failure of the client's decode (a body
+    labelled JSON that is not valid UTF-8, holds an integer literal over the
+    interpreter's int-to-str digit limit, or nests deeper than ``json.loads``
+    decodes), as a JSON object without ``choices``, or on a streaming
+    request as a stream with no events. The adapter raises
+    :class:`~fifty_agent_sdk.errors.LLMError` for each, with one of these
+    ``context["type"]`` values:
+
+    * ``"NonJsonProviderBody"``: the adapter got text where it expected a
+      JSON object, as the response body or as the data of a stream event:
+      text that is not JSON, a bare JSON string, or (a non-streaming body
+      whose Content-Type is not JSON) JSON the client could not decode.
+    * ``"NonStreamProviderBody"``: a streaming request got a 200 whose
+      media type is not ``text/event-stream``, or that has no
+      ``Content-Type``, and that produced no chunk. The type names what was
+      detected, not the body's format: an SSE-framed body holding only
+      ``data: [DONE]`` gets it too. ``context["content_type"]`` holds the
+      media type (``""`` when the header is missing), cut to 100 characters.
+    * ``"UndecodableProviderBody"`` (BR-023): the ``openai`` client could
+      not decode the body. On ``complete()``, a 200 whose Content-Type the
+      client treats as JSON (on 2.43.0 and 2.54.0, when the part before
+      ``;`` ends in ``json``, case-sensitively; measured labelled
+      ``application/json``, ``application/problem+json`` and
+      ``text/json``) and whose body is not valid UTF-8, holds an integer literal over the digit limit, or nests
+      deeper than ``json.loads`` decodes; also a 200 not labelled JSON
+      whose text the client's decode, with the ``charset`` its
+      Content-Type names, rejects with a ``ValueError`` (measured:
+      ``text/plain; charset=utf-16`` or ``utf-32`` on a UTF-8 body, and
+      ``charset=idna``). ``context["decode_error"]`` holds the class name
+      of the exception the client raised: for a body labelled JSON,
+      ``"UnicodeDecodeError"``, ``"ValueError"`` or ``"RecursionError"``;
+      for the ``charset`` case, measured ``"UnicodeDecodeError"`` for
+      ``utf-16`` and ``utf-32`` on CPython 3.13.2 and 3.14.3, and
+      ``"UnicodeError"`` for them on 3.11.15 and for ``idna`` on all
+      three.
+      On ``stream()``, the same three failures while the ``openai``
+      iterator decodes the stream: a line that is not valid UTF-8, or event
+      data over the digit limit or nested past the decoder. There the
+      message quotes the exception's own text, which holds no provider
+      text, and ``context`` holds only ``model``, ``type``,
+      ``decode_error`` and ``phase="stream"``.
+    * ``"ErrorEnvelopeProviderBody"`` (BR-023): a non-streaming 200 whose
+      body is a JSON object without ``choices`` and with a truthy
+      ``error`` member, such as ``{"error": {"message": ...}}`` (measured
+      labelled ``application/json`` and ``text/plain``). The streamed twin
+      is a ``NonStreamProviderBody`` error, which quotes the same text.
+    * ``"ContextLengthExceeded"``: see below.
+
+    The message is a fixed prefix plus the first 500 characters of the
+    stripped provider text, with ``…[truncated]`` appended when it was cut.
+    That text is the decoded body, the value of a body that is a bare JSON
+    string, or the data of the one stream event that failed. For
+    ``UndecodableProviderBody`` and ``ErrorEnvelopeProviderBody`` the
+    decoded body is the body's bytes read as UTF-8, invalid bytes as
+    U+FFFD, whatever ``charset`` the Content-Type names (BR-023 round 2):
+    ``httpx``'s ``Response.text`` decodes with that charset, and for some
+    labels it raises (measured: ``utf-16`` and ``utf-32`` on a UTF-8 body,
+    ``hex``, ``base64``, ``rot13``). So a body actually encoded in UTF-16
+    or UTF-32 is quoted as its UTF-8 reading, NUL characters included, and
+    is not classified (measured for an error envelope in each, with and
+    without a byte-order mark). ``context`` holds ``model``, ``type``,
+    ``body_length`` (the length in characters of that text before
+    stripping), ``decode_error`` for ``UndecodableProviderBody`` and, on a
+    stream, ``phase="stream"`` (plus ``content_type`` for
+    ``NonStreamProviderBody``, the provider's media type cut to 100
+    characters). It holds none of the body's text.
+
+    How ``complete()`` reads the body (BR-023): it calls the ``openai``
+    client's ``with_raw_response.create(...)``, which encodes and sends the
+    request and returns the response without decoding its body, and then
+    decodes the body with ``parse()`` in a separate step. Only that step's
+    ``ValueError`` and ``RecursionError`` become provider-body errors. An
+    error while encoding the request propagates unchanged, with nothing
+    sent: ``UnicodeEncodeError`` for a non-ASCII API key (``httpx`` encodes
+    headers as ASCII) or for a surrogate code point in a field the adapter
+    sends as it is, such as a user or system message (the ``openai`` client
+    encodes the body as strict UTF-8; the fields the model writes are escaped
+    first, see "Model-written text in requests (BR-024)"). In that mode the
+    ``openai`` client adds the header ``X-Stainless-Raw-Response: true`` to each
+    non-streamed request. BR-023's probe P2 compared requests with and
+    without it on ``openai`` 2.43.0 and 2.54.0: every other header had the
+    same value, the header order differed (the new header comes before
+    ``x-stainless-retry-count``), and the method, URL and body bytes were
+    the same.
+    ``stream()`` calls ``create()`` as before.
+
+    Not every such body becomes one of these errors (measured on 2.43.0):
+
+    * A non-streaming 200 whose body is a JSON object without ``choices``
+      and without a truthy ``error`` member (``{"choices": []}``, or an
+      error in another shape such as ``{"detail": ...}``) stays
+      ``"MalformedResponse"`` (``Provider returned no choices.``) and its
+      text is not kept, so it is never classified.
+    * A streaming 200 labelled ``text/event-stream`` whose body holds no SSE
+      field (plain text, or a JSON error envelope) yields no chunk and no
+      error: the ``openai`` SSE decoder drops it before the adapter sees it.
+    * A 200 body, or a stream event's data, that is JSON but neither an
+      object nor a string (an array, a number, ``null``, ``true`` or
+      ``false``) still raises ``"MalformedResponse"`` or
+      ``"MalformedChunk"`` without its text, as before BR-021 (measured
+      labelled ``application/json``).
+    * A non-streaming 200 not labelled JSON whose body ``json.loads``
+      cannot decode (measured: plain text, a body that is not valid UTF-8,
+      an integer literal over the digit limit, nesting past the decoder)
+      and whose Content-Type names a codec that is not a text encoding
+      (measured: ``hex``, ``base64``, ``rot13``, ``zlib``, ``uu``) still
+      raises ``AssertionError`` or ``TypeError`` raw out of ``complete()``,
+      from the ``openai`` client's own ``Response.text`` read inside
+      ``parse()``, as before BR-023 (measured on 2.43.0 and 2.54.0). A
+      body under those labels that ``json.loads`` decodes (a completion,
+      an error envelope) is handled as above.
+    * On ``stream()``, a 200 read ahead (not ``text/event-stream``) whose
+      ``charset`` the read cannot decode with (measured: the same five
+      codecs, ``idna``, and ``utf-16`` and ``utf-32`` on a UTF-8 body)
+      and that produced no chunk ends with the generic wrap
+      (``context["type"]`` is the exception's class name) instead of
+      ``NonStreamProviderBody``: that read is BR-021's and uses
+      ``Response.text``.
+
+    The provider text is diagnostic text, not end-user text. It
+    reaches ``LLMError.message``, and from there
+    :attr:`fifty_agent_sdk.streaming.ErrorEvent.message`, the Runner's
+    ``error`` audit payload (``error_message``) and the ``on_error`` hook,
+    the same places the provider's 4xx/5xx text already reaches (that text
+    is not cut to a bound). :class:`fifty_agent_sdk.loop.AgentLoop` ends
+    the run with :attr:`fifty_agent_sdk.safety.SafetyConfig.
+    error_fallback_message`, never with this text.
+
+    Context-window overflow is classified on these paths only: the
+    ``NonJsonProviderBody``, ``NonStreamProviderBody`` and
+    ``ErrorEnvelopeProviderBody`` errors above, ``UndecodableProviderBody``
+    from ``complete()``, and any ``openai.APIError`` other than
+    ``APITimeoutError``, ``APIConnectionError`` or ``RateLimitError``
+    (``BadRequestError``, ``InternalServerError``, a mid-stream error
+    event, ...), whether ``complete()`` gets it, ``stream()`` gets it when
+    opening the request, or ``stream()`` gets it while iterating. It is
+    never applied to those three when ``complete()`` gets them or
+    ``stream()`` opens the request. While iterating, ``stream()`` has no
+    ``RateLimitError`` arm: ``openai`` 2.43.0 raises only the base
+    ``APIError`` for a mid-stream error event, so no rate limit was
+    measured there. It is never applied to ``UndecodableProviderBody`` from
+    ``stream()``, whose message holds no provider text, to any other
+    failure while a stream is read (an ``httpx`` read error, for example),
+    or to the bodies the list above leaves unhandled. When the full text
+    contains ``max_prompt_length``, ``context_length_exceeded`` or
+    ``maximum context length`` (compared case-insensitively), or the
+    error's ``code`` is ``context_length_exceeded``, ``context["type"]`` is
+    ``"ContextLengthExceeded"`` and ``context["classified_from"]`` holds the
+    type it would otherwise have had. For an error envelope that "full
+    text" is the whole body, so an envelope whose ``code`` is
+    ``context_length_exceeded`` and whose message names no overflow is
+    classified too, as on ``stream()``. The marker list is closed: other
+    phrasings of the same failure stay unclassified, and an unrelated error
+    whose text quotes a marker is misclassified.
+
+Fields of the wrong type (BR-023)
+    A non-streaming 200 completion with a field of the wrong JSON type or
+    value raises :class:`~fifty_agent_sdk.errors.LLMError` with
+    ``context["type"] == "MalformedResponse"`` and the exception as
+    ``__cause__``. Which message depends on the exception mapping raises:
+
+    * ``ValueError`` (a pydantic ``ValidationError`` included),
+      ``OverflowError`` or a ``LookupError`` other than ``IndexError``: the
+      fixed message ``Malformed provider response: a field has the wrong
+      type or value (<exception class>).``, which quotes no value, because
+      ``str()`` of a ``ValidationError`` does. Measured: ``content`` of
+      ``5``, ``[1]``, an object or ``true``; a tool call's ``name`` of
+      ``null`` or ``5``; a usage count of ``-1``, ``"abc"``, ``"nan"``,
+      ``1e400`` or a string of digits over the int-to-str limit; and
+      ``choices`` sent as an object (``KeyError``). Before BR-023 each of
+      these escaped ``complete()`` raw.
+    * ``AttributeError``, ``IndexError`` or ``TypeError``: the earlier
+      message ``Malformed provider response: <the exception's text>``, as
+      before BR-023. Measured: ``choices`` as a string, a number, ``[5]``
+      or ``[[]]``; ``message`` of ``null`` or ``5``; ``finish_reason`` of
+      ``[1]`` or ``{}``; a usage count of ``[1]``; ``tool_calls`` as a
+      number, a string, an object, ``[5]`` or ``[{"function": 5}]``; and a
+      tool call's ``arguments`` of ``5``, ``true``, ``[1]`` or
+      ``{"a": 1}`` (an ``arguments`` of ``null``, ``false``, ``0``,
+      ``""``, ``[]`` or ``{}`` reads as ``{}``).
+
+    None of the shapes measured still escapes ``complete()`` raw. Some
+    wrong-typed values are accepted rather than refused (a ``usage`` that
+    is a list or a string reads as zero counts, a ``finish_reason`` of
+    ``5`` as ``"error"``). A stream chunk with such a field keeps the
+    generic wrap (``context["type"]`` is the exception's class name,
+    ``phase="stream"``).
+
+Tool-call arguments (BR-019)
+    Before decoding the ``arguments`` string of a native tool call, the
+    adapter checks how deeply it nests, one level per JSON object or array
+    (``{"q": [1]}`` is 2 levels; brackets inside strings do not count).
+    Arguments nested deeper than 64 levels
+    (:data:`fifty_agent_sdk._json_depth.MAX_TOOL_ARGS_DEPTH`) raise
+    :class:`~fifty_agent_sdk.errors.LLMError` with ``context["type"] ==
+    "MalformedResponse"`` and the fixed message ``provider tool_call
+    arguments nest deeper than 64 levels``. ``context`` holds ``model``,
+    ``type``, ``tool_call_id``, ``arguments_excerpt`` (the first 200
+    characters of the arguments, as for invalid JSON) and
+    ``max_tool_args_depth`` (``64``), the key that tells this refusal apart
+    from the other ``MalformedResponse`` errors. The check reads brackets,
+    not JSON: invalid text whose brackets open more than 64 levels (``x``
+    followed by 100 ``[``, for example) gets this error too, where earlier
+    releases raised ``provider tool_call arguments is not valid JSON``, so
+    the key means the check refused the text, not that the text decodes to
+    a deeply nested value. The whole response is
+    refused: ``complete()`` returns no :class:`ChatResponse`, so one such
+    entry in a multi-call response refuses every call in it. Before BR-019
+    such arguments were decoded wherever ``json.loads`` could decode them,
+    and re-encoding them for the next request could raise a raw
+    :class:`RecursionError`; past ``json.loads``'s own limit, the decode
+    itself raised it, out of ``complete()``.
+
+Model-written text in requests (BR-024)
+    When it builds a request, the adapter writes each surrogate code point
+    (U+D800-U+DFFF) as its six-character ``\\udXXX`` escape
+    (:func:`fifty_agent_sdk._model_json.escape_surrogates`) in three fields:
+    an assistant message's ``content``, the ``name`` of each tool call an
+    assistant message carries, and a ``"tool"`` message's ``name``. UTF-8
+    cannot encode those code points, and the ``openai`` releases measured
+    (2.43.0 and 2.54.0 on CPython 3.14.3, 2.54.0 on 3.11.15 and 3.13.2;
+    BR-024 probe P4) encode the request body as strict UTF-8, so before
+    BR-024 such a request was not sent: ``UnicodeEncodeError`` propagated
+    out of ``complete()`` and ``stream()``. The rule follows the message's
+    role, not where the text came from, so an assistant message the caller
+    passes in is escaped too. A message without a surrogate code point in
+    those fields serialises to the same dict as before, keys in the same
+    order. Every other field is sent as it is (the ``arguments`` string
+    keeps BR-020's form, escaped in full when a value holds one): a
+    surrogate code point in a user or system message, in a ``"tool"``
+    message's content, or in the ``name`` of a user, assistant or system
+    message still raises ``UnicodeEncodeError`` with nothing sent (BR-024
+    probe P4). The returned
+    :class:`ChatResponse` and the caller's messages are not changed; the
+    escape exists only in the request, and the model cannot tell it from
+    the same six characters typed.
 """
 
 from __future__ import annotations
@@ -27,6 +269,8 @@ from openai import (
     RateLimitError,
 )
 
+from fifty_agent_sdk._json_depth import MAX_TOOL_ARGS_DEPTH, json_nesting_exceeds
+from fifty_agent_sdk._model_json import dumps_for_model, escape_surrogates
 from fifty_agent_sdk.errors import LLMError
 from fifty_agent_sdk.llm.types import (
     ChatMessage,
@@ -52,6 +296,58 @@ _FINISH_REASON_MAP: dict[str, FinishReason] = {
 _MAX_TOOL_CALL_ARG_EXCERPT: int = 200
 """Maximum length of ``arguments_excerpt`` in the malformed-arguments context."""
 
+_MAX_PROVIDER_BODY_EXCERPT: int = 500
+"""Maximum characters of a provider body quoted in an ``LLMError`` message (BR-021)."""
+
+_PROVIDER_BODY_TRUNCATION_MARKER: str = "…[truncated]"
+"""Appended to a provider-body excerpt that was cut (BR-021).
+
+The same text as the Runner's result-summary marker. It is defined here
+because ``llm/`` must not import ``runner.py``.
+"""
+
+_CONTEXT_LENGTH_MARKERS: tuple[str, ...] = (
+    "max_prompt_length",
+    "context_length_exceeded",
+    "maximum context length",
+)
+"""Lower-case substrings that classify a provider error as a context-window overflow.
+
+BR-021. Matched case-insensitively against the full provider text. The list
+is closed: other phrasings stay unclassified, and a provider error that
+merely quotes one of these strings is misclassified. Adding a marker moves
+those errors to a new ``context["type"]``, so it is a CHANGELOG item.
+"""
+
+_CONTEXT_LENGTH_CODE: str = "context_length_exceeded"
+"""Provider error ``code`` that classifies an error as a context-window overflow (BR-021)."""
+
+_EVENT_STREAM_MEDIA_TYPE: str = "text/event-stream"
+"""The one media type a streamed response is iterated without reading it first (BR-021)."""
+
+_MAX_CONTENT_TYPE_LENGTH: int = 100
+"""Maximum length of the media type recorded as ``context["content_type"]`` (BR-021)."""
+
+# Fixed message prefixes of the three provider-body errors (BR-021). The
+# excerpt of the provider's own text follows the prefix.
+_NON_JSON_BODY_PREFIX: str = "Provider response body could not be read as a JSON object: "
+_NON_JSON_EVENT_PREFIX: str = "Provider stream event is not a JSON object: "
+# The stream prefix states what was detected (no chunk, and a media type that
+# is not text/event-stream), not that the body is not SSE: an SSE-framed body
+# holding only `data: [DONE]` also ends here.
+_NON_STREAM_BODY_PREFIX: str = (
+    "Provider stream produced no chunk and its Content-Type is not text/event-stream. Body: "
+)
+
+_UNDECODABLE_BODY_PREFIX: str = "Provider response body could not be decoded: "
+"""Message prefix when ``complete()``'s decode step fails; the body's text follows (BR-023)."""
+
+_UNDECODABLE_STREAM_PREFIX: str = "Provider stream could not be decoded: "
+"""Message prefix when the ``openai`` stream iterator fails to decode; ``str(e)`` follows (BR-023)."""
+
+_ERROR_ENVELOPE_PREFIX: str = "Provider returned an error object instead of a completion: "
+"""Message prefix of a non-streamed 200 error envelope; the body's text follows (BR-023)."""
+
 _MaxTokensParam = Literal["max_tokens", "max_completion_tokens"]
 """Request-body key that carries :attr:`ChatRequest.max_tokens` on the wire."""
 
@@ -65,6 +361,106 @@ _MAX_COMPLETION_TOKENS_MODEL_RE = re.compile(
     r"^(?:.*[/:])?(?:gpt-5|o[134])(?![0-9a-z])",
     re.IGNORECASE,
 )
+
+
+def _is_context_length_exceeded(text: str, code: object = None) -> bool:
+    """Return whether a provider error reports a context-window overflow (BR-021).
+
+    True when ``text`` contains any of :data:`_CONTEXT_LENGTH_MARKERS`
+    (compared after :meth:`str.casefold`), or when ``code`` is a ``str``
+    equal to :data:`_CONTEXT_LENGTH_CODE` after casefolding. The ``code``
+    rule covers a provider error whose message carries no marker. A
+    non-``str`` ``code`` is ignored.
+
+    Args:
+        text: The full provider text: a body, or ``str()`` of an ``openai``
+            exception. Never an excerpt, so a marker past the excerpt bound
+            still counts.
+        code: The ``code`` attribute of an ``openai.APIError``, if any.
+
+    Returns:
+        ``True`` when the error should be typed ``"ContextLengthExceeded"``.
+    """
+    folded = text.casefold()
+    if any(marker in folded for marker in _CONTEXT_LENGTH_MARKERS):
+        return True
+    return isinstance(code, str) and code.casefold() == _CONTEXT_LENGTH_CODE
+
+
+def _classify(context: dict[str, Any], text: str, code: object = None) -> dict[str, Any]:
+    """Re-type an error context as ``"ContextLengthExceeded"`` when the text says so (BR-021).
+
+    Returns ``context`` itself, unchanged, when
+    :func:`_is_context_length_exceeded` is false, so an unclassified error
+    gains no key. Otherwise returns a new dict with ``type`` set to
+    ``"ContextLengthExceeded"`` and ``classified_from`` set to the type it
+    replaced (for example ``"BadRequestError"`` or ``"NonJsonProviderBody"``).
+
+    Args:
+        context: The error context, which must hold a ``"type"`` key.
+        text: The full provider text the classification reads.
+        code: The provider error ``code``, if any.
+
+    Returns:
+        The context to attach to the :class:`LLMError`.
+    """
+    if not _is_context_length_exceeded(text, code):
+        return context
+    return {**context, "type": "ContextLengthExceeded", "classified_from": context["type"]}
+
+
+def _provider_body_error(
+    text: str,
+    *,
+    model: str,
+    type_: str,
+    prefix: str,
+    extra: dict[str, Any] | None = None,
+) -> LLMError:
+    """Build the :class:`LLMError` for a provider body the adapter cannot map (BR-021).
+
+    The message is ``prefix`` plus the stripped ``text`` cut to
+    :data:`_MAX_PROVIDER_BODY_EXCERPT` characters, with
+    :data:`_PROVIDER_BODY_TRUNCATION_MARKER` appended when it was cut. The
+    context holds ``model``, ``type``, ``body_length`` (``len(text)``,
+    before stripping) and ``extra``, and is passed through :func:`_classify`
+    on the WHOLE ``text``. The context holds none of ``text``.
+
+    The error is returned, not raised, so each caller chooses its cause
+    (``raise ... from e`` after a decode failure; no cause on a ``str`` body).
+
+    Args:
+        text: The provider text: the decoded body, the value of a body that
+            is a bare JSON string, or the data of one stream event.
+        model: Model identifier for the context.
+        type_: The context type before classification.
+        prefix: The fixed message prefix naming the failure.
+        extra: Further context keys that carry no body text (``phase``,
+            ``content_type``).
+
+    Returns:
+        The error to raise.
+    """
+    stripped = text.strip()
+    excerpt = stripped[:_MAX_PROVIDER_BODY_EXCERPT]
+    if len(stripped) > _MAX_PROVIDER_BODY_EXCERPT:
+        excerpt += _PROVIDER_BODY_TRUNCATION_MARKER
+    context: dict[str, Any] = {"model": model, "type": type_, "body_length": len(text)}
+    if extra:
+        context.update(extra)
+    return LLMError(prefix + excerpt, context=_classify(context, text))
+
+
+def _media_type(content_type: str | None) -> str:
+    """Return the media type of a ``Content-Type`` header value, casefolded (BR-021).
+
+    The parameters after ``;`` are dropped, so ``"text/event-stream;
+    charset=utf-8"`` gives ``"text/event-stream"``. A missing header gives
+    ``""``.
+    """
+    if content_type is None:
+        return ""
+    return content_type.split(";", 1)[0].strip().casefold()
 
 
 class OpenAICompatibleClient:
@@ -186,7 +582,30 @@ class OpenAICompatibleClient:
         Raises:
             fifty_agent_sdk.errors.LLMError: Wraps any failure of the underlying
                 provider call (network, timeout, rate-limit, malformed
-                envelope, missing fields).
+                envelope, missing fields). A 200 whose body the adapter
+                receives as text (text that is not JSON, or a bare JSON
+                string; see the module docstring) is ``context["type"] ==
+                "NonJsonProviderBody"``, with the body's start in the message
+                (BR-021). A 200 labelled JSON that the ``openai`` client
+                cannot decode (not valid UTF-8, an integer over the digit
+                limit, nested past ``json.loads``) is
+                ``"UndecodableProviderBody"``, and a JSON error envelope is
+                ``"ErrorEnvelopeProviderBody"``, each with the body's start
+                in the message; a field of the wrong type or value is
+                ``"MalformedResponse"`` (see "Fields of the wrong type" in
+                the module docstring for which message) (BR-023). A
+                context-window overflow is ``"ContextLengthExceeded"`` (see
+                the module docstring). Tool call ``arguments`` nested deeper
+                than 64 levels are ``"MalformedResponse"`` with
+                ``context["max_tool_args_depth"]`` (BR-019; see the module
+                docstring).
+            UnicodeEncodeError: Not wrapped. The request could not be
+                encoded, and nothing was sent: a non-ASCII ``api_key``, or a
+                surrogate code point in a field the adapter sends as it is,
+                such as a user or system message (BR-023 probe P2 and
+                BR-024 probe P4, ``openai`` 2.43.0 and 2.54.0). The fields
+                the model writes are escaped since BR-024; see the module
+                docstring.
         """
         model = request.model or self._default_model
         if not model:
@@ -196,7 +615,50 @@ class OpenAICompatibleClient:
             )
         body = self._build_body(request, model=model, stream=False)
         try:
-            raw = await self._client.chat.completions.create(**body)
+            # BR-023: two steps, so that each `except` arm sees only one of
+            # them. The request step encodes and sends the request:
+            # `with_raw_response` makes the openai client return the response
+            # without decoding its body. Only the four openai arms below cover
+            # it, never `ValueError`: encoding raises `UnicodeEncodeError` (a
+            # ValueError) for a surrogate code point in a field
+            # `_serialize_message` sends as it is (a user or system message;
+            # BR-024 escapes the model-written fields before this step), and
+            # httpx raises it for a non-ASCII API key, and neither is a
+            # provider body (BR-021 D9; BR-022 and BR-024 added no arm).
+            raw_response = await self._client.chat.completions.with_raw_response.create(**body)
+            # The decode step (`parse()`) decodes the provider's bytes and
+            # builds the openai model from them; it encodes nothing, so a
+            # ValueError or RecursionError from it is reported as a body the
+            # client could not decode. The order is load-bearing:
+            # JSONDecodeError (a ValueError) first.
+            try:
+                raw = raw_response.parse()
+            except json.JSONDecodeError as e:
+                # BR-021: a 200 labelled JSON whose text is not JSON. `e.doc` is
+                # the decoded body.
+                raise _provider_body_error(
+                    e.doc,
+                    model=model,
+                    type_="NonJsonProviderBody",
+                    prefix=_NON_JSON_BODY_PREFIX,
+                ) from e
+            except (ValueError, RecursionError) as e:
+                # BR-023: a 200 that the client could not decode: not valid
+                # UTF-8 (UnicodeDecodeError), an integer literal over the
+                # interpreter's digit limit (bare ValueError) or nested past the
+                # decoder (RecursionError). `decode_error` names the exception
+                # class; its text is not parsed (coding_guidelines §3). The
+                # quote is the body's bytes read as UTF-8 with invalid bytes as
+                # U+FFFD, whatever `charset` the Content-Type names: httpx's
+                # `.text` decodes with that charset and can itself raise (for
+                # example `charset=utf-16` or `charset=hex`; BR-023 round 2).
+                raise _provider_body_error(
+                    raw_response.http_response.content.decode("utf-8", "replace"),
+                    model=model,
+                    type_="UndecodableProviderBody",
+                    prefix=_UNDECODABLE_BODY_PREFIX,
+                    extra={"decode_error": type(e).__name__},
+                ) from e
         except APITimeoutError as e:
             raise LLMError(
                 str(e),
@@ -215,9 +677,13 @@ class OpenAICompatibleClient:
         except APIError as e:
             raise LLMError(
                 str(e),
-                context={"model": model, "type": type(e).__name__},
+                context=_classify(
+                    {"model": model, "type": type(e).__name__},
+                    str(e),
+                    getattr(e, "code", None),
+                ),
             ) from e
-        return self._map_response(raw, model=model)
+        return self._map_response(raw, model=model, response=raw_response.http_response)
 
     async def stream(self, request: ChatRequest) -> AsyncIterator[ChatResponse]:
         """Stream a completion as incremental chunks.
@@ -231,6 +697,24 @@ class OpenAICompatibleClient:
         ``finish_reason`` without misreading an intermediate delta as
         terminal.
 
+        Non-event-stream responses (BR-021)
+            A 200 whose media type is not ``text/event-stream`` (a missing
+            ``Content-Type`` included) is read whole before its first chunk
+            is yielded, so a direct caller gets that response's chunks only
+            after its body has arrived. If it then yields no chunk, the
+            adapter raises :class:`LLMError` with ``context["type"] ==
+            "NonStreamProviderBody"`` and the body's start in the message,
+            whatever the body holds: an SSE-framed body with only
+            ``data: [DONE]`` gets this error too. If reading the body fails,
+            the adapter raises :class:`LLMError` whose ``context["type"]``
+            is the ``httpx`` exception's class name (for example
+            ``"ReadError"``) and ``context["phase"]`` is ``"stream"``. A
+            ``text/event-stream`` response is not read ahead. One case is
+            not recoverable: a body without SSE fields (plain text, or a
+            JSON error envelope) labelled ``text/event-stream`` yields no
+            chunk and no error, because the ``openai`` SSE decoder discards
+            it (measured on 2.43.0).
+
         Args:
             request: The chat completion request.
 
@@ -240,6 +724,22 @@ class OpenAICompatibleClient:
         Raises:
             fifty_agent_sdk.errors.LLMError: Wraps any failure of the underlying
                 provider call. Errors mid-stream surface from the iterator.
+                A stream event whose data is not JSON, or is a bare JSON
+                string, is ``context["type"] == "NonJsonProviderBody"``
+                (before BR-021 the first was ``"JSONDecodeError"`` and the
+                second ``"MalformedChunk"``). A line the ``openai`` client
+                cannot decode as UTF-8, or event data over the digit limit
+                or nested past ``json.loads``, is
+                ``"UndecodableProviderBody"`` with the exception's class
+                name in ``context["decode_error"]`` and its text after a
+                fixed prefix (before BR-023 ``context["type"]`` was that
+                class name and the message its text). A context-window
+                overflow is ``"ContextLengthExceeded"`` (see the module
+                docstring); a failure of the ``httpx`` read itself, such as
+                a mid-stream ``ReadTimeout``, is never classified.
+                Provider-body errors carry ``context["phase"] == "stream"``.
+            UnicodeEncodeError: Not wrapped, as for :meth:`complete`: the
+                request could not be encoded, and nothing was sent.
         """
         model = request.model or self._default_model
         if not model:
@@ -268,12 +768,72 @@ class OpenAICompatibleClient:
         except APIError as e:
             raise LLMError(
                 str(e),
-                context={"model": model, "type": type(e).__name__},
+                context=_classify(
+                    {"model": model, "type": type(e).__name__},
+                    str(e),
+                    getattr(e, "code", None),
+                ),
             ) from e
 
         try:
-            async for raw_chunk in stream:
+            # BR-021 (D8): the openai client iterates a 200 stream without
+            # looking at its Content-Type, and its SSE decoder silently drops
+            # a body that is not SSE, so a plain-text error would look like an
+            # empty stream. Read every non-event-stream body first (the openai
+            # iterator then replays it from httpx's cache), so its text is
+            # still available if it yields no chunk. `getattr` + `isinstance`
+            # keep a stream object without an httpx `response` (another
+            # openai release, a test double) on the unbuffered path.
+            response = getattr(stream, "response", None)
+            buffered: httpx.Response | None = None
+            media_type = ""
+            if isinstance(response, httpx.Response):
+                media_type = _media_type(response.headers.get("content-type"))
+                if media_type != _EVENT_STREAM_MEDIA_TYPE:
+                    await response.aread()
+                    buffered = response
+            upstream_chunks = 0
+            events = aiter(stream)
+            while True:
+                # BR-023: only the openai iterator step is inside this `try`.
+                # It reads and decodes the stream (each line as strict UTF-8,
+                # each event's data with json.loads) and builds the openai
+                # chunk; the request was encoded by the `create()` above,
+                # outside this `try`. So a ValueError or RecursionError here is
+                # reported as a stream the client could not decode. `_map_chunk`
+                # and the `yield` stay outside it: a ValueError from mapping a
+                # chunk (an `int()` of a usage field, a pydantic
+                # ValidationError) keeps the generic wrap below.
+                try:
+                    raw_chunk = await anext(events)
+                except StopAsyncIteration:
+                    break
+                except json.JSONDecodeError:
+                    # BR-021's arm below handles it: the event data is text.
+                    raise
+                except (ValueError, RecursionError) as e:
+                    raise LLMError(
+                        _UNDECODABLE_STREAM_PREFIX + str(e),
+                        context={
+                            "model": model,
+                            "type": "UndecodableProviderBody",
+                            "decode_error": type(e).__name__,
+                            "phase": "stream",
+                        },
+                    ) from e
+                upstream_chunks += 1
                 yield self._map_chunk(raw_chunk, model=model)
+            if buffered is not None and upstream_chunks == 0:
+                raise _provider_body_error(
+                    buffered.text,
+                    model=model,
+                    type_="NonStreamProviderBody",
+                    prefix=_NON_STREAM_BODY_PREFIX,
+                    extra={
+                        "phase": "stream",
+                        "content_type": media_type[:_MAX_CONTENT_TYPE_LENGTH],
+                    },
+                )
         except APITimeoutError as e:
             raise LLMError(
                 str(e),
@@ -287,11 +847,38 @@ class OpenAICompatibleClient:
         except APIError as e:
             raise LLMError(
                 str(e),
-                context={"model": model, "type": type(e).__name__, "phase": "stream"},
+                context=_classify(
+                    {"model": model, "type": type(e).__name__, "phase": "stream"},
+                    str(e),
+                    getattr(e, "code", None),
+                ),
             ) from e
         except LLMError:
-            # Allow defensive mapping errors raised from `_map_chunk` to surface unchanged.
+            # Allow defensive mapping errors raised from `_map_chunk` (and the
+            # BR-021 and BR-023 provider-body errors above) to surface
+            # unchanged.
             raise
+        except json.JSONDecodeError as e:
+            # BR-021: SSE-framed data that is not JSON (`data: <text>`). `e.doc`
+            # is the event data. Deliberately NOT `ValueError` here: this
+            # `try` also covers `_map_chunk`, whose ValueErrors are not decode
+            # failures (no `e.doc` body to quote) and keep the generic wrap
+            # below, which quotes `str(e)` (that text can hold a field value,
+            # such as `'abc'` from `int()`). The iterator's
+            # other decode failures are typed by the inner arm above (BR-023).
+            # Encoding the request happens in the `create()` call above,
+            # outside this `try`: a surrogate code point in a field
+            # `_serialize_message` sends as it is (a user or system message)
+            # raises `UnicodeEncodeError` raw there (measured for BR-022 on
+            # openai 2.43.0 and 2.54.0; pinned for user and system messages by
+            # test_request_encoding_errors_stay_raw_through_the_real_client).
+            raise _provider_body_error(
+                e.doc,
+                model=model,
+                type_="NonJsonProviderBody",
+                prefix=_NON_JSON_EVENT_PREFIX,
+                extra={"phase": "stream"},
+            ) from e
         except Exception as e:
             raise LLMError(
                 str(e),
@@ -308,13 +895,14 @@ class OpenAICompatibleClient:
 
         For every message EXCEPT an assistant turn carrying native
         ``tool_calls``, this is byte-for-byte ``msg.model_dump(exclude_none=True)``
-        (the pre-BR-008 behavior). For an assistant turn carrying
+        (the pre-BR-008 behavior), apart from the surrogate escape described
+        below (BR-024). For an assistant turn carrying
         ``tool_calls`` (only set when native function-calling is on), the
         message is translated into the OpenAI envelope:
 
             {role:"assistant", content, tool_calls: [
                 {id, type:"function",
-                 function:{name, arguments: json.dumps(args)}}
+                 function:{name, arguments: dumps_for_model(args)}}
             ]}
 
         The ``id`` is sourced PER ENTRY from the entry's own
@@ -328,12 +916,36 @@ class OpenAICompatibleClient:
         sets ``ToolCall(id=None)`` and ``msg.tool_call_id=call_id``, so
         ``tc.id is None`` falls back to ``msg.tool_call_id`` and emits the
         same id BR-008 did. ``arguments`` is emitted as a JSON STRING (not an
-        object), per the OpenAI function-calling spec.
+        object), per the OpenAI function-calling spec. Since 1.11.0 that
+        string keeps non-ASCII text literal rather than as ``\\uXXXX``
+        escapes (a value holding a surrogate code point keeps the escaped
+        form; :func:`fifty_agent_sdk._model_json.dumps_for_model`, BR-020);
+        it decodes to the same value the 1.10.1 string did. BR-020 changed
+        only ``arguments``: the ``id`` expression above is untouched.
 
         Flag-OFF proof: ``ChatMessage.tool_calls`` defaults to ``None`` and is
         only populated on a native turn (which requires
         ``native_tools_enabled=True`` to even reach the provider), so every
-        flag-OFF message takes the ``else`` branch — identical to today.
+        flag-OFF message takes the ``model_dump`` branch — identical to the
+        pre-BR-008 form apart from the surrogate escape described next.
+
+        BR-024: three fields carry text the model writes, and each surrogate
+        code point (U+D800-U+DFFF) in them is written as its six-character
+        ``\\udXXX`` escape (:func:`fifty_agent_sdk._model_json.escape_surrogates`):
+        an assistant message's ``content`` (in the envelope and in the
+        ``model_dump`` branch), each ``tool_calls[].function.name``, and a
+        ``"tool"`` message's ``name``. The rule follows the role, not where
+        the text came from: an assistant message the host passes in (history,
+        a few-shot example, a turn the Runner stored) is escaped too. User and
+        system messages, a ``"tool"`` message's ``content`` (the loop escapes
+        the content it builds, BR-022), every other ``name`` and the ids are
+        left as they are, and ``arguments`` keeps the form described above.
+        The escape is not reversible: the model cannot tell it from the same
+        six characters typed. ``escape_surrogates`` returns its argument itself
+        when the text holds no surrogate code point, and the ``model_dump``
+        branch re-assigns the existing key, so a message without a surrogate
+        code point in those fields serialises to the same dict, keys in the
+        same order.
         """
         if msg.role == "assistant" and msg.tool_calls:
             tool_calls_envelope = [
@@ -341,18 +953,24 @@ class OpenAICompatibleClient:
                     "id": tc.id if tc.id is not None else msg.tool_call_id,
                     "type": "function",
                     "function": {
-                        "name": tc.name,
-                        "arguments": json.dumps(tc.args),
+                        "name": escape_surrogates(tc.name),
+                        "arguments": dumps_for_model(tc.args),
                     },
                 }
                 for tc in msg.tool_calls
             ]
             return {
                 "role": "assistant",
-                "content": msg.content,
+                "content": escape_surrogates(msg.content),
                 "tool_calls": tool_calls_envelope,
             }
-        return msg.model_dump(exclude_none=True)
+        dumped = msg.model_dump(exclude_none=True)
+        # BR-024: re-assign the existing key, so the key order is unchanged.
+        if msg.role == "assistant":
+            dumped["content"] = escape_surrogates(msg.content)
+        elif msg.role == "tool" and msg.name is not None:
+            dumped["name"] = escape_surrogates(msg.name)
+        return dumped
 
     def _max_tokens_key(self, model: str) -> _MaxTokensParam:
         """Resolve the body key for ``max_tokens`` (see ``max_tokens_param``)."""
@@ -423,7 +1041,13 @@ class OpenAICompatibleClient:
         return _FINISH_REASON_MAP.get(raw, "error")
 
     @classmethod
-    def _map_response(cls, raw: Any, *, model: str) -> ChatResponse:  # noqa: ANN401 - SDK shape is opaque
+    def _map_response(
+        cls,
+        raw: Any,  # noqa: ANN401 - SDK shape is opaque
+        *,
+        model: str,
+        response: httpx.Response,
+    ) -> ChatResponse:
         """Map a non-streaming SDK response into our :class:`ChatResponse`.
 
         Defensive: if any required field is missing or has the wrong shape,
@@ -437,11 +1061,66 @@ class OpenAICompatibleClient:
         ``arguments`` raises :class:`LLMError` (``type="MalformedResponse"``)
         with the offending ``tool_call_id`` and a bounded
         ``arguments_excerpt`` — a provider sending malformed ``arguments`` is
-        an unrecoverable envelope error, not model drift.
+        an unrecoverable envelope error, not model drift. So do
+        ``arguments`` nested deeper than 64 levels, which are refused
+        before decoding (BR-019; see :meth:`_map_tool_calls`).
+
+        A ``str`` ``raw`` is a provider body that could not be read as a
+        JSON object: measured on ``openai`` 2.43.0, the client returns a 200
+        body as text when its Content-Type is not JSON and it does not
+        decode, and returns a bare JSON string as that string. It raises
+        :class:`LLMError` with ``context["type"] == "NonJsonProviderBody"``
+        (or ``"ContextLengthExceeded"``) and the body's start in the
+        message, instead of ``"MalformedResponse"`` (BR-021).
+
+        A JSON object without ``choices`` but with a truthy ``error`` member
+        is an error envelope: it raises :class:`LLMError` with
+        ``context["type"] == "ErrorEnvelopeProviderBody"`` (or
+        ``"ContextLengthExceeded"``), quoting the response's bytes read as
+        UTF-8 with replacement (not ``response.text``, which decodes with
+        the Content-Type's ``charset`` and can raise) and classifying the
+        whole of that text, as the streamed twin does. Without such a
+        member it still raises ``"MalformedResponse"`` (``Provider
+        returned no choices.``) without its text. ``choices`` is checked
+        first, so an ``error`` member beside a usable choice is ignored. A
+        field of the wrong type or value raises ``"MalformedResponse"``:
+        with a fixed message naming only the exception class for a
+        ``ValueError`` (pydantic ``ValidationError`` included),
+        ``OverflowError`` or a ``LookupError`` other than ``IndexError``
+        (BR-023), and with ``Malformed provider response: <error>`` for an
+        ``AttributeError``, ``IndexError`` or ``TypeError``, as before.
+
+        Args:
+            raw: What the ``openai`` client's ``parse()`` returned.
+            model: Model identifier for the error context payload.
+            response: The HTTP response ``raw`` was decoded from; its bytes
+                are read only for an error envelope (BR-023).
         """
+        if isinstance(raw, str):
+            raise _provider_body_error(
+                raw,
+                model=model,
+                type_="NonJsonProviderBody",
+                prefix=_NON_JSON_BODY_PREFIX,
+            )
         try:
             choices = raw.choices
             if not choices:
+                if getattr(raw, "error", None):
+                    # BR-023: a JSON error envelope. A truthy `error` member is
+                    # the openai client's own rule for a streamed error event.
+                    # Quote and classify the whole body text, as the streamed
+                    # twin does (`NonStreamProviderBody`), so a `code`-only
+                    # overflow classifies on both. The text is the bytes read
+                    # as UTF-8 with replacement, not httpx's `.text`, which
+                    # decodes with the `charset` the Content-Type names and can
+                    # raise (BR-023 round 2).
+                    raise _provider_body_error(
+                        response.content.decode("utf-8", "replace"),
+                        model=model,
+                        type_="ErrorEnvelopeProviderBody",
+                        prefix=_ERROR_ENVELOPE_PREFIX,
+                    )
                 raise LLMError(
                     "Provider returned no choices.",
                     context={"model": model, "type": "MalformedResponse"},
@@ -452,6 +1131,13 @@ class OpenAICompatibleClient:
             finish_reason = cls._normalize_finish_reason(choice.finish_reason)
             usage = cls._map_usage(raw.usage)
             tool_calls = cls._map_tool_calls(getattr(sdk_message, "tool_calls", None), model=model)
+            # BR-023: built inside the `try`, so a field of the wrong JSON type
+            # reaches the arm below instead of escaping complete() raw.
+            return ChatResponse(
+                message=ChatMessage(role="assistant", content=content, tool_calls=tool_calls),
+                usage=usage,
+                finish_reason=finish_reason,
+            )
         except LLMError:
             raise
         except (AttributeError, IndexError, TypeError) as e:
@@ -459,11 +1145,20 @@ class OpenAICompatibleClient:
                 f"Malformed provider response: {e}",
                 context={"model": model, "type": "MalformedResponse"},
             ) from e
-        return ChatResponse(
-            message=ChatMessage(role="assistant", content=content, tool_calls=tool_calls),
-            usage=usage,
-            finish_reason=finish_reason,
-        )
+        except (ValueError, OverflowError, LookupError) as e:
+            # BR-023 (AC-8): a field of the wrong type or value, such as
+            # `content: 5` or a tool call's `name: null` (a pydantic
+            # ValidationError, which is a ValueError), a usage count of -1, a
+            # usage count `int()` cannot convert ("abc": ValueError; 1e400:
+            # OverflowError), or `choices` sent as an object (`choices[0]`
+            # raises KeyError; round 2). IndexError, also a LookupError, is
+            # taken by the arm above first. The message is fixed: `str(e)` of
+            # a ValidationError quotes the provider's value.
+            raise LLMError(
+                "Malformed provider response: a field has the wrong type or value "
+                f"({type(e).__name__}).",
+                context={"model": model, "type": "MalformedResponse"},
+            ) from e
 
     @classmethod
     def _map_tool_calls(cls, raw: Any, *, model: str) -> list[ToolCall] | None:  # noqa: ANN401 - SDK shape is opaque
@@ -490,7 +1185,18 @@ class OpenAICompatibleClient:
 
         Raises:
             fifty_agent_sdk.errors.LLMError: When an entry's ``arguments``
-                is not valid JSON.
+                is not valid JSON or not a JSON object, or (BR-019) nests
+                deeper than :data:`~fifty_agent_sdk._json_depth.
+                MAX_TOOL_ARGS_DEPTH` levels. The depth check reads
+                brackets before ``json.loads`` runs, so invalid text whose
+                brackets open more than 64 levels (``x`` followed by 100
+                ``[``, which ``json.loads`` rejects at its first character)
+                gets the depth error where earlier releases raised the
+                invalid-JSON one. All three are
+                ``"MalformedResponse"``; only the depth error carries
+                ``context["max_tool_args_depth"]``, and it has no
+                ``__cause__``. The first such entry in ``raw`` ends the
+                mapping, so no :class:`ToolCall` is returned for any entry.
         """
         if not raw:
             return None
@@ -498,6 +1204,41 @@ class OpenAICompatibleClient:
         for tc in raw:
             function = tc.function
             arguments = function.arguments if function.arguments is not None else ""
+            # BR-019: check the nesting of the exact text json.loads would
+            # decode, before decoding it. Deeply nested arguments used to
+            # decode and then make the next request's re-encode raise a raw
+            # RecursionError, or raise it here, past the decoder's own limit
+            # (BR-019 evidence, P1).
+            # The message is fixed and holds no model text; the excerpt goes
+            # in `context`, as in the two arms below. A non-`str` value skips
+            # the check and keeps its pre-BR-019 path: an empty or false one
+            # becomes `{}` without decoding, and any other makes json.loads
+            # raise TypeError, which `_map_response` reports as
+            # MalformedResponse.
+            if (
+                isinstance(arguments, str)
+                and arguments
+                and json_nesting_exceeds(arguments, MAX_TOOL_ARGS_DEPTH)
+            ):
+                raise LLMError(
+                    f"provider tool_call arguments nest deeper than {MAX_TOOL_ARGS_DEPTH} levels",
+                    context={
+                        "model": model,
+                        "type": "MalformedResponse",
+                        "tool_call_id": getattr(tc, "id", None),
+                        "arguments_excerpt": arguments[:_MAX_TOOL_CALL_ARG_EXCERPT],
+                        "max_tool_args_depth": MAX_TOOL_ARGS_DEPTH,
+                    },
+                )
+            # No RecursionError arm (BR-019): after the check, json.loads sees
+            # at most MAX_TOOL_ARGS_DEPTH levels. An arm would also hide the
+            # check's removal from part of the regression suite: with the
+            # check removed and such an arm added, the four codec-limit loop
+            # cases and the past-the-decoder client test passed on CPython
+            # 3.11.15 and 3.13.2, where their arguments fail inside
+            # json.loads itself; the tests one level past the limit stayed
+            # red (BR-019 evidence, mutant M1a). Not measured: a host whose
+            # stack is nearly exhausted when this decodes up to 64 levels.
             try:
                 args = json.loads(arguments) if arguments else {}
             except ValueError as e:
@@ -539,7 +1280,21 @@ class OpenAICompatibleClient:
         on the chunk whose upstream ``finish_reason`` is non-``None``. This
         lets consumers branch on ``finish_reason`` without misreading an
         intermediate delta as terminal.
+
+        A ``str`` ``raw`` is a stream event whose data is a bare JSON string.
+        It raises :class:`LLMError` with ``context["type"] ==
+        "NonJsonProviderBody"`` (or ``"ContextLengthExceeded"``),
+        ``context["phase"] == "stream"`` and the text in the message,
+        instead of ``"MalformedChunk"`` (BR-021).
         """
+        if isinstance(raw, str):
+            raise _provider_body_error(
+                raw,
+                model=model,
+                type_="NonJsonProviderBody",
+                prefix=_NON_JSON_EVENT_PREFIX,
+                extra={"phase": "stream"},
+            )
         try:
             choices = raw.choices
             if not choices:

@@ -493,7 +493,7 @@ async def test_explicit_json_blank_completion_is_not_echoed() -> None:
 async def test_native_empty_final_terminates_with_parser_error(
     retry_enabled: bool, replies: list[str]
 ) -> None:
-    """With no retry left, an empty NATIVE final ends with ParserError + fallback final (FR-001 D6)."""
+    """With no retry left, an empty NATIVE final ends with ParserError + the error text (FR-001 D6, BR-021)."""
     llm = FakeLLMClient([make_response(r) for r in replies])
     safety = SafetyConfig(parser_retry_enabled=retry_enabled)
 
@@ -506,7 +506,7 @@ async def test_native_empty_final_terminates_with_parser_error(
     assert error.context["parser"] == "FinalOnlyParser"
     assert error.context["error_phase"] == "empty_completion"
     assert isinstance(events[-1], FinalEvent)
-    assert events[-1].text == safety.fallback_message
+    assert events[-1].text == safety.error_fallback_message
     assert len(llm.calls) == len(replies)
 
 

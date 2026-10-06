@@ -12,23 +12,53 @@ Covers BR-011's Runner-integration surface:
 * ``audit=None`` is a zero-overhead no-op.
 * A raising sink never aborts the run; the failure is logged at ``WARNING``.
 * ``result_summary`` is bounded with a truncation marker.
+* BR-021: the ``error`` payload's ``error_subtype`` separates a classified
+  provider failure from the iteration cap, and a provider text body ends the
+  turn with ``SafetyConfig.error_fallback_message`` and no assistant turn
+  stored.
+* BR-022: an output whose ``repr`` raises gets the ``result_summary`` marker
+  ``<unrepresentable TYPE: ERROR>`` (type names only) instead of ending
+  ``AgentRunner.run()``, with or without an audit sink; I2 drives a real value
+  nested past the limits the running interpreter measures. A ``BaseException``
+  that is not an ``Exception`` still propagates from the summary.
+* BR-027: through a real :class:`ConsoleAuditSink`, under structlog's
+  default processors (JSON renderer) and under a ``TimeStamper(fmt="iso")``
+  chain, each of a one-tool run's three ``audit.event`` lines carries its
+  event's own time under ``event_timestamp`` (A2).
 """
 
 from __future__ import annotations
 
+import asyncio
+import sys
+from collections.abc import Callable
+
+import pytest
 import structlog
+from pytest_httpx import HTTPXMock
 
 from fifty_agent_sdk import (
     ActionEvent,
     AuditEvent,
     AuditSink,
+    ConsoleAuditSink,
+    FinalEvent,
     Registry,
     SafetyConfig,
     ToolResult,
     ToolStartedEvent,
 )
-from tests.loop.conftest import FakeLLMClient, FakeTool, make_multi_tool_response, make_response
+from fifty_agent_sdk.runner import _bounded_repr
+from tests.loop.conftest import (
+    FakeLLMClient,
+    FakeTool,
+    list_chain,
+    make_multi_tool_response,
+    make_response,
+    measured_unrenderable_depth,
+)
 from tests.runner.conftest import collect, final_json, make_runner, tool_json
+from tests.structlog_chains import CHAINS, audit_json_lines, configured_structlog
 
 # ---------------------------------------------------------------------------
 # Test doubles
@@ -318,6 +348,129 @@ async def test_llm_error_run_emits_session_start_then_error() -> None:
     assert "run_id" in error_event.payload
 
 
+async def test_error_audit_tells_provider_failure_from_steps_exhausted() -> None:
+    """The error audit payload's error_subtype separates a classified provider failure from the cap (BR-021)."""
+    from fifty_agent_sdk.errors import LLMError
+
+    provider_llm = FakeLLMClient(
+        replies=[LLMError("too long", context={"type": "ContextLengthExceeded"})]
+    )
+    provider_spy = SpyAuditSink()
+    runner, _store = make_runner(llm=provider_llm, audit=provider_spy)
+    await collect(runner.run("s1", "Hi"))
+
+    registry = Registry()
+    registry.register(FakeTool("t", result=ToolResult(output="ok")))
+    cap_llm = FakeLLMClient(replies=[make_response(tool_json("t", "t", {}))])
+    cap_spy = SpyAuditSink()
+    runner, _store = make_runner(
+        llm=cap_llm, registry=registry, safety=SafetyConfig(max_iterations=1), audit=cap_spy
+    )
+    await collect(runner.run("s2", "Hi"))
+
+    provider_error = next(e for e in provider_spy.events if e.event_type == "error")
+    cap_error = next(e for e in cap_spy.events if e.event_type == "error")
+    assert provider_error.payload["error_type"] == "LLMError"
+    assert provider_error.payload["error_subtype"] == "ContextLengthExceeded"
+    assert cap_error.payload["error_type"] == "MaxIterationsExceeded"
+    assert cap_error.payload["error_subtype"] is None
+    # One stable key set on this branch, whichever error ended the run.
+    keys = {"run_id", "error_type", "error_subtype", "error_message"}
+    assert set(provider_error.payload) == keys
+    assert set(cap_error.payload) == keys
+
+
+async def test_error_audit_subtype_is_none_for_non_string_types() -> None:
+    """A non-str context["type"] is reported as error_subtype None, never coerced (BR-021)."""
+    from fifty_agent_sdk.errors import LLMError
+
+    llm = FakeLLMClient(replies=[LLMError("odd client", context={"type": 42})])
+    spy = SpyAuditSink()
+    runner, _store = make_runner(llm=llm, audit=spy)
+
+    await collect(runner.run("s1", "Hi"))
+
+    error_event = next(e for e in spy.events if e.event_type == "error")
+    assert error_event.payload["error_subtype"] is None
+
+
+async def test_runner_yields_the_error_text_and_persists_no_assistant_turn(
+    httpx_mock: HTTPXMock,
+) -> None:
+    """A provider text body ends the Runner's turn with the error text; nothing of it is stored or logged (BR-021).
+
+    Drives the real ``OpenAICompatibleClient``. The store holds only the
+    user message, and no structlog entry of the run (Runner, loop, adapter;
+    no audit sink is wired) carries the provider text. With an audit sink,
+    the text does reach ``error_message`` (see the next test).
+    """
+    from fifty_agent_sdk import (
+        AgentLoop,
+        AgentRunner,
+        FinalEvent,
+        JsonModeParser,
+        MemoryStateStore,
+        OpenAICompatibleClient,
+        PromptSections,
+    )
+
+    httpx_mock.add_response(
+        method="POST",
+        url="https://example.com/v1/chat/completions",
+        content=b"Prompt length 145048 exceeds max_prompt_length 131072 SENTINEL-br021",
+        headers={"content-type": "text/plain"},
+    )
+    client = OpenAICompatibleClient(
+        api_key="k", base_url="https://example.com/v1", timeout=5.0, max_retries=0
+    )
+    loop = AgentLoop(
+        llm=client,
+        registry=Registry(),
+        parser=JsonModeParser(),
+        prompts=PromptSections(persona="You are a helpful agent."),
+        safety=SafetyConfig(),
+        model="test-model",
+    )
+    store = MemoryStateStore()
+    runner = AgentRunner(loop=loop, state=store)
+
+    with structlog.testing.capture_logs() as logs:
+        events = await collect(runner.run("s1", "Hi"))
+
+    final = events[-1]
+    assert isinstance(final, FinalEvent)
+    assert final.text == SafetyConfig().error_fallback_message
+    history = await store.get_messages("s1")
+    assert [(m.role, m.content) for m in history] == [("user", "Hi")]
+    assert logs, "capture_logs saw no entries; the leak check below would be vacuous"
+    assert all("SENTINEL" not in repr(entry) for entry in logs)
+
+
+async def test_error_audit_message_carries_the_provider_text_and_subtype() -> None:
+    """With an audit sink wired, error_message carries the provider text, as 4xx text did before (BR-021).
+
+    Pins where the text DOES go, so a docstring that says so stays true.
+    """
+    from fifty_agent_sdk.errors import LLMError
+
+    llm = FakeLLMClient(
+        replies=[
+            LLMError(
+                "Provider response body could not be read as a JSON object: upstream busy",
+                context={"type": "NonJsonProviderBody", "body_length": 13},
+            )
+        ]
+    )
+    spy = SpyAuditSink()
+    runner, _store = make_runner(llm=llm, audit=spy)
+
+    await collect(runner.run("s1", "Hi"))
+
+    error_event = next(e for e in spy.events if e.event_type == "error")
+    assert error_event.payload["error_subtype"] == "NonJsonProviderBody"
+    assert "upstream busy" in error_event.payload["error_message"]
+
+
 async def test_fatal_sdk_error_escaping_loop_is_audited() -> None:
     """An MCPError escaping the loop emits an error audit event, terminates
     with ``terminated_by="sdk_error"``, and still re-raises to the caller.
@@ -526,6 +679,128 @@ async def test_large_tool_output_is_truncated_in_result_summary() -> None:
 
 
 # ---------------------------------------------------------------------------
+# BR-022: an output whose repr raises
+# ---------------------------------------------------------------------------
+
+_SECRET = "SECRET-BR022-runner"
+_DIGIT_LIMIT = sys.get_int_max_str_digits()
+
+
+class _Boom:
+    """An output whose ``__repr__`` raises with a secret in the message."""
+
+    def __repr__(self) -> str:
+        raise RuntimeError(f"repr failed {_SECRET}")
+
+
+@pytest.mark.parametrize(
+    ("make", "marker"),
+    [
+        pytest.param(_Boom, "<unrepresentable _Boom: RuntimeError>", id="raising_repr"),
+        pytest.param(
+            lambda: 10**_DIGIT_LIMIT,
+            "<unrepresentable int: ValueError>",
+            id="int_over_digit_limit",
+            marks=pytest.mark.skipif(
+                _DIGIT_LIMIT == 0, reason="the int-to-str digit limit is disabled (0)"
+            ),
+        ),
+    ],
+)
+async def test_result_summary_names_an_output_whose_repr_raises(
+    make: Callable[[], object], marker: str
+) -> None:
+    """An output whose ``repr`` raises gets ``<unrepresentable TYPE: ERROR>`` as its ``result_summary``, never the exception text, and the turn completes (BR-022).
+
+    Before BR-022 the ``repr`` error ended ``AgentRunner.run()`` from the
+    audit summary (BR-022 evidence, P2 and P3). The integer has
+    ``sys.get_int_max_str_digits() + 1`` digits.
+    """
+    tool = FakeTool("odd", result=ToolResult(output=make()))
+    registry = Registry()
+    registry.register(tool)
+    llm = FakeLLMClient(
+        replies=[
+            make_response(tool_json("fetch", "odd", {})),
+            make_response(final_json("answered")),
+        ]
+    )
+    spy = SpyAuditSink()
+    runner, _store = make_runner(llm=llm, registry=registry, audit=spy)
+
+    events = await collect(runner.run("s1", "Hi"))
+
+    tool_event = next(e for e in spy.events if e.event_type == "tool_invocation")
+    assert tool_event.payload["result_summary"] == marker
+    assert tool_event.payload["outcome"] == "ok"
+    assert _SECRET not in str(tool_event.payload)
+    assert isinstance(events[-1], FinalEvent) and events[-1].text == "answered"
+
+
+class _ReprRaisesBase:
+    def __init__(self, exc_type: type[BaseException]) -> None:
+        self._exc_type = exc_type
+
+    def __repr__(self) -> str:
+        raise self._exc_type()
+
+
+@pytest.mark.parametrize("exc_type", [KeyboardInterrupt, SystemExit, asyncio.CancelledError])
+def test_result_summary_lets_base_exceptions_propagate(exc_type: type[BaseException]) -> None:
+    """``_bounded_repr`` catches ``Exception`` only: a ``BaseException`` raised by ``__repr__`` propagates (BR-022)."""
+    with pytest.raises(exc_type):
+        _bounded_repr(_ReprRaisesBase(exc_type))
+
+
+async def test_runner_survives_a_result_nested_past_the_measured_limits() -> None:
+    """A real list chain past what ``json.dumps`` and ``repr`` render in this test's frame ends the turn on the model's answer, with or without an audit sink (BR-022).
+
+    The depth comes from ``measured_unrenderable_depth(include_repr=True)``
+    (``tests/loop/conftest.py``), called once from this test's frame, so it
+    is derived from the running interpreter; both runs below use it. Its
+    docstring says why ``_bounded_repr`` and the loop's renderer, which run
+    deeper on the stack, cannot render it either. The depth it derived was
+    about 1,900 levels on CPython 3.11.15, 9,980 on 3.13.2 and 104,500 on
+    3.14.3, moving by a few levels with the test harness (3.12 and Linux
+    first run in CI). Before BR-022 the run
+    raised a raw ``RecursionError`` out of ``AgentRunner.run()`` from
+    ``repr`` in ``_bounded_repr``, even with no audit sink, on all three
+    (BR-022 evidence, P2). The list chain is used because on 3.14.3 its
+    ``json.dumps`` limit is past its ``repr`` limit, so the first candidate
+    already fails both and the measurement costs one failing ``repr`` (about
+    0.8 s there); see the evidence, P4. The deep value only meets the code
+    under test: only scalars and short strings reach an ``assert``.
+    """
+    depth = measured_unrenderable_depth(include_repr=True, shape=list_chain)
+
+    for audit in (SpyAuditSink(), None):
+        deep = ToolResult(output=list_chain(depth))
+        registry = Registry()
+        registry.register(FakeTool("deep", result=deep))
+        llm = FakeLLMClient(
+            replies=[
+                make_response(tool_json("fetch", "deep", {})),
+                make_response(final_json("answered")),
+            ]
+        )
+        runner, store = make_runner(llm=llm, registry=registry, audit=audit)
+
+        events = await collect(runner.run("s1", "Hi"))
+
+        kinds = [type(e).__name__ for e in events]
+        assert kinds[-1] == "FinalEvent" and "ErrorEvent" not in kinds
+        final = events[-1]
+        assert isinstance(final, FinalEvent) and final.text == "answered"
+        assert len(llm.calls) == 2
+        history = await store.get_messages("s1")
+        assert [m.role for m in history] == ["user", "assistant"]
+        if isinstance(audit, SpyAuditSink):
+            tool_event = next(e for e in audit.events if e.event_type == "tool_invocation")
+            assert tool_event.payload["result_summary"] == "<unrepresentable list: RecursionError>"
+            assert tool_event.payload["outcome"] == "ok"
+
+
+# ---------------------------------------------------------------------------
 # Protocol smoke / multi-turn
 # ---------------------------------------------------------------------------
 
@@ -573,3 +848,59 @@ async def test_iteration_cap_error_is_audited() -> None:
     error_event = spy.events[-1]
     assert error_event.payload["error_type"] == "MaxIterationsExceeded"
     assert all(e.event_type != "final_answer" for e in spy.events)
+
+
+# ---------------------------------------------------------------------------
+# BR-027: ConsoleAuditSink's lines under a host's TimeStamper
+# ---------------------------------------------------------------------------
+
+
+class _ConsoleTee:
+    """Records each event, then logs it through a real :class:`ConsoleAuditSink`."""
+
+    def __init__(self) -> None:
+        self.events: list[AuditEvent] = []
+        self._sink = ConsoleAuditSink()
+
+    async def record(self, event: AuditEvent) -> None:
+        self.events.append(event)
+        await self._sink.record(event)
+
+
+@pytest.mark.parametrize("chain", ["default_processors_json", "timestamper_iso"])
+async def test_console_audit_lines_carry_each_event_time_under_a_timestamper(chain: str) -> None:
+    """A2: every ``audit.event`` line of a run carries its own event's time as ``event_timestamp`` (BR-027).
+
+    The chains are structlog's default processors with a JSON renderer and
+    ``[add_log_level, TimeStamper(fmt="iso"), JSONRenderer()]``. Before BR-027
+    each of the run's three lines logged its event's time as ``timestamp``,
+    where the ``TimeStamper`` then wrote the log time (BR-027 evidence, P2
+    row j). Each line's ``timestamp`` is now the log time, whose format
+    differs from the event's ``isoformat()`` (a space or a ``Z``, never
+    ``+00:00``).
+    """
+    tool = FakeTool("search", result=ToolResult(output={"x": 1}))
+    registry = Registry()
+    registry.register(tool)
+    llm = FakeLLMClient(
+        replies=[
+            make_response(tool_json("look up", "search", {"q": "weather"})),
+            make_response(final_json("got it")),
+        ]
+    )
+    tee = _ConsoleTee()
+    runner, _store = make_runner(llm=llm, registry=registry, audit=tee)
+
+    with configured_structlog(CHAINS[chain]) as buffer:
+        await collect(runner.run("s1", "Hi"))
+
+    lines = audit_json_lines(buffer)
+    assert [event.event_type for event in tee.events] == [
+        "session_start",
+        "tool_invocation",
+        "final_answer",
+    ]
+    assert [(line["event_type"], line["event_timestamp"]) for line in lines] == [
+        (event.event_type, event.timestamp.isoformat()) for event in tee.events
+    ]
+    assert all(line["timestamp"] != line["event_timestamp"] for line in lines)

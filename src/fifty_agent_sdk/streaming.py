@@ -202,9 +202,13 @@ class FinalEvent(_EventBase):
 
     Attributes:
         event_type: Literal discriminator; always ``"final"``.
-        text: The terminal answer text. On safety-cap / parser error / LLM
-            error termination this is :attr:`fifty_agent_sdk.safety.SafetyConfig.
-            fallback_message`.
+        text: The terminal answer text. On safety-cap termination
+            (``error_type="MaxIterationsExceeded"``) this is
+            :attr:`fifty_agent_sdk.safety.SafetyConfig.fallback_message`; on
+            parser error or LLM error termination it is
+            :attr:`fifty_agent_sdk.safety.SafetyConfig.error_fallback_message`
+            (BR-021; before 1.11.0 those also used ``fallback_message``). On
+            those paths it is never the error's message.
         raw_completion: The raw LLM completion that produced this answer
             (the JSON envelope under JSON-mode). Set ONLY on the happy-path
             :class:`fifty_agent_sdk.parser.base.FinalAnswer` branch; ``None`` on
@@ -227,8 +231,11 @@ class FinalEvent(_EventBase):
 class ErrorEvent(_EventBase):
     """A non-recoverable failure occurred and the run is about to terminate.
 
-    Always followed by a :class:`FinalEvent` carrying
-    :attr:`fifty_agent_sdk.safety.SafetyConfig.fallback_message`. Consumers can
+    Always followed by a :class:`FinalEvent`. That event carries
+    :attr:`fifty_agent_sdk.safety.SafetyConfig.fallback_message` when
+    ``error_type == "MaxIterationsExceeded"``, and
+    :attr:`fifty_agent_sdk.safety.SafetyConfig.error_fallback_message` for
+    ``"LLMError"`` and ``"ParserError"`` (BR-021). Consumers can
     pattern-match on ``error_type`` to take application-specific action
     (for instance, re-raising :class:`fifty_agent_sdk.errors.MaxIterationsExceeded`
     when ``error_type == "MaxIterationsExceeded"``).
@@ -237,10 +244,25 @@ class ErrorEvent(_EventBase):
         event_type: Literal discriminator; always ``"error"``.
         error_type: Short tag identifying the kind of failure (e.g.
             ``"LLMError"``, ``"ParserError"``, ``"MaxIterationsExceeded"``).
-        message: Human-readable failure description.
+        message: Human-readable failure description, for diagnostics. Not
+            end-user text: for an ``"LLMError"`` it is the error's message,
+            which from :class:`fifty_agent_sdk.llm.openai_compat.
+            OpenAICompatibleClient` is often the provider's own error text
+            and may quote its response body (since 1.11.0 the provider-body
+            errors listed in that client's module docstring quote up to 500
+            characters of the body, except an ``"UndecodableProviderBody"``
+            from ``stream()``, which quotes the decoder's error instead;
+            4xx/5xx text is not cut, as before). Show the
+            following :class:`FinalEvent` to end users instead.
         context: Structured debugging payload forwarded verbatim from the
             originating error (when applicable). Always a ``dict``,
-            defaults to ``{}``.
+            defaults to ``{}``. For an ``"LLMError"`` from
+            :class:`fifty_agent_sdk.llm.openai_compat.OpenAICompatibleClient`,
+            ``context["type"]`` classifies the failure, for example
+            ``"ContextLengthExceeded"`` when the provider's error names a
+            context-window overflow on a path that client classifies (its
+            module docstring lists those paths and the ones it does not;
+            BR-021).
     """
 
     event_type: Literal["error"] = "error"

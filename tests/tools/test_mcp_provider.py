@@ -739,10 +739,11 @@ async def test_attach_warns_on_name_collision(
     overwrites = [
         entry
         for entry in logs
-        if entry.get("event") == "mcp.tool_overwrite" and entry.get("name") == "search"
+        if entry.get("event") == "mcp.tool_overwrite" and entry.get("tool_name") == "search"
     ]
     assert len(overwrites) == 1, f"expected exactly one MCPProvider overwrite warning, got {logs}"
     assert overwrites[0]["log_level"] == "warning"
+    assert "name" not in overwrites[0]  # renamed to tool_name by BR-026
 
 
 async def test_refresh_does_not_warn_for_first_time_tools(

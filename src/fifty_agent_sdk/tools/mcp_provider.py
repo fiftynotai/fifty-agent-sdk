@@ -11,7 +11,7 @@ Refresh semantics
     :meth:`MCPProvider.refresh` is the always-available manual path; it
     re-discovers the remote catalog and re-registers every tool, leveraging
     :meth:`fifty_agent_sdk.tools.registry.Registry.register`'s last-write-wins
-    overwrite (registry.py:62-65). Tools that disappeared upstream are NOT
+    overwrite (registry.py:63-65). Tools that disappeared upstream are NOT
     unregistered — the :class:`Registry` has no ``unregister`` (BR-008) and
     the consistency requirement around in-flight
     :class:`fifty_agent_sdk.loop.AgentLoop` snapshots makes silent removal a
@@ -29,10 +29,12 @@ Refresh semantics
 Tool-name collisions
     :meth:`MCPProvider.attach` and :meth:`MCPProvider.refresh` detect when
     a tool name they are about to register already exists in the target
-    :class:`Registry` and log a ``structlog`` warning per collision. The
-    :class:`Registry`'s own overwrite warning still fires; the provider's
-    warning carries the MCP context (server URL) the registry does not
-    know.
+    :class:`Registry` and log a ``structlog`` WARNING ``mcp.tool_overwrite``
+    per collision, with the name under ``tool_name`` (not ``name``, which
+    stdlib's ``LogRecord`` reserves; BR-026). The :class:`Registry`'s own
+    overwrite warning still fires. The provider's warning, under this
+    module's logger, carries the tool name and a fixed ``reason``
+    (``"name already present in registry"``); it carries no server URL.
 """
 
 from __future__ import annotations
@@ -44,6 +46,7 @@ from typing import Any, Final
 import structlog
 from pydantic import BaseModel, ConfigDict
 
+from fifty_agent_sdk._model_json import escape_for_log
 from fifty_agent_sdk.mcp import MCPClient, MCPToolDef
 from fifty_agent_sdk.mcp.client import _MCPCallError
 from fifty_agent_sdk.tools._schema_refs import inline_local_refs
@@ -375,9 +378,10 @@ class MCPProvider:
         for defn in defs:
             adapter = _MCPToolAdapter(defn, self._client)
             if defn.name in existing:
+                # BR-028: a server-defined name; control characters escaped for the log only.
                 _log.warning(
                     "mcp.tool_overwrite",
-                    name=defn.name,
+                    tool_name=escape_for_log(defn.name),
                     reason="name already present in registry",
                 )
                 refreshed += 1
@@ -392,9 +396,23 @@ class MCPProvider:
     async def _periodic_loop(self, interval_seconds: float) -> None:
         """Background task body: sleep, refresh, repeat until cancelled.
 
-        Discovery failures are logged at WARNING (with the MCPError
-        ``context``) but do NOT terminate the task — a transient server
-        outage shouldn't permanently stop refresh.
+        An ``Exception`` from a refresh (a discovery failure, for example)
+        is logged at WARNING as ``mcp.refresh_failed``, with the exception's
+        class name under ``wrapped`` and its ``str()``, with control
+        characters and surrogate code points escaped (BR-028: for a
+        JSON-RPC error it is the MCP server's own message; the escape cannot
+        be told apart from the same six characters typed), under
+        ``error_message``, and does NOT terminate the task — a transient
+        server outage shouldn't permanently stop refresh.
+        ``asyncio.CancelledError`` ends the task. The line does not carry an
+        ``MCPError``'s ``context``. The log call itself is not guarded, so a
+        logging configuration that makes it raise ends the task: before
+        BR-026 the key was ``message``, which stdlib's ``Logger.makeRecord``
+        refuses as ``extra``, and with structlog routed through stdlib by
+        ``render_to_log_kwargs`` or ``render_to_log_args_and_kwargs`` and
+        WARNING enabled for this module's logger, the first failed refresh
+        ended the task that way (measured at DEBUG, at INFO and with no
+        level set).
         """
         while True:
             try:
@@ -409,7 +427,7 @@ class MCPProvider:
                 _log.warning(
                     "mcp.refresh_failed",
                     wrapped=type(exc).__name__,
-                    message=str(exc),
+                    error_message=escape_for_log(str(exc)),
                 )
 
 

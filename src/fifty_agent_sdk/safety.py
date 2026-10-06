@@ -1,9 +1,9 @@
 """Iteration cap and timeout configuration for the agent loop.
 
 :class:`SafetyConfig` is the loop's only knob for production safety. It is
-intentionally narrow: an iteration cap, a per-tool timeout, a fallback
-message the loop emits when iteration is exhausted, and the BR-018 parser
-one-shot retry knobs. The iteration counter itself is a plain ``int``
+intentionally narrow: an iteration cap, a per-tool timeout, the two final
+texts the loop emits when a run does not end with an answer, and the BR-018
+parser one-shot retry knobs. The iteration counter itself is a plain ``int``
 inside :func:`fifty_agent_sdk.loop.AgentLoop.run` — introducing a dedicated
 counter class for a single integer would be over-abstraction.
 
@@ -14,6 +14,17 @@ FinalEvent` carrying :attr:`SafetyConfig.fallback_message`, then returns
 cleanly from the async generator. The exception class
 :class:`fifty_agent_sdk.errors.MaxIterationsExceeded` is retained for callers
 that want to raise from the consumer side of the event stream.
+
+Two final texts (BR-021)
+    ``fallback_message`` follows only the ``ErrorEvent`` whose
+    ``error_type`` is ``"MaxIterationsExceeded"``: the run used up its
+    iterations. Every other ``ErrorEvent`` the loop emits (``"LLMError"``,
+    for example a provider failure, and ``"ParserError"``) is followed by
+    :attr:`SafetyConfig.error_fallback_message`, so the end user is not told
+    the steps ran out when the provider failed. The two are independent:
+    setting only ``fallback_message`` leaves ``error_fallback_message`` at
+    its default. Before 1.11.0 every one of those paths used
+    ``fallback_message``.
 
 Parser-error retry (BR-018)
     On a :class:`fifty_agent_sdk.errors.ParserError` mid-iteration the loop now
@@ -68,9 +79,22 @@ class SafetyConfig(BaseModel):
             disables the timeout; any positive float enforces it. Note:
             this does NOT cover the LLM call itself — wrap a higher-level
             runner with its own request timeout for that.
-        fallback_message: Text used as the :class:`fifty_agent_sdk.streaming.
-            FinalEvent` payload when the iteration cap is hit (or when a
-            parser / LLM error terminates the run). Must be non-empty.
+        fallback_message: Text of the :class:`fifty_agent_sdk.streaming.
+            FinalEvent` when the iteration cap is hit, the one path whose
+            ``ErrorEvent`` has ``error_type="MaxIterationsExceeded"``. Must be
+            non-empty. Before 1.11.0 it also ended runs stopped by an LLM or
+            parser error; those now use :attr:`error_fallback_message`
+            (BR-021).
+        error_fallback_message: Text of the :class:`fifty_agent_sdk.streaming.
+            FinalEvent` that follows every other ``ErrorEvent``: an
+            ``"LLMError"`` (a provider failure, including an over-long
+            prompt) or a ``"ParserError"`` (output that could not be parsed,
+            after the BR-018 retry when it is enabled). Defaults to
+            ``"Something went wrong while answering. Please try again."``.
+            Must be non-empty. Independent of :attr:`fallback_message`:
+            setting only that field leaves this one at its default, so a
+            consumer with a localised ``fallback_message`` sets this field
+            too. BR-021.
         parser_retry_enabled: Kill-switch for the BR-018 one-shot
             parser-error retry. When ``True`` (the default) the loop
             transparently re-issues the LLM call on a mid-iteration
@@ -158,6 +182,13 @@ class SafetyConfig(BaseModel):
     tool_timeout_seconds: float | None = Field(default=30.0, gt=0.0)
     fallback_message: str = Field(
         default="I was unable to complete the task within the allowed steps.",
+        min_length=1,
+    )
+    # BR-021: deliberately NOT derived from an explicitly set
+    # `fallback_message` (no `model_fields_set` check). Inheriting it would
+    # keep a step-limit text on provider failures, which is the bug.
+    error_fallback_message: str = Field(
+        default="Something went wrong while answering. Please try again.",
         min_length=1,
     )
     parser_retry_enabled: bool = Field(default=True)

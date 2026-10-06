@@ -44,6 +44,197 @@ Interventions (FR-003)
     1.9.0 (timestamps and minted ids aside); see
     :mod:`fifty_agent_sdk.interventions` for the contract.
 
+Non-ASCII text (BR-020)
+    Since 1.11.0, JSON the SDK writes for the model carries non-ASCII text
+    literally instead of as ``\\uXXXX`` escapes: non-string tool results,
+    the text-mode tool list, and the ``arguments`` string of a replayed
+    native tool call (a value holding a surrogate code point keeps the
+    escaped form; see :mod:`fifty_agent_sdk._model_json`). The
+    release-equivalence statements in this module (above, in
+    :class:`AgentLoop`'s Args and in its ``__init__`` comments), and the
+    matching ones in :mod:`fifty_agent_sdk.tool_mode` and
+    :mod:`fifty_agent_sdk.interventions`, were measured with golden fixtures
+    in which that JSON contains only code points U+0000-U+007E, and they hold
+    for runs where it does.
+
+Error-path final text (BR-021)
+    Since 1.11.0 a run that ends on an ``LLMError`` or a ``ParserError`` ends
+    with :attr:`SafetyConfig.error_fallback_message`, where earlier releases
+    used ``fallback_message``. An ``LLMError`` from
+    :class:`~fifty_agent_sdk.llm.openai_compat.OpenAICompatibleClient` can
+    carry a different message and ``context`` for the same provider answer.
+    A streamed request answered with a 200 that is not labelled
+    ``text/event-stream`` and yields no chunk now ends the run after one
+    request with an ``LLMError``, where earlier releases, with the shipped
+    text parsers, ended it with a ``ParserError``, after a parser retry when
+    that is enabled. The 1.9.0 golden, the one fixture that records events,
+    holds no run that ends on an ``ErrorEvent``. The release-equivalence
+    statements in this module (above, in :class:`AgentLoop`'s Args and in
+    its ``__init__`` comments),
+    and the matching ones in :mod:`fifty_agent_sdk.tool_mode` and
+    :mod:`fifty_agent_sdk.interventions`, are claimed only for runs that do
+    not end on an ``LLMError`` or a ``ParserError``.
+
+Tool-argument nesting (BR-019)
+    Since 1.11.0 the shipped
+    :class:`~fifty_agent_sdk.llm.openai_compat.OpenAICompatibleClient`,
+    :class:`~fifty_agent_sdk.parser.json_mode.JsonModeParser` and
+    :class:`~fifty_agent_sdk.parser.prose_mode.ProseModeParser` check the
+    text they are about to decode (a native call's ``arguments``; in JSON
+    mode the whole completion and its recovery candidate; in PROSE mode the
+    ``Action Input:`` body and its recovery candidate) before decoding it,
+    and refuse tool arguments nested deeper than 64 levels (one level per
+    JSON object or array, the JSON-mode envelope counting one more;
+    :mod:`fifty_agent_sdk._json_depth`). Earlier
+    releases decoded and dispatched every such argument ``json.loads`` could
+    decode. On a native turn the run now ends on that turn, with no further
+    request, with an ``LLMError`` (``MalformedResponse``), and none of that
+    turn's tools runs. In JSON and PROSE mode the parser first sends a
+    refused text to its recovery pass; a ``ParserError`` from the refusal
+    takes the parser retry when it is enabled. A custom ``LLMClient`` or ``Parser`` is
+    not checked. The check refuses no text in any golden scenario, whose
+    tool arguments nest at most 1 level. The release-equivalence statements
+    in this module (above, in :class:`AgentLoop`'s Args and in its
+    ``__init__`` comments), and the matching ones in
+    :mod:`fifty_agent_sdk.tool_mode` and :mod:`fifty_agent_sdk.interventions`,
+    are claimed only for runs in which that check refuses no text. A
+    JSON-mode or PROSE text it refuses goes to the parser's recovery pass,
+    so such a run can differ from earlier releases even when its tool
+    arguments nest at most 64 levels.
+
+Tool-result text (BR-022)
+    Since 1.11.0 the text of each tool-result message the loop builds has
+    every surrogate code point (U+D800-U+DFFF), which UTF-8 cannot encode,
+    written as its six-character ``\\udXXX`` escape
+    (:func:`fifty_agent_sdk._model_json.escape_surrogates`), whatever
+    produced the text: a string result, an ``is_error`` text, an
+    ``after_tool`` note, a denial reason or the ``repr`` fallback. The model
+    cannot tell that escape from the same six characters typed. A
+    non-string result that ``json.dumps`` cannot render because it nests
+    too deeply, or whose ``repr`` fallback raises, is sent as a fixed
+    sentence, a WARNING ``tool_output_not_rendered`` is logged, and the run
+    continues; any ``Exception`` from ``json.dumps`` other than
+    ``TypeError``, ``ValueError`` or ``RecursionError`` (one raised by a
+    value's ``__str__``, say) now falls back to ``repr``, as those first
+    two always did (``_serialize_tool_output``). Before, each of these ended ``run()``
+    with a raw exception and no ``ErrorEvent`` or ``FinalEvent``: the
+    surrogate code point in the shipped client, whose
+    ``openai`` releases BR-022 measured (2.43.0, 2.54.0) encode the request
+    body as strict UTF-8, and the others in the loop itself. A custom
+    ``LLMClient`` received the surrogate code point itself. A non-string
+    result is now rendered once per call instead of twice. Events still
+    carry the tool's own value and text. The release-equivalence
+    statements in this module (above, in :class:`AgentLoop`'s Args and in
+    its ``__init__`` comments), and the matching ones in
+    :mod:`fifty_agent_sdk.tool_mode` and :mod:`fifty_agent_sdk.interventions`,
+    are claimed only for runs in which the escape changes no tool-result
+    message (no text that goes into one holds a surrogate code point) and
+    every non-string tool result renders to the text 1.10.1 rendered: JSON,
+    or ``repr`` after a ``TypeError`` or ``ValueError`` from
+    ``json.dumps``. A value whose ``__str__`` returns different text on
+    each call is outside that scope: it now renders once, so the
+    ``"user"`` and ``"assistant"`` roles show its first text where they
+    showed its second. No golden scenario's tool-result text held a
+    surrogate code point before the escape, and every successful tool
+    result in them renders as JSON. The loop passes text it does not build
+    to the ``LLMClient`` as it is (the model's own completion, its tool
+    names in an assistant turn or a tool reply's ``name``, messages passed
+    to ``run()``); a tool name the loop quotes in tool-result text is
+    escaped with that text, and so is the name in its ``tool_invoked``
+    debug log line. The shipped client escapes the fields the model writes
+    when it sends them (see "Model-written text in requests (BR-024)").
+
+Model-written text in requests (BR-024)
+    Since 1.11.0 the shipped
+    :class:`~fifty_agent_sdk.llm.openai_compat.OpenAICompatibleClient`
+    writes each surrogate code point in an assistant message's content, a
+    tool call's name and a ``"tool"`` message's name as its ``\\udXXX``
+    escape when it sends a request. That text comes from the model (a
+    completion echoed back on a tool step, a parser retry or a require-tool
+    re-ask; a native tool call's name or its turn's content; a tool name
+    :class:`~fifty_agent_sdk.parser.json_mode.JsonModeParser` decoded from
+    an escape and sent as the tool reply's name) or from an assistant
+    message passed to :meth:`AgentLoop.run`, such as a final answer the
+    Runner stored. Before, the request carrying it was not sent and
+    ``run()`` ended with a raw ``UnicodeEncodeError`` and no ``ErrorEvent``
+    or ``FinalEvent`` (BR-024 probe P4, ``openai`` 2.43.0 and 2.54.0 on
+    CPython 3.14.3, 2.54.0 on 3.11.15 and 3.13.2, structlog silenced). The
+    ``tool_invoked`` debug log line writes the model's tool name with the
+    same escape: under structlog's default configuration, which prints to
+    stdout, a strict UTF-8 stdout (a file or a TTY under a UTF-8 locale)
+    made that line raise ``UnicodeEncodeError`` first, before the request,
+    unless the name held a space, tab, ``=``, a quote or a line break, which
+    the default renderer writes with ``repr`` (BR-024 evidence, rounds 2 and
+    3); with a JSON renderer the line now shows the escape's backslash escaped again.
+    Otherwise the client's escape exists only in the request, and the model cannot
+    tell it from the same six characters typed: the messages the loop builds, its
+    events and the messages the Runner passes to its state store keep the model's
+    text (since BR-025 ``SqlStateStore`` and ``RedisStateStore`` store such text with
+    the same escape), and a custom ``LLMClient`` receives it as before. User and
+    system messages are sent as they are. The release-equivalence statements in
+    this module (above, in :class:`AgentLoop`'s Args and in its
+    ``__init__`` comments), and the matching ones in
+    :mod:`fifty_agent_sdk.tool_mode` and :mod:`fifty_agent_sdk.interventions`,
+    are claimed only for runs in which no text that goes into an assistant
+    message's content, a tool call's name or a ``"tool"`` message's name
+    holds a surrogate code point. No golden scenario holds such text
+    (BR-024 probe P5).
+
+Log keys under stdlib logging (BR-026)
+    Since 1.11.0 the loop's ``tool_invoked`` debug line logs the tool name
+    under ``tool_name``, not ``name``, which stdlib's ``LogRecord`` reserves.
+    When structlog passed the loop's log keys to stdlib ``logging`` as a
+    record's ``extra``, as ``structlog.stdlib.render_to_log_kwargs`` and
+    ``render_to_log_args_and_kwargs`` do, with DEBUG enabled for the
+    ``fifty_agent_sdk.loop`` logger, that line raised ``KeyError`` at the
+    run's first dispatched tool call, with no ``FinalEvent``, on 1.7.0,
+    1.8.0, 1.9.0 and 1.10.1 (measured with those two recipes and structlog
+    26.1.0; the CHANGELOG names the interpreters and the cases run on each
+    release). Such a run now continues. The release-equivalence statements
+    in this module (above, in :class:`AgentLoop`'s Args and in its
+    ``__init__`` comments), and the matching ones in
+    :mod:`fifty_agent_sdk.tool_mode` and :mod:`fifty_agent_sdk.interventions`,
+    are claimed only for runs that do not dispatch a tool call under such a
+    configuration. No golden scenario routes structlog through stdlib (by
+    reading).
+
+Control characters in log values (BR-028)
+    Since 1.11.0 the ``tool_invoked`` debug line also writes each control
+    character (U+0000-U+001F, U+007F-U+009F) in the model's tool name as six
+    characters, a backslash, ``u`` and four lowercase hex digits
+    (:func:`fifty_agent_sdk._model_json.escape_for_log`), which cannot be
+    told apart from the same six characters typed. Under structlog's default
+    configuration, which prints to stdout, such a character reached the
+    output as it was unless the name held a space, tab, ``=``, a quote, CR
+    or LF (structlog 26.1.0; with 24.1.0, whatever the name held). Events
+    and requests keep the model's name. On a stream whose encoding cannot
+    encode a C1 control character (U+0080-U+009F), such as an ASCII or
+    cp1252 stdout, a dispatched call whose name held one, and on structlog
+    26.1.0 none of those characters, made that line raise
+    ``UnicodeEncodeError`` out of :meth:`AgentLoop.run` (after one request
+    when the first response named it), with no ``FinalEvent``, before BR-028
+    and on 1.7.0, 1.8.0, 1.9.0 and 1.10.1; such a run now continues
+    (measured; the CHANGELOG names the library sets). An MCP tool call whose
+    error hook line logged such a name holding a C1 control character, or a
+    surrogate code point (on any strict stream, UTF-8 included), got that
+    exception's text as its error result instead of the ``isError`` message
+    (measured through ``Registry.invoke``). The release-equivalence
+    statements in this module (above, in :class:`AgentLoop`'s Args and in
+    its ``__init__`` comments), and the matching ones in
+    :mod:`fifty_agent_sdk.tool_mode` and :mod:`fifty_agent_sdk.interventions`,
+    are claimed only for runs in which no value the SDK escapes for a log
+    line held, before the escape, a character that the stream structlog
+    writes that line to cannot encode. With structlog 26.1.0 that includes a
+    run that now raises: a name whose only characters from the renderer's
+    ``repr`` list were a tab, CR or LF was written with ``repr``, which
+    escaped a character such as U+202E or NBSP in it, and it is now written
+    as it is after the escape (measured with structlog 26.1.0 for U+202E,
+    U+200B and NBSP after a tab or LF, on ASCII and cp1252 streams, NBSP on
+    ASCII only; such a run completed before BR-028, and with U+202E after a
+    tab also on 1.7.0, 1.8.0, 1.9.0 and 1.10.1). The golden tests capture no log lines, no golden
+    scenario uses MCP, and the golden fixtures hold no control character
+    other than line feed, none in a tool name, and no surrogate code point.
+
 Statelessness
     Every :meth:`AgentLoop.run` call is its own scoped iteration. The
     loop holds no state across calls — conversation persistence and
@@ -88,7 +279,6 @@ from __future__ import annotations
 
 import asyncio
 import enum
-import json
 import re
 import time
 from collections.abc import AsyncIterator
@@ -100,6 +290,7 @@ from uuid import uuid4
 import structlog
 from pydantic import ValidationError
 
+from fifty_agent_sdk._model_json import dumps_for_model, escape_for_log, escape_surrogates
 from fifty_agent_sdk.errors import (
     AgentSdkError,
     LLMError,
@@ -210,7 +401,11 @@ def _render_tool_descriptions(tools: list[Tool]) -> str:
     Format::
 
         - <name>: <description>
-          args: <JSON of schema.properties with sorted keys>
+          args: <JSON of schema.properties with sorted keys, non-ASCII literal>
+
+    The ``args`` JSON comes from :func:`fifty_agent_sdk._model_json.dumps_for_model`
+    (BR-020), so non-ASCII text in a property ``description`` or ``enum``
+    reaches the system prompt as written rather than as ``\\uXXXX`` escapes.
 
     Args:
         tools: Snapshot of registered tools from
@@ -224,7 +419,7 @@ def _render_tool_descriptions(tools: list[Tool]) -> str:
         return ""
     lines: list[str] = []
     for tool in tools:
-        args_json = json.dumps(tool.schema.properties, sort_keys=True)
+        args_json = dumps_for_model(tool.schema.properties, sort_keys=True)
         lines.append(f"- {tool.name}: {tool.description}\n  args: {args_json}")
     return "\n".join(lines)
 
@@ -275,32 +470,121 @@ def _render_openai_tools(tools: list[Tool]) -> list[dict[str, Any]]:
     ]
 
 
-def _serialize_tool_output(output: Any) -> str:
-    """Convert a tool's return value into a string suitable for a ``role="tool"`` message.
+_UNRENDERED_TOOL_OUTPUT: Final = (
+    "The tool's output could not be converted to text, so it is not shown."
+)
+"""What the model reads for a tool result that cannot be converted to text (BR-022).
 
-    Strategy:
+Fixed and ASCII. It quotes nothing from the value or from the exception, so
+a failing value cannot put its own text in front of the model this way.
+:func:`_serialize_tool_output` returns it, and the call sites lay it out like
+any successful result (``Tool <name> returned: ...`` outside the ``"tool"``
+role).
+"""
 
-    1. If ``output`` is already a string, return it unchanged.
-    2. Otherwise attempt :func:`json.dumps` with ``default=str`` to handle
-       common non-serializable types (datetimes, paths, custom classes).
-    3. As a last resort fall back to :func:`repr`.
 
-    The shape of the tool message content is provider-tolerated; both
-    JSON-mode and prose-mode LLMs accept a stringified payload.
+def _serialize_tool_output(
+    output: Any,
+    *,
+    call_id: str | None = None,
+    run_id: str | None = None,
+) -> str:
+    """Convert a tool's return value into the text of its tool-result message.
+
+    Steps, in order:
+
+    1. A ``str`` is returned unchanged. A surrogate code point in it is
+       escaped later, with the rest of the message, by
+       :meth:`AgentLoop._build_tool_message` (BR-022).
+    2. Anything else goes to
+       :func:`fifty_agent_sdk._model_json.dumps_for_model` with
+       ``default=str``, which converts values JSON has no type for
+       (datetimes, paths, custom classes) with their ``__str__``. Non-ASCII
+       text stays literal (BR-020); a value holding a surrogate code point
+       gets the escaped form.
+    3. If that raises ``RecursionError``, the fixed sentence
+       :data:`_UNRENDERED_TOOL_OUTPUT` is returned and ``repr`` is not tried
+       (BR-022). It is raised when the value nests deeper than ``json.dumps``
+       reaches from this call's stack, which depends on the interpreter,
+       the value's shape and how deep the stack already is. For scale,
+       inside async pytest tests ``dumps_for_model`` rendered a dict chain
+       ``{"a": {"a": ...}}`` about 950 levels deep on CPython 3.11.15,
+       about 9,980 on 3.13.2 and about 61,470 on 3.14.3 (about 104,500 for
+       a list chain there); each figure moved by up to 10 levels between
+       the test harnesses BR-022 measured in. These are examples, not a
+       bound the SDK sets. It is also raised when
+       ``default=str`` calls a ``__str__`` that recurses without end, for
+       example the default ``__str__`` of an object whose ``__repr__``
+       returns ``repr(self)``.
+    4. If it raises any other ``Exception``, ``repr(output)`` is returned.
+       1.10.1 did this for ``TypeError`` (for example a tuple key) and
+       ``ValueError`` (for example a circular reference). Since 1.11.0 it
+       also covers an exception raised by a value's ``__str__`` under
+       ``default=str`` (BR-022 measured ``RuntimeError`` and ``KeyError``),
+       which used to propagate.
+    5. If that ``repr`` raises any ``Exception``, the fixed sentence is
+       returned (BR-022). Measured cases: an ``int`` with more digits than
+       ``sys.get_int_max_str_digits()`` allows (4300 by default), bare or
+       inside a container, makes ``json.dumps`` and ``repr`` both raise
+       ``ValueError``; and a value whose ``__str__`` and ``__repr__`` both
+       raise.
+
+    Each time the fixed sentence is returned, one WARNING
+    ``tool_output_not_rendered`` is logged with ``call_id``, ``run_id``,
+    ``output_type`` (the value's type name) and ``error_type`` (the
+    exception's type name), never the value or the exception's text. The
+    ``repr`` route logs nothing, as in 1.10.1.
+
+    Not caught: a ``BaseException`` that is not an ``Exception``
+    (``KeyboardInterrupt``, ``SystemExit``, ``asyncio.CancelledError``)
+    propagates, and so does an exception raised by the WARNING call itself.
+    Nothing here bounds the time or memory ``json.dumps`` or ``repr`` spend
+    on a value they can render, or the time they spend before they fail.
 
     Args:
         output: Anything a tool may return as :attr:`fifty_agent_sdk.tools.
             protocol.ToolResult.output`.
+        call_id: The call's id, for the WARNING only.
+        run_id: The run's id, for the WARNING only.
 
     Returns:
-        A string representation of the output, guaranteed not to raise.
+        ``output`` itself when it is a ``str``; otherwise its JSON text, its
+        ``repr``, or :data:`_UNRENDERED_TOOL_OUTPUT`.
     """
     if isinstance(output, str):
         return output
     try:
-        return json.dumps(output, default=str)
-    except (TypeError, ValueError):
-        return repr(output)
+        # BR-020: the ``UnicodeEncodeError`` a surrogate code point causes is
+        # a ``ValueError`` subclass, but the helper handles it, so it never
+        # reaches the ``repr`` arm below (pinned by
+        # test_serialize_tool_output_lone_surrogate_keeps_json_not_repr).
+        return dumps_for_model(output, default=str)
+    except RecursionError as exc:
+        # BR-022: this arm must stay first; RecursionError is a RuntimeError,
+        # so the `except Exception` arm below would otherwise take it and try
+        # `repr`. `repr` recurses through the same value, so it would fail the
+        # same way after more work: on CPython 3.14.3 a failing `repr` of a
+        # 200,000-level list took about 0.8 s, the failing `json.dumps` about
+        # 0.03 s (BR-022 evidence, P4). Only the type name is kept.
+        error_type = type(exc).__name__
+    except Exception:
+        # BR-022: `default=str` runs the value's own `__str__`, host code in a
+        # value-producing position, so any exception can come out of here.
+        # Fall back to `repr` (coding_guidelines §9b's fallback, without its
+        # log line: the `repr` route stays silent, as 1.10.1's
+        # `TypeError`/`ValueError` arm was).
+        try:
+            return repr(output)
+        except Exception as exc:
+            error_type = type(exc).__name__
+    _log.warning(
+        "tool_output_not_rendered",
+        call_id=call_id,
+        run_id=run_id,
+        output_type=type(output).__name__,
+        error_type=error_type,
+    )
+    return _UNRENDERED_TOOL_OUTPUT
 
 
 async def _accumulate_stream(llm: LLMClient, request: ChatRequest) -> tuple[str, list[str]]:
@@ -443,7 +727,8 @@ class AgentLoop:
             also empty, no output-format section appears in the system
             prompt.
         safety: :class:`fifty_agent_sdk.safety.SafetyConfig` with iteration cap,
-            tool timeout, and fallback message.
+            tool timeout, and fallback messages (one for the iteration cap,
+            one for errors; BR-021).
         model: Model identifier embedded in every
             :class:`fifty_agent_sdk.llm.types.ChatRequest`.
         stream: If ``True``, use :meth:`LLMClient.stream` and emit
@@ -751,7 +1036,11 @@ class AgentLoop:
         Non-recoverable failures (``LLMError``, ``ParserError``, iteration
         cap exhaustion) emit an :class:`fifty_agent_sdk.streaming.ErrorEvent`
         followed by a fallback :class:`fifty_agent_sdk.streaming.FinalEvent`,
-        then return.
+        then return. Since 1.11.0 (BR-021) that ``FinalEvent`` carries
+        :attr:`SafetyConfig.fallback_message` only after iteration cap
+        exhaustion (``error_type="MaxIterationsExceeded"``), and
+        :attr:`SafetyConfig.error_fallback_message` after an ``LLMError`` or
+        a ``ParserError``. Neither is ever the error's own message.
 
         :class:`asyncio.CancelledError` and any
         :class:`fifty_agent_sdk.errors.AgentSdkError` subclass not explicitly
@@ -837,16 +1126,24 @@ class AgentLoop:
                         message=exc.message,
                         context=dict(exc.context),
                     )
+                    # BR-021: a provider failure is not exhausted steps, so the
+                    # end user gets the error text, never `exc.message` (which
+                    # may quote the provider's body).
                     yield self._make_event(
                         FinalEvent,
                         sequence_box,
-                        text=self._safety.fallback_message,
+                        text=self._safety.error_fallback_message,
                     )
+                    # BR-021: `llm_error_type` is `context["type"]`; for the shipped
+                    # client a type code (for example "ContextLengthExceeded"), not
+                    # message text (§10). A custom LLMClient sets that key itself.
+                    llm_error_type = exc.context.get("type")
                     _log.info(
                         "agent_loop_completed",
                         iterations=iteration,
                         run_id=run_id,
                         terminated_by="llm_error",
+                        llm_error_type=llm_error_type if isinstance(llm_error_type, str) else None,
                     )
                     return
 
@@ -901,10 +1198,12 @@ class AgentLoop:
                             message=exc.message,
                             context=dict(exc.context),
                         )
+                        # BR-021: a malformed native envelope is an error, not
+                        # exhausted steps.
                         yield self._make_event(
                             FinalEvent,
                             sequence_box,
-                            text=self._safety.fallback_message,
+                            text=self._safety.error_fallback_message,
                         )
                         _log.info(
                             "agent_loop_completed",
@@ -971,6 +1270,9 @@ class AgentLoop:
                     # Retry disabled OR per-iteration budget exhausted:
                     # preserve the pre-BR-018 terminal ParserError shape
                     # verbatim — ErrorEvent + fallback FinalEvent + return.
+                    # BR-021: the run stopped on output it could not parse,
+                    # before the iteration cap, so the final text is the
+                    # error text, not the step-limit text.
                     yield self._make_event(
                         ErrorEvent,
                         sequence_box,
@@ -981,7 +1283,7 @@ class AgentLoop:
                     yield self._make_event(
                         FinalEvent,
                         sequence_box,
-                        text=self._safety.fallback_message,
+                        text=self._safety.error_fallback_message,
                     )
                     _log.info(
                         "agent_loop_completed",
@@ -1159,9 +1461,20 @@ class AgentLoop:
                     if call_denial is not None:
                         _log.debug("tool_denied", call_id=cid, run_id=run_id)
                     else:
+                        # BR-024: the model's tool name, escaped as on the wire, so a
+                        # surrogate code point cannot make a strict UTF-8 log stream
+                        # (structlog's default configuration prints to stdout) raise.
+                        # BR-026: under `tool_name`, not `name`, which stdlib's
+                        # LogRecord reserves: with structlog routed through stdlib
+                        # (`render_to_log_kwargs`) and DEBUG enabled, `name=` raised
+                        # KeyError here.
+                        # BR-028: control characters too (see
+                        # `_model_json.escape_for_log`): structlog's default
+                        # ConsoleRenderer wrote such a name as it was, so a model
+                        # could send a terminal control sequence to a console log.
                         _log.debug(
                             "tool_invoked",
-                            name=tc.name,
+                            tool_name=escape_for_log(tc.name),
                             call_id=cid,
                             run_id=run_id,
                         )
@@ -1356,14 +1669,19 @@ class AgentLoop:
                                     result=raw,
                                 )
                             )
+                            # BR-022: render once per call (it used to be
+                            # rendered for both layouts), still after
+                            # `after_tool` and right before the append.
+                            rendered = _serialize_tool_output(
+                                raw.output, call_id=cid, run_id=run_id
+                            )
                             working.append(
                                 self._build_tool_message(
                                     tool_name=tool_name,
                                     call_id=cid,
-                                    content_for_tool_role=_serialize_tool_output(raw.output),
+                                    content_for_tool_role=rendered,
                                     content_for_other_role=(
-                                        f"Tool {tool_name} returned: "
-                                        f"{_serialize_tool_output(raw.output)}"
+                                        f"Tool {tool_name} returned: {rendered}"
                                     ),
                                     augmentation=note,
                                 )
@@ -1505,9 +1823,12 @@ class AgentLoop:
                     )
                 )
                 continue
+            # BR-024: escaped as on the wire (see the batch path above).
+            # BR-026: under `tool_name`, not `name` (see the batch path above).
+            # BR-028: control characters escaped too (see the batch path above).
             _log.debug(
                 "tool_invoked",
-                name=tool_name,
+                tool_name=escape_for_log(tool_name),
                 call_id=call_id,
                 run_id=run_id,
             )
@@ -1618,15 +1939,17 @@ class AgentLoop:
                         result=tool_result,
                     )
                 )
+                # BR-022: render once per call (it used to be rendered for both
+                # layouts), still after `after_tool` and right before the append.
+                rendered = _serialize_tool_output(
+                    tool_result.output, call_id=call_id, run_id=run_id
+                )
                 working.append(
                     self._build_tool_message(
                         tool_name=tool_name,
                         call_id=call_id,
-                        content_for_tool_role=_serialize_tool_output(tool_result.output),
-                        content_for_other_role=(
-                            f"Tool {tool_name} returned: "
-                            f"{_serialize_tool_output(tool_result.output)}"
-                        ),
+                        content_for_tool_role=rendered,
+                        content_for_other_role=f"Tool {tool_name} returned: {rendered}",
                         augmentation=note,
                     )
                 )
@@ -1649,6 +1972,7 @@ class AgentLoop:
                 "iteration_count": iteration,
             },
         )
+        # BR-021: the one path that keeps `fallback_message` (steps exhausted).
         yield self._make_event(FinalEvent, sequence_box, text=self._safety.fallback_message)
         _log.info(
             "agent_loop_completed",
@@ -1684,7 +2008,19 @@ class AgentLoop:
         ``role="tool"`` body and on the collapsed ``user``/``assistant`` body
         alike. With ``augmentation=None`` (every call site when no
         ``after_tool`` is configured, and every non-``ToolResult`` outcome)
-        the content is exactly the chosen string.
+        the content is the chosen string, escaped as described next.
+
+        BR-022: the final content, note included, then goes through
+        :func:`fifty_agent_sdk._model_json.escape_surrogates`, once, here, for
+        every caller: a string result, an ``is_error`` text, an
+        ``after_tool`` note, a denial reason, a ``ToolNotFound`` or
+        ``ToolTimeout`` text and the ``repr`` fallback all reach the model
+        with each surrogate code point (U+D800-U+DFFF) written as its
+        six-character ``\\udXXX`` escape. Content without one is unchanged.
+        The model-facing message is the only thing that changes: events keep
+        the tool's own text. The ``name`` field of the ``"tool"``-role
+        message is the model's tool name and is not escaped here; the shipped
+        client escapes it when it sends the request (BR-024).
 
         Args:
             tool_name: The name of the tool that was invoked (only used in
@@ -1693,8 +2029,10 @@ class AgentLoop:
             call_id: The synthesized tool-call identifier (only used in the
                 ``"tool"`` role branch).
             content_for_tool_role: Body string for the ``role="tool"``
-                envelope. MUST remain byte-identical to the previous
-                implementation so default-path callers see no wire change.
+                envelope. For text without surrogate code points it MUST
+                remain byte-identical to the previous implementation so
+                default-path callers see no wire change (BR-022 escapes
+                those code points).
             content_for_other_role: Body string for the
                 ``role="user"`` / ``role="assistant"`` envelope. Carries the
                 tool name inline since the envelope drops ``name``.
@@ -1709,6 +2047,11 @@ class AgentLoop:
         content = content_for_tool_role if tool_role else content_for_other_role
         if augmentation is not None:
             content = content + _AFTER_TOOL_SEPARATOR + augmentation
+        # BR-022: escape AFTER the role has chosen the content and the note is
+        # appended, so one call covers every source of tool-message text in
+        # every tool mode and role (a surrogate code point would otherwise make
+        # a strict-UTF-8 request encoder raise on the next request).
+        content = escape_surrogates(content)
         if tool_role:
             return ChatMessage(
                 role="tool",

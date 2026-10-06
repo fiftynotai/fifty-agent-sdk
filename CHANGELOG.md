@@ -6,6 +6,1039 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.11.0] - 2026-10-06
+
+### Added
+- `SafetyConfig.error_fallback_message`: the text of the `FinalEvent` that ends a run after
+  an LLM error or a parser error. It defaults to "Something went wrong while answering.
+  Please try again." and must be non-empty. It follows every `ErrorEvent` except the one
+  whose `error_type` is `MaxIterationsExceeded`. (BR-021)
+
+### Changed
+- After an LLM error or a parser error the run now ends with `error_fallback_message`. A
+  parser error here is the native `tool_calls` rejection, or a text parse failure with the
+  retry disabled or used up. Before, these runs ended with `fallback_message`, whose
+  default reads "I was unable to complete the task within the allowed steps.", and
+  `fallback_message` now follows only the iteration cap. The two fields are independent:
+  setting only `fallback_message` does not change the error text. **If you set
+  `fallback_message`, for example to localised text, set `error_fallback_message` too:
+  until you do, your end users see its English default after a provider or parser
+  error.** A test that asserts `fallback_message` after an LLM or parser error needs
+  updating. (BR-021)
+- `SafetyConfig.model_dump()` has one more key, `error_fallback_message`. A config written
+  for 1.10.1 validates unchanged. A dump from this release does not validate on 1.10.1,
+  whose `SafetyConfig` forbids unknown fields. (BR-021)
+- `LLMError.context["type"]` from `OpenAICompatibleClient` takes new values:
+  - `ContextLengthExceeded`, when the provider's text contains `max_prompt_length`,
+    `context_length_exceeded` or `maximum context length` (compared case-insensitively),
+    or the provider's error code is `context_length_exceeded`. It is applied on these
+    paths only: the 200 body errors below (`NonJsonProviderBody`,
+    `NonStreamProviderBody`), BR-023's `UndecodableProviderBody` from `complete()` and
+    `ErrorEnvelopeProviderBody` (see the BR-023 item), and every `APIError` other than
+    `APITimeoutError`, `APIConnectionError` and `RateLimitError` (for example
+    `BadRequestError`, `InternalServerError` and a mid-stream error event), on `complete()`
+    and on `stream()`. It is never applied to those three on `complete()` or when `stream()`
+    opens the request; while `stream()` iterates, `openai` 2.43.0 raises only the base
+    `APIError` for an error event. It is never applied to a failure of the read itself
+    while a stream is read (an `httpx` read error, for example), to
+    `UndecodableProviderBody` from `stream()`, or to the bodies the client still does not
+    catch (see Fixed).
+    `context["classified_from"]` keeps the type the error would otherwise have had, for
+    example `BadRequestError`. The list is closed: other phrasings of the same failure
+    stay unclassified, and an unrelated error whose text quotes one of these strings is
+    classified too. A release that adds a marker will say so here.
+  - `NonJsonProviderBody` for a stream event whose data is not JSON, or is a bare JSON
+    string (before BR-021 the first was `JSONDecodeError`, with the decoder's message
+    instead of the event's text, and the second `MalformedChunk`).
+  - `NonStreamProviderBody` for a streamed 200 whose Content-Type is not
+    `text/event-stream` and which produced no chunk (see the next items).
+
+  (BR-021)
+- `OpenAICompatibleClient`, `JsonModeParser` and `ProseModeParser` refuse tool arguments
+  nested deeper than 64 levels. A level is one JSON object or array (`{"q": [1]}` is 2
+  levels; brackets inside strings do not count). In JSON mode the envelope counts one
+  more, so `tool_args` may still nest 64 levels. The check reads the text before it is
+  decoded.
+  - On a native turn, `complete()` raises `LLMError` with `context["type"] ==
+    "MalformedResponse"`, the message `provider tool_call arguments nest deeper than 64
+    levels`, and `tool_call_id`, `arguments_excerpt` (the first 200 characters, as for
+    invalid JSON) and a new key, `max_tool_args_depth` (64), in `context`. One such entry
+    refuses the whole response, so no tool of that turn runs, and `AgentLoop` ends the
+    run on that turn with `error_fallback_message`, with no further request.
+  - The text parsers' depth error is a `ParserError` (`error_phase` `json_decode` or
+    `action_input_decode`, with `context["max_tool_args_depth"]`), and the loop takes its
+    parser retry for it when that is enabled (the default). A strict-pass text that is too deep
+    goes to the parsers' recovery pass first, as a decode failure does, and the depth error
+    is raised only when that pass finds no `{`...`}` candidate or one past the limit. A
+    candidate within the limit is decoded as in 1.10.1: an unclosed `[draft ` before a
+    valid envelope still parses. That pass now also runs for valid JSON that is too deep,
+    which 1.10.1 passed to `json.loads` as it stood: for example, the JSON-mode completion
+    `[<envelope>, <70 nested arrays>]` now parses to that envelope, where 1.10.1 raised
+    `schema_validation` and, with the retry enabled, took the parser retry, and a PROSE
+    `Action Input` of
+    `[{"a": 1}, <70-level array>]` now dispatches `{"a": 1}`, where 1.10.1 raised
+    `Action Input JSON must decode to an object`.
+  - Before, arguments that `json.loads` could decode were decoded and dispatched at any
+    depth (see Fixed for what then happened on a native turn).
+  - The check reads brackets, not JSON, so invalid text can get the depth error too, for
+    example `x` followed by 100 `[`, which `json.loads` rejects at its first character. On
+    a native turn any text whose brackets open more than 64 levels gets it: before,
+    `complete()` raised `provider tool_call arguments is not valid JSON` for it, with the
+    decode error as `__cause__`. In the text parsers such text gets it when the recovery
+    pass finds no candidate or the check also refuses the candidate (65 levels for the
+    whole JSON-mode envelope), as with `x` followed by 100 `[`; before, they raised their
+    invalid-JSON `ParserError`. So `context["max_tool_args_depth"]` means the check refused
+    the text; do not read it as proof that the arguments were deeply nested.
+  - In JSON mode the check covers the whole envelope, not only `tool_args`. An `answer` or
+    `thought` value nested more than 64 levels, which the schema rejects anyway, now gets
+    the `json_decode` depth error where it used to get `schema_validation` whenever
+    `json.loads` could decode it. Both are `ParserError` and take the parser retry when it
+    is enabled.
+  - The check reads the text once before `json.loads` does. Measured on CPython 3.11.15,
+    3.13.2 and 3.14.3: 10 MB of arguments with few brackets took about 6.5 ms, less than
+    `json.loads` of the same text; 10 MB of `[[],[],...]` took 0.69 s, 0.85 s and 1.02 s,
+    1.5 to 6.2 times `json.loads`, growing linearly from 1 MB. The JSON-mode parser can
+    check one completion twice (its strict text, then its recovery candidate).
+  - The limit is fixed: there is no setting. A custom `LLMClient` or `Parser` decodes its
+    own arguments and is not checked. No public API changes. (BR-019)
+- The Runner's `error` audit event has a new key, `error_subtype`: the `ErrorEvent`'s
+  `context["type"]` when it is a string (for example `ContextLengthExceeded`), else `None`.
+  It is on every `error` event the Runner emits for an `ErrorEvent`, so
+  `{"error_type": "LLMError", "error_subtype": "ContextLengthExceeded"}` and
+  `{"error_type": "MaxIterationsExceeded", "error_subtype": null}` can be told apart
+  without reading logs. (BR-021)
+- `OpenAICompatibleClient.stream()` now reads a response whose media type is not
+  `text/event-stream`, or that has no Content-Type, in full before yielding its first
+  chunk, so a direct caller gets those chunks only once the body has arrived. A
+  `text/event-stream` response streams as before. `AgentLoop` emits nothing for a
+  streamed turn until it has read the stream up to its terminal chunk, so for a run the
+  change adds only the time to receive whatever follows that chunk. If such a response
+  produces no chunk at all, `stream()` now raises `LLMError` typed
+  `NonStreamProviderBody`, whatever the body holds: an SSE-framed body with only
+  `data: [DONE]` included. Before, it yielded nothing. If reading the body fails, the
+  error is an `LLMError` whose `context["type"]` is the `httpx` exception's class name
+  (for example `ReadError`), with `context["phase"] == "stream"`. (BR-021)
+- The release-equivalence statements (`tool_mode` omitted ≡ 1.7.0, request options
+  omitted ≡ 1.8.0, `interventions` omitted ≡ 1.9.0) now hold only for runs that do not end
+  on an LLM or parser error. Those runs end with `error_fallback_message`, and a streamed
+  200 that is not `text/event-stream` and yields no chunk now ends the run after one
+  request with an `LLMError`, where with the shipped text parsers it used to end with a
+  `ParserError`, after a parser retry when that is enabled. (BR-021) Since BR-019 they
+  also hold only for runs in which the 64-level nesting check refuses no text. It refuses
+  no text in any golden scenario, whose tool arguments nest at most 1 level. (BR-019)
+  Since BR-022 they also hold only for runs in which the surrogate escape changes no
+  tool-result message (no text that goes into one holds a surrogate code point) and every
+  non-string tool result renders to the text 1.10.1 rendered (JSON, or `repr` after a
+  `TypeError` or `ValueError` from `json.dumps`). Runs outside that scope used to end with
+  a raw exception (see Fixed), with two exceptions: a custom `LLMClient` received a
+  surrogate code point as it was, and a value whose `__str__` returns different text on
+  each call now runs it once (see the next item). For a surrogate code point with the
+  shipped client this was measured on `openai` 2.43.0 and 2.54.0, which encode the request
+  body as strict UTF-8; other `openai` and `httpx` releases were not measured. No golden
+  scenario's tool-result text held a surrogate code point before the escape, and every
+  successful tool result in them is a non-string value that renders as JSON. (BR-022)
+  BR-023 adds no scope: apart from runs whose call stack is already near the interpreter's
+  recursion limit (see its Not covered item), its new outcomes are runs that end on an
+  `LLMError`, which these statements already exclude, and its one change to the request is
+  a header, which is not part of the request bodies they compare. (BR-023) Since BR-024 they
+  also hold only for runs in which no text that goes into an assistant message's content, a
+  tool call's name or a `"tool"` message's name holds a surrogate code point. With the
+  shipped client such a run, when a request carried that text (a later one in the run, or
+  the first for an assistant message passed to `run()`), used to end with a raw
+  `UnicodeEncodeError` at that request, or, for a tool name the default renderer writes as it
+  is (one without a space, tab, `=`, a quote or a line break) under structlog's default
+  configuration with a strict UTF-8 stdout, earlier, at the loop's `tool_invoked` debug line
+  (measured on `openai` 2.43.0 and 2.54.0 with CPython 3.14.3, and 2.54.0 with 3.11.15 and
+  3.13.2). It now sends the escape and continues, measured with structlog silenced and under
+  its default configuration (see the BR-024 items). No golden scenario holds such text.
+  (BR-024) BR-025 adds no scope (by reading): it changes SDK code only in `state/`, and no
+  golden scenario uses `AgentRunner` or a state store. (BR-025) Since BR-026 they also hold
+  only for runs that do not dispatch a tool call while structlog passes the SDK's log keys
+  to stdlib `logging` as a record's `extra` (as `render_to_log_kwargs` and
+  `render_to_log_args_and_kwargs` do) with DEBUG enabled for the `fifty_agent_sdk.loop`
+  logger. On the paths Fixed lists, such a run used to end with a raw `KeyError` at the
+  loop's `tool_invoked` debug line (measured with those two recipes and structlog 26.1.0 on
+  1.10.1 on the library sets named there, and, apart from the `ToolMode.JSON`,
+  `ToolMode.PROSE` and `before_tool` cases, on 1.7.0, 1.8.0 and 1.9.0 with CPython 3.14.3
+  and `openai` 2.43.0), and now continues. The renamed log keys (see Changed) are not part
+  of what these statements compare: the golden tests capture no log lines, and no golden
+  scenario routes structlog through stdlib (by reading). (BR-026) BR-027 adds no scope (by
+  reading): it changes SDK code only in `audit/console.py`, no golden scenario uses
+  `AgentRunner` or an audit sink, and these statements compare request bodies and, in some,
+  the system prompt or the event stream, not log lines. (BR-027) Since BR-028 they also hold
+  only for runs in which no value that BR-028 escapes in a log line (see its Changed item)
+  held, before the escape, a character that the stream structlog writes that line to cannot
+  encode: on an ASCII or cp1252 stdout, for example, a C1 control character (U+0080-U+009F)
+  or any other character that encoding lacks, and on any strict stdout, UTF-8 included, a
+  surrogate code point. On an ASCII or cp1252 stream a run in which the loop dispatched a
+  model tool call whose name held a C1 control character, in a name the renderer wrote as it
+  was (with structlog 26.1.0's default `ConsoleRenderer`, one holding no space, tab, `=`,
+  quote, CR or LF; with 24.1.0, any), used to end with a raw `UnicodeEncodeError` at that
+  call's `tool_invoked` debug line (after one request when the first response named it), and
+  now continues (that line has escaped a surrogate code point since BR-024). An MCP tool call
+  whose error hook line logged such a name holding either used to get the
+  `UnicodeEncodeError`'s text as its error instead of the `isError` message (measured through
+  `Registry.invoke`, not through `AgentLoop`). With structlog 26.1.0's default
+  `ConsoleRenderer` a run can also differ the other way: a value whose only characters from
+  the renderer's `repr` list were a tab, CR or LF used to be written with `repr`, which
+  escaped a bidirectional formatting character, a zero-width character, U+2028, U+2029 or NBSP
+  in it, and it is now written as it is after the escape, so on a stream that cannot encode
+  such a character the line now raises where it did not (measured on the library
+  sets its Fixed item names, on ASCII and cp1252 streams: U+202E after a tab at
+  `tool_invoked` (single and batch), `register`, `attach()`, `refresh()`, the periodic refresh
+  and a hook line, and U+200B after a tab and NBSP after a line feed, NBSP on ASCII only, at
+  the single-call `tool_invoked` line, `register`, `refresh()` and the periodic refresh; with
+  U+202E after a tab such runs completed on 1.7.0, 1.8.0, 1.9.0 and 1.10.1, measured at
+  `tool_invoked`, `register` and the periodic refresh with CPython 3.14.3 and 3.11.15; with
+  structlog 24.1.0 they raised before and after). The C1 and
+  surrogate outcomes were measured on 1.7.0, 1.8.0, 1.9.0 and 1.10.1 as well, on the library
+  sets and streams its Fixed item names. The escaped values are not part of what these
+  statements compare: the golden tests capture no log lines, no golden scenario uses MCP, and
+  the three golden fixtures hold no control character other than line feed, none in a tool
+  name, and no surrogate code point (a scan of every string in them). (BR-028)
+- Tool-result message text no longer holds a surrogate code point (U+D800-U+DFFF), which
+  UTF-8 cannot encode:
+  - Each one is written as its six-character `\udXXX` escape, the spelling `json.dumps`
+    uses. That applies whatever produced the text: a string result, an `is_error` text, an
+    `after_tool` note (otherwise still appended verbatim), a `before_tool` denial reason, a
+    `ToolNotFound` text or the `repr` fallback, in every tool mode and tool-result role, on
+    the single-call path and in a native batch.
+  - Other text, non-ASCII and U+007F included, is unchanged, and text without a surrogate
+    code point is unchanged byte for byte. Two surrogate code points in a row are escaped
+    one by one. The escape cannot be told apart from those six characters typed literally.
+  - A custom `LLMClient` used to receive the code point itself.
+  - `ObservationEvent.result` and `ToolFailedEvent.error` still carry the tool's own value
+    and text. The `name` field of a `"tool"`-role reply, which is the model's tool name, is
+    not escaped by the loop; since BR-024 the shipped client escapes it when it sends the
+    request.
+  - A non-string tool result is now rendered once per call; it was rendered twice, so a
+    `default=str` conversion (the value's `__str__`) now runs once. The `"tool"` role used
+    the first rendering and the `"user"`/`"assistant"` roles the second, so in those two
+    roles a value whose `__str__` returns different text on each call now shows its first
+    text where it showed its second (measured on CPython 3.11.15 and 3.14.3).
+  - Each tool-result message gets one more UTF-8 encode, the surrogate check (two, and a
+    decode, when the text holds one). Measured on CPython 3.11.15, 3.13.2 and 3.14.3, best
+    of 7: 0.9-1.6 ms per million Arabic characters, and 0.3-0.4 ms for 10 million ASCII
+    characters, which come back as the same string. For the one non-string result
+    measured, a list of 20,000 dicts (1.4 million characters), that was less than the
+    rendering saved: one rendering took 10.6-12.1 ms and the check 0.6-0.7 ms.
+  - Any other `Exception` from `json.dumps` (not `TypeError`, `ValueError` or
+    `RecursionError`), for example one raised by a value's `__str__`, now falls back to
+    `repr`, as `TypeError` and `ValueError` did; it used to escape `AgentLoop.run()` (see
+    Fixed). A `RecursionError` gets the fixed sentence without `repr`, and a
+    `BaseException` that is not an `Exception` still propagates.
+
+  (BR-022)
+
+- `OpenAICompatibleClient.complete()` now calls the `openai` client's
+  `chat.completions.with_raw_response.create(...)`, which returns the response without
+  decoding its body, and decodes it with `parse()` in a separate step. So a body the client
+  cannot decode is told apart from a request it cannot encode. In that mode the `openai`
+  client adds one header to every non-streamed request, `X-Stainless-Raw-Response: true`.
+  Compared with and without it on `openai` 2.43.0 and 2.54.0, every other header had the
+  same value, the header order changed (the new header comes before
+  `x-stainless-retry-count`), the method, URL and body bytes were the same, and `parse()`
+  returned the same value or raised the same exception as `create()` did for every body
+  compared. `stream()` still
+  calls `create()`, and its requests do not carry the header. A request that cannot be
+  encoded (a non-ASCII API key, or a surrogate code point in a field the client sends as it
+  is, such as a user or system message; see the BR-024 items) still raises
+  `UnicodeEncodeError` unwrapped, with nothing sent (measured on both releases). A test
+  double that replaces the private `client._client.chat.completions.create` and returns a
+  `ChatCompletion` no longer works: set before the client's first `complete()`, it makes
+  `complete()` raise `AttributeError: 'ChatCompletion' object has no attribute 'parse'`;
+  set after it, it is silently bypassed and the request goes to the HTTP transport, because
+  `with_raw_response` binds `create` the first time it is used (both measured on both
+  releases). (BR-023)
+- `LLMError.context["type"]` from `OpenAICompatibleClient` takes two more values, and some
+  errors change type:
+  - `UndecodableProviderBody`: the `openai` client could not decode the body. On
+    `complete()`, a 200 whose Content-Type it treats as JSON (on `openai` 2.43.0 and 2.54.0,
+    one whose Content-Type, up to any `;`, ends in `json` (case-sensitive)) and whose body
+    is not valid UTF-8, holds an integer literal over the interpreter's int-to-str digit
+    limit, or nests deeper than `json.loads` decodes; also a 200 not labelled JSON whose
+    text the client's decode, with the `charset` its Content-Type names, rejects with a
+    `ValueError` (measured: `text/plain; charset=utf-16` or `utf-32` on a UTF-8 body, and
+    `charset=idna`). The message is `Provider response body could not be decoded: ` plus the
+    first 500 characters of the body's bytes read as UTF-8, invalid bytes as U+FFFD,
+    whatever `charset` the Content-Type names, and `context` holds `body_length` and
+    `decode_error`, the class name of the exception the client raised: for a body labelled
+    JSON, `UnicodeDecodeError`, `ValueError` or `RecursionError`; for the `charset` case,
+    measured `UnicodeDecodeError` for `utf-16` and `utf-32` on CPython 3.13.2 and 3.14.3,
+    and `UnicodeError` for them on 3.11.15 and for `idna` on all three. It is classified
+    `ContextLengthExceeded` by the same rule as the other provider-body errors. On
+    `stream()`, the same three failures while the client decodes the stream: the message is
+    `Provider stream could not be decoded: ` plus the exception's own text, `context` holds
+    `decode_error` and `phase`, and it is never classified.
+  - `ErrorEnvelopeProviderBody`: a non-streamed 200 whose body is a JSON object without
+    `choices` and with a truthy `error` member. The message is `Provider returned an error
+    object instead of a completion: ` plus the first 500 characters of the body, read the
+    same way, and `context` holds `body_length`. It is classified on the whole body, as the
+    same body on `stream()` is, so an envelope whose `code` is `context_length_exceeded` is
+    `ContextLengthExceeded` even when its message names no overflow.
+  - Old to new:
+
+    | Method | HTTP 200 body | 1.10.1 | 1.11.0 |
+    |---|---|---|---|
+    | `complete()` | labelled JSON, not valid UTF-8 | raw `UnicodeDecodeError` | `UndecodableProviderBody` |
+    | `complete()` | labelled JSON, an integer literal over the digit limit | raw `ValueError` | `UndecodableProviderBody` |
+    | `complete()` | labelled JSON, nested deeper than `json.loads` decodes | raw `RecursionError` | `UndecodableProviderBody` |
+    | `complete()` | not labelled JSON, text the client's decode rejects under the `charset` its Content-Type names (measured: `utf-16`, `utf-32`, `idna`) | raw `UnicodeDecodeError` (`utf-16`, `utf-32`) or `UnicodeError` (`idna`) | `UndecodableProviderBody` |
+    | `complete()` | a JSON object without `choices`, with a truthy `error` member | `MalformedResponse`, text lost | `ErrorEnvelopeProviderBody`, text quoted |
+    | `complete()` | a completion with a field of the wrong type or value that mapping rejects with a `ValueError` (pydantic's included), `OverflowError` or `KeyError` (see Fixed) | raw `ValidationError`, `ValueError`, `OverflowError` or `KeyError` | `MalformedResponse` |
+    | `stream()` | a line that is not valid UTF-8 | `UnicodeDecodeError` | `UndecodableProviderBody` |
+    | `stream()` | event data with an integer literal over the digit limit | `ValueError` | `UndecodableProviderBody` |
+    | `stream()` | event data nested deeper than `json.loads` decodes | `RecursionError` | `UndecodableProviderBody` |
+
+    The first five rows are `ContextLengthExceeded` instead, with the new type in
+    `classified_from`, when the body's text names an overflow. In the `stream()` rows the
+    old type is now in `decode_error`, and the message, which was the exception's text,
+    now has the prefix. Measured for 1.10.1 on CPython 3.14.3 with `openai` 2.43.0, and for
+    1.11.0 on 3.14.3 with 2.43.0 and on 3.11.15 and 3.13.2 with 2.54.0. (BR-023)
+- `OpenAICompatibleClient` writes each surrogate code point (U+D800-U+DFFF) as its
+  six-character `\udXXX` escape, the spelling `json.dumps` uses, in three fields of the
+  request it sends: an assistant message's content, the name of each tool call an assistant
+  message carries, and a `"tool"` message's name.
+  - The text can come from the model (its completion echoed back, a native tool call's
+    name, a tool name `JsonModeParser` decoded from an escape and sent as the tool reply's
+    name) or from an assistant message passed to `run()`, such as a final answer the Runner
+    stored. The rule follows the role, so a host-supplied assistant message is escaped too.
+  - Every other field is sent as it is (the `arguments` string keeps BR-020's form, escaped
+    in full when a value holds one), and so is a message without a surrogate code point in
+    those three fields. For 16 requests (8 request shapes through `complete()` and
+    `stream()`, among them histories holding Arabic text, an astral emoji, U+007F or the six
+    characters of an escape typed literally, in every role and in a native tool-call turn),
+    the request body bytes were identical before and after BR-024, on `openai` 2.43.0 and
+    2.54.0 with CPython 3.14.3 and 2.54.0 with 3.11.15 and 3.13.2. User and system messages
+    are sent as they are (see Not covered).
+  - `ChatResponse`, events and the messages the Runner passes to its state store still carry
+    the provider's text, and a custom `LLMClient` receives it as before. The escape cannot be
+    told apart from those six characters typed literally.
+  - The loop's `tool_invoked` debug log line writes the tool name with the same escape, so
+    its tool-name field (`tool_name` since BR-026, `name` before) shows the six characters
+    where it held the code point (a name the default renderer writes with `repr` shows that
+    escape's backslash doubled; measured).
+    Under structlog's default configuration, which the SDK does not change, the line used to
+    make a strict UTF-8 stdout raise for a name it writes as it is (see Fixed). With a JSON renderer (`structlog.processors.JSONRenderer`)
+    the line did not raise, because the renderer escaped the code point itself; it now
+    escapes the escape's backslash again, so a reader that decodes the line gets the six
+    characters, not the code point (both measured). No other log call passes text the model
+    wrote as a top-level value (by reading every logging call in the package).
+    `ConsoleAuditSink` logs the Runner's audit `payload`, a dict that holds the model's tool
+    name; the default renderer writes a dict with `repr`, which escapes the code point, and
+    that line did not raise (measured).
+  - Building a request now checks each of those fields with one UTF-8 encode (two, and a
+    decode, when it holds a surrogate code point). For 52 messages holding 260,000 Arabic
+    characters in assistant turns, building the request body took about 0.3-0.45 ms instead
+    of about 0.05 ms (CPython 3.11.15, 3.13.2 and 3.14.3 on one machine, best of 7). (BR-024)
+- Four log lines (five logging calls) carry a field under a new key, because the old key is
+  one that stdlib `logging` refuses in a record's `extra` (see Fixed):
+
+  | Line | Level | Old key | New key |
+  |---|---|---|---|
+  | `tool_invoked` (the loop's batch and single-call lines, once per dispatched tool call) | DEBUG | `name` | `tool_name` |
+  | `tool overwritten` (`Registry.register`) | WARNING | `name` | `tool_name` |
+  | `mcp.tool_overwrite` (`MCPProvider.attach` and `refresh()`) | WARNING | `name` | `tool_name` |
+  | `mcp.refresh_failed` (`MCPProvider`'s periodic refresh) | WARNING | `message` | `error_message` |
+
+  BR-026 does not change the values: `tool_invoked` still writes the tool name with BR-024's
+  escape (BR-028 escapes control characters in the values of all four lines, and surrogate
+  code points in the other three; see its item).
+  A query, alert or parser that reads one of the old keys on these lines needs the new one.
+  Other SDK log lines already use `tool_name` for a tool's name (`mcp.tool_error_hook_failed`
+  and `mcp.tool_error_hook_invalid`) and `error_message` for an exception's text
+  (`audit.emit_failed` and `runner.persist_failed`). BR-026 changes no other log key and no
+  event name. A new test parses the package's source. It fails on a logging call it can
+  read (a log method, `bind` or `new` called on a logger the module builds with `get_logger`
+  or `wrap_logger`, binds or aliases, or a call to `bind_contextvars` or
+  `bound_contextvars`) that passes a key that is a `LogRecord` attribute on the interpreter
+  it runs on, `message`, `asctime` or `taskName` (a `LogRecord` attribute on CPython 3.13.2
+  and 3.14.3, not on 3.11.15). It also fails, rather than passing, on these uses, whose
+  keys it cannot read: a `**` argument other than a dict literal with string keys, a
+  logging-style call on an object it does not know as a logger, a call to a method it does
+  not know on a logger, a call to `getLogger`, a logger method used without being called
+  (`meth = _log.info`), `getattr` on a logger, and a logger passed, returned or stored as a
+  value. It does not see a logger that a module neither builds nor takes from its own
+  loggers (one imported, or received as a parameter) when that logger is used without a
+  logging-style call, for example through `getattr` or a stored method, or code it cannot
+  parse, such as `eval`. Before this change it reported these five calls. (BR-026)
+- `ConsoleAuditSink`'s `audit.event` line logs the audit event's time under
+  `event_timestamp`, not `timestamp`, because `timestamp` is the key structlog's
+  `TimeStamper` processor writes by default (see Fixed). The value is unchanged
+  (`AuditEvent.timestamp` as an ISO-8601 string), and so are the line's other keys
+  (`session_id`, `user_id`, `event_type`, `payload`), its event name, its level and its
+  logger name (`fifty_agent_sdk.audit`). What the line's `timestamp` and `event_timestamp`
+  hold, by host configuration, measured with structlog 26.1.0 and 24.1.0 on CPython
+  3.11.15, 3.13.2 and 3.14.3 (`render_to_log_args_and_kwargs` with 26.1.0 only: 24.1.0 has
+  none):
+
+  | Host configuration | `timestamp` before | `timestamp` now | `event_timestamp` now |
+  |---|---|---|---|
+  | structlog's default configuration, which the SDK does not change; `structlog.stdlib.recreate_defaults()`; a `TimeStamper` at its default key (measured: `fmt="iso"` and the default `fmt` with `JSONRenderer`, the default processors with `JSONRenderer`, and `fmt="iso"` ahead of `render_to_log_kwargs`, `render_to_log_args_and_kwargs` or `ProcessorFormatter.wrap_for_formatter`) | the log time | the log time | the event's time |
+  | `structlog.processors.MaybeTimeStamper`, which adds a time only when the event has none | the event's time | the log time | the event's time |
+  | no processor that writes `timestamp` or `event_timestamp` (measured: `structlog.testing.capture_logs()`, and a `TimeStamper` with `key="ts"`) | the event's time | absent | the event's time |
+  | a `TimeStamper` with `key="event_timestamp"` (structlog 26.1.0) | the event's time | absent | the log time |
+
+  Under the default configuration, and under `recreate_defaults()`, the renderer
+  (`ConsoleRenderer`) writes `timestamp` as the line's first column, without its key name.
+  A query, alert or parser that reads the event's time from `timestamp` on this line needs
+  `event_timestamp`. `AuditEvent`, `SqlAuditSink` (its `timestamp` column included) and
+  the `AuditSink` protocol are unchanged. The test BR-026 added now also fails on a logging
+  call that passes one of these 28 keys, which structlog 26.1.0's own processors, renderers
+  or logger methods write into the event, remove from it or read with a meaning of their
+  own, under their default names (by reading structlog 26.1.0; the test also runs 18 probes
+  of these writers on the installed structlog, and fails if a probe touches a key outside
+  the set or, on structlog 26.1.0, if the probes leave a key in the set untouched): `event`
+  (the logger methods, `EventRenamer`, `ConsoleRenderer`); `timestamp` (`TimeStamper`,
+  `MaybeTimeStamper`); `level` (`add_log_level`); `level_number` (`add_log_level_number`);
+  `logger` (`add_logger_name`); `logger_name` (a `ConsoleRenderer` column); `exception`,
+  `exc_info`, `stack` and `stack_info` (`format_exc_info`, `set_exc_info`, the loggers'
+  `exception()`, `StackInfoRenderer`); `stacklevel` and `positional_args` (`render_to_log_kwargs`,
+  `render_to_log_args_and_kwargs`, the stdlib `BoundLogger`, `PositionalArgumentsFormatter`);
+  `log_level` (`capture_logs`); `_record`, `_from_structlog`, `_logger` and `_name`
+  (`ProcessorFormatter`, `ExtraAdder`); and the eleven `CallsiteParameterAdder` keys
+  (`pathname`, `filename`, `module`, `qual_module`, `func_name`, `qual_name`, `lineno`,
+  `thread`, `thread_name`, `process`, `process_name`). For both of its key sets the test
+  now also reads the keyword arguments of a call whose name ends in `get_logger` or
+  `wrap_logger` (for `wrap_logger`, apart from its own parameters), because structlog binds
+  the other keyword arguments as values on every line that logger writes (by reading); the
+  package's 11 such calls pass only a name. Before this change the processor-key check
+  reported this one call. (BR-027)
+- Eight logging calls (six log lines) now write each control character in one of their
+  values, U+0000-U+001F (C0, tab, line feed and carriage return included) and U+007F-U+009F
+  (DEL and C1), as six characters: a backslash, `u` and the code point as four lowercase hex
+  digits (`\u001b` for ESC). Log readers see the change: the control character itself no
+  longer reaches the log output (see Fixed). The five MCP calls and the registry line also
+  write a surrogate code point (U+D800-U+DFFF) in their value as BR-024's six-character
+  escape, as `tool_invoked` has since BR-024; they wrote it as it was.
+
+  | Line | Level | Key | What the value is |
+  |---|---|---|---|
+  | `tool_invoked` (the loop's batch and single-call lines) | DEBUG | `tool_name` | the model's tool name |
+  | `mcp.tool_overwrite` (`MCPProvider.attach` and `refresh()`) | WARNING | `tool_name` | an MCP server's tool name |
+  | `tool overwritten` (`Registry.register`) | WARNING | `tool_name` | the tool's name: an MCP server's when `MCPProvider` registers it again, else yours |
+  | `mcp.refresh_failed` (`MCPProvider`'s periodic refresh) | WARNING | `error_message` | the exception's text, which for a JSON-RPC error is the MCP server's own message |
+  | `mcp.tool_error_hook_failed` (one call), `mcp.tool_error_hook_invalid` (two calls; `MCPClient`) | WARNING | `tool_name` | the MCP tool name of the call |
+
+  A value with neither a control character nor a surrogate code point is passed to the logger
+  as an equal string. For nine such values (among them Arabic, an emoji, NBSP, U+202E,
+  U+2028, the six characters of an escape typed, and a message with spaces), and for one
+  holding a surrogate code point on `tool_invoked`'s value, a direct logging call shaped like
+  `tool_invoked` wrote the same bytes before and after BR-028 under the default
+  configuration (its time column left out), with `ConsoleRenderer(colors=True)`,
+  `JSONRenderer` (with and without `ensure_ascii`), `LogfmtRenderer`, `KeyValueRenderer`,
+  `ProcessorFormatter.wrap_for_formatter` and `render_to_log_kwargs` (two formats), with
+  structlog 26.1.0 and 24.1.0 on CPython 3.11.15, 3.13.2 and 3.14.3. A name that is not a
+  string, on the registry line, is logged as it is. `tool_invoked` still writes BR-024's
+  escape for a surrogate code point. The keys are unchanged. Events, requests, registry keys
+  and the text of an MCP tool's error result keep the characters (measured), and so does
+  what the state stores write (by reading: their escape leaves control characters alone).
+  The escape cannot be told apart from the same six characters typed.
+  A renderer that escapes a backslash shows the escape's backslash doubled:
+  `structlog.processors.JSONRenderer` (so a reader that decodes the line gets the six
+  characters, where it got the control character before), `KeyValueRenderer`, structlog
+  26.1.0's default `ConsoleRenderer` for a value it writes with `repr` (one that also holds a
+  space, `=` or a quote; a tab, CR or LF is escaped first, so a value holding only those,
+  which 26.1.0 used to quote with `repr`, is now written unquoted) and 26.1.0's
+  `LogfmtRenderer` for a value it quotes (one holding a space, `=` or `"`); measured. Other
+  characters are written as before, among them the bidirectional formatting characters,
+  apart from one case on structlog 26.1.0 (see Not covered). (BR-028)
+
+### Fixed
+- JSON that the SDK writes for the model now carries non-ASCII text as literal UTF-8
+  instead of `\uXXXX` escapes. By default Python's `json.dumps` writes every non-ASCII
+  character as an escape: 6 characters each, 12 for a character outside the Basic
+  Multilingual Plane such as an emoji. One Arabic-heavy tool result measured 141,325
+  characters escaped and 35,840 unescaped, about 3.9 times shorter. In that measured
+  case the previous request had used 12,535 prompt tokens, and the provider rejected the
+  request that added the escaped result for exceeding its max_prompt_length of 131,072.
+- Three places change:
+  - a tool result that is not a string (a dict or list, including an MCP tool's
+    `structuredContent` or content blocks), in every tool mode and tool-result role, on
+    the single-call path and in a native batch;
+  - the argument schemas in the system prompt's text-mode tool list;
+  - the `arguments` string of a replayed native tool call.
+- The decoded JSON values are unchanged.
+- For data whose strings hold only code points U+0000-U+007E, that JSON is unchanged,
+  byte for byte. U+007F (DEL) is the one ASCII exception: it is now sent as the
+  character rather than as `\u007f`.
+- In those three places, a value holding a surrogate code point (U+D800-U+DFFF), which
+  UTF-8 cannot encode, keeps the fully escaped 1.10.1 form, which UTF-8 can encode. BR-020
+  does not change a tool result that is already a string (BR-022 escapes surrogate code
+  points in it; see Changed).
+- Stored data is unchanged: tool results are never persisted, and Redis branch metadata
+  keeps its encoding.
+- This fix makes no public API changes. (BR-020)
+- A provider answering HTTP 200 with a plain-text body now makes `OpenAICompatibleClient`
+  raise `LLMError` carrying that body, typed `NonJsonProviderBody` (or
+  `ContextLengthExceeded`, see Changed). The message quotes the first 500 characters of
+  the stripped provider text, with `…[truncated]` appended when it was cut.
+  `context["body_length"]` is the length in characters of that text before stripping: the
+  decoded body, the value of a body that is a bare JSON string (so 61 for a 63-character
+  body), or the data of the stream event that failed. It used to raise `Malformed provider
+  response: 'str' object has no attribute 'choices'`, and the provider's explanation was
+  lost. The same holds for a body that is a bare JSON string, and for a body labelled
+  `application/json` whose UTF-8 text is not JSON, which used to escape `complete()` and
+  `AgentLoop.run()` as a raw `json.JSONDecodeError`, with no `ErrorEvent` or
+  `FinalEvent`. Bodies with a JSON Content-Type that the `openai` client could not decode
+  at all (not valid UTF-8, an integer literal over the digit limit) escaped raw too; BR-023
+  fixes them (see its items).
+- A streaming request answered with such a body looked like an empty stream: with the
+  parser retry on (the default), the run ended with a `ParserError` after two provider
+  calls. It now raises `LLMError` typed `NonStreamProviderBody` (or
+  `ContextLengthExceeded`) after one, unless the body is labelled `text/event-stream` (see
+  below).
+- Some provider answers are still not caught. A non-streamed 200 whose body is a JSON
+  object without `choices` and without a truthy `error` member, such as `{"detail": ...}`,
+  still raises `MalformedResponse` (`Provider returned no choices.`) with its text lost, so
+  it is never classified. (An error envelope `{"error": {...}}` is caught since BR-023;
+  see its items.) A body without SSE fields (plain text, or a JSON error envelope)
+  labelled `text/event-stream` still looks empty, because the `openai` client's SSE
+  decoder drops it before the SDK sees it.
+- An over-long prompt whose provider error uses one of the three markers, on one of the
+  paths listed under Changed, is classified `ContextLengthExceeded`, so a consumer can
+  react to it, for example by trimming a tool result and retrying.
+- The end user is no longer told the steps ran out when the provider failed: the run ends
+  with `error_fallback_message` (see Added).
+- Where the quoted provider text goes: `LLMError.message`, `ErrorEvent.message`, the
+  Runner's `error` audit `error_message` (`ConsoleAuditSink` logs it, `SqlAuditSink` stores
+  it) and the `on_error` hook, the places a provider's 4xx/5xx text already reached, in
+  full. It is not in `FinalEvent.text`, in `LLMError.context`, in the state store, or in
+  the log lines the loop, the client and the Runner write for such a run with no audit
+  sink wired. Treat `ErrorEvent.message` as diagnostic text, not text for end users.
+- How these bodies reach the SDK is the `openai` client's behaviour, measured on `openai`
+  2.43.0. The BR-021 test suite also passed with `openai` 2.54.0 (on CPython 3.11.15 and
+  3.13.2). (BR-021)
+- A native tool call whose `arguments` `json.loads` decoded but the SDK could not
+  re-encode for the next request ran the tool, and building that request then raised a raw
+  `RecursionError` out of `AgentLoop.run()`, with no `ErrorEvent` or `FinalEvent`.
+  - Reproduced on CPython 3.14.3 at 100,000 levels of nested objects, for a single call
+    and a batch, with and without intervention hooks. 100,000 levels of nested arrays
+    still re-encoded there, and that run completed.
+  - Reproduced on 3.11.15 in a band of 3 levels just below the depth at which decoding
+    failed. No such band was found on 3.13.2.
+  - Arguments deeper than `json.loads` itself decodes raised the `RecursionError` out of
+    `complete()` instead, before any tool ran: the `ValueError` arm around the decode does
+    not catch it (reproduced on 3.11.15, 3.13.2 and 3.14.3).
+  - Both now end as described under Changed.
+  - Why only those interpreters and depths, measured with stdlib `json` from a module's
+    top level: `json.loads` and `json.dumps` both reach 995 levels on CPython 3.11.5 and
+    3.11.15, and 9998 on 3.13.2, for nested objects and nested arrays alike. On 3.14.3
+    `json.loads` reaches 116,213 levels, and `json.dumps` 61,525 for nested objects and
+    104,591 for nested arrays. The 3.11.15 band comes from the SDK re-encoding the
+    replayed arguments 3 Python frames deeper than it decodes them. Inside an async
+    pytest test each of these limits was lower: 948 on 3.11.15, 9976 on 3.13.2, and
+    about 116,100 / 61,470 / 104,500 on 3.14.3, where they moved by a level between
+    runs. (BR-019)
+- A tool result could end a run with a raw exception and no `ErrorEvent` or
+  `FinalEvent`. Each case below was measured on CPython 3.11.15, 3.13.2 and 3.14.3:
+  - A string result holding a surrogate code point made the next request raise
+    `UnicodeEncodeError` out of `AgentLoop.run()` after one request, with the shipped
+    client on `openai` 2.43.0 and 2.54.0, which encode the request body as strict UTF-8.
+    An `is_error` text, an `after_tool` note, a denial reason or a `repr` fallback holding
+    one did the same.
+  - A non-string result nested deeper than `json.dumps` reaches, such as a 200,000-level
+    list, raised `RecursionError` out of `AgentLoop.run()` from `json.dumps`. Under
+    `AgentRunner` it raised out of `AgentRunner.run()` from the `repr` in the Runner's
+    `tool_invocation` audit summary, which is computed even with no audit sink, before the
+    loop rendered the result. On 3.14.3 a dict chain one level past `json.dumps`' reach,
+    which `repr` still renders there, raised from `json.dumps` under `AgentRunner` too.
+  - A result whose `repr` fallback raised ended the run with that exception, for example
+    one holding an integer over the interpreter's int-to-str digit limit (`ValueError`
+    from `json.dumps` and from `repr`). So did an exception other than `TypeError` or
+    `ValueError` raised by a value's `__str__` under `default=str` (see Changed).
+- Now a surrogate code point reaches the model escaped (see Changed), and a result that
+  cannot be converted reaches it as the fixed sentence "The tool's output could not be
+  converted to text, so it is not shown.", in the usual layout (`Tool <name> returned:
+  ...` outside the `"tool"` role). The run continues.
+  - The loop logs the WARNING `tool_output_not_rendered` with `call_id`, `run_id`,
+    `output_type` and `error_type` (type names), never the value or the exception's text.
+  - `repr` is not tried after a `RecursionError`: it recurses through the same value, and
+    on CPython 3.14.3 a failing `repr` of a 200,000-level list took about 0.8 s against
+    about 0.03 s for the failing `json.dumps`.
+  - The Runner's `tool_invocation` `result_summary` for an output whose `repr` raises is
+    `<unrepresentable TYPE: ERROR>` (type names only), for example `<unrepresentable list:
+    RecursionError>`, where the run used to end.
+- MCP over streamable HTTP: BR-022's probes called the parser the `mcp` client runs on
+  each response (`JSONRPCMessage.model_validate_json`; mcp 1.28.0 and 1.30.0) directly.
+  It refused a `tools/call` result whose text holds the lone escape `\ud800`, and one
+  whose `structuredContent` nests deeper than 198 levels, so those did not reach
+  `MCPClient`'s result. In-process tools and other `Tool` implementations can return
+  such values.
+- Not covered:
+  - A surrogate code point in a user or system message passed to `run()` still makes the
+    shipped client raise `UnicodeEncodeError` raw (measured). The model's own completion and
+    tool names echoed back did too before BR-024 (see its items).
+  - A tool whose exception's own `__str__` raises still escapes `AgentLoop.run()` from
+    `Registry.invoke` (measured).
+  - Serialising an event that carries such a value with pydantic, as a consumer may,
+    still raises `PydanticSerializationError`: `ObservationEvent.model_dump_json()` when the
+    result holds a surrogate code point or is a dict chain nested deeper than 254 levels,
+    and `ToolFailedEvent.model_dump_json()` when its `error` holds a surrogate code point.
+    Events carry the tool's own value and text, so BR-022 does not change this (measured on
+    the BR-022 tree and its base, CPython 3.11.15, 3.13.2 and 3.14.3, pydantic 2.13.4 and
+    2.13.5). `ObservationEvent.model_dump(mode="json")` returned for a string result
+    holding one.
+  - Nothing bounds the time `json.dumps` or `repr` spend on a value before they render it
+    or fail.
+
+  No public API changes. (BR-022)
+
+- A provider answering HTTP 200 could still end a run with a raw exception and no
+  `ErrorEvent` or `FinalEvent`, because `AgentLoop.run()` catches only `LLMError`.
+  Measured before BR-023 on CPython 3.14.3 with `openai` 2.43.0 and on 3.11.15 and 3.13.2
+  with 2.54.0, and on 1.10.1 (CPython 3.14.3, `openai` 2.43.0):
+  - a body labelled JSON (`application/json`, `application/problem+json` or `text/json`)
+    that is not valid UTF-8: `UnicodeDecodeError`;
+  - a body under the same labels with an integer literal one digit over the interpreter's
+    int-to-str digit limit: `ValueError`;
+  - a body labelled `application/json` nested twice as deep as `json.loads` decodes:
+    `RecursionError`;
+  - a body labelled `text/plain; charset=utf-16` or `charset=utf-32` that `json.loads`
+    cannot decode (measured: plain text, a body that is not valid UTF-8, an integer literal
+    over the digit limit): `UnicodeDecodeError` (`UnicodeError` on 3.11.15); under
+    `charset=idna`, `UnicodeError`; each from the `openai` client's own text decode;
+  - a completion whose `content` is `5` or `[1]`, whose tool call's `name` is `null`, whose
+    usage count is `-1`, `"abc"` or `1e400`, or whose `choices` is an object instead of a
+    list: a pydantic `ValidationError`, a `ValueError`, an `OverflowError` or a `KeyError`
+    from mapping the response.
+- Each of these now ends the run after one request with an `ErrorEvent` carrying the
+  `LLMError`, then the `FinalEvent` with `error_fallback_message`. The first four are
+  `UndecodableProviderBody` (see Changed). The last is `MalformedResponse` with the fixed
+  message `Malformed provider response: a field has the wrong type or value (<exception
+  class>).`, which quotes no value from the body, and the exception as `__cause__`.
+  Fields that fail with an `AttributeError`, `IndexError` or `TypeError` instead (measured,
+  for example: `choices` as a string, `finish_reason` `[1]`, a usage count `[1]`,
+  `tool_calls` `5`) were `MalformedResponse` before and keep the message `Malformed
+  provider response: <error>`. Of the 35 wrong-typed field shapes measured, none still
+  escapes `complete()` raw; some are accepted as before (a `usage` that is a list or a
+  string reads as zero counts). A streamed chunk with such a field keeps its earlier error
+  (`context["type"]` is the exception's class name).
+- A non-streamed 200 JSON error envelope (`{"error": {...}}`; measured labelled
+  `application/json` and `text/plain`) raised `MalformedResponse` (`Provider returned no
+  choices.`) with its text lost, so it was never classified, while the same body on a
+  streamed request not labelled `text/event-stream` was quoted and classified. It is now
+  `ErrorEnvelopeProviderBody` carrying its text, classified like its streamed twin (see
+  Changed).
+- Not covered:
+  - A 200 JSON object without `choices` and without a truthy `error` member, such as
+    `{"detail": ...}`, still raises `MalformedResponse` with its text lost, and a body
+    without SSE fields labelled `text/event-stream` still looks empty (see the BR-021
+    items above).
+  - A `RecursionError` in the decode step that comes from a call stack already nearly
+    exhausted, not from the body, is reported as `UndecodableProviderBody` too, with
+    `decode_error` `RecursionError`. Measured on CPython 3.11.15: a valid completion holding
+    a 300-level array in an extra key, with `complete()` awaited 679 to 962 coroutine frames
+    deep (before BR-023 those runs raised `RecursionError` raw). With that body no such
+    depth was found on 3.13.2 or 3.14.3, and with a completion without the deep key none on
+    any of the three: there the request step fails first (`APIConnectionError`, or
+    `RecursionError` raw with nothing sent), as before BR-023 but one frame shallower, so
+    at one measured depth per interpreter a run that ended with `APIConnectionError` now
+    raises `RecursionError` raw, and at one other a raw exception now ends as
+    `APIConnectionError`. On 3.11.15 the 300-level body also completes at 675 to 678
+    frames, where it raised raw before. `stream()`'s decode arm would report such a failure
+    of the event iterator the same way, as `UndecodableProviderBody` (by reading; not
+    measured).
+  - The quote reads the body's bytes as UTF-8 whatever `charset` the Content-Type names,
+    so a body actually encoded in UTF-16 or UTF-32 is quoted unreadably, NUL characters
+    included, and is not classified (measured for an error envelope in UTF-16 and UTF-32,
+    each with and without a byte-order mark).
+  - A 200 not labelled JSON whose body `json.loads` cannot decode (measured: plain text, a
+    body that is not valid UTF-8, an integer literal over the digit limit, nesting past the
+    decoder) and whose Content-Type names a codec that is not a text encoding (measured:
+    `charset=hex`, `base64`, `rot13`, `zlib`, `uu`) still raises `AssertionError` or
+    `TypeError` raw out of `complete()`, from the `openai` client's own `Response.text`
+    read inside `parse()`, as before BR-023 and in 1.10.1 (measured on `openai` 2.43.0 and
+    2.54.0; 1.10.1 on 2.43.0). A body under those labels that `json.loads` decodes (a
+    completion, an error envelope) is handled as above.
+  - On `stream()`, a 200 that is read ahead (not `text/event-stream`), yields no chunk, and
+    whose `charset` that read cannot decode with (the same five codecs, `idna`, or `utf-16`
+    and `utf-32` on a UTF-8 body) ends with the generic wrap (`context["type"]` is the
+    exception's class name) instead of `NonStreamProviderBody`. That read is BR-021's and is
+    unchanged.
+  - A custom `LLMClient` decodes its own responses.
+
+  No public API changes. (BR-023)
+
+- Text the model wrote, or an assistant message passed to `run()`, holding a surrogate code
+  point made the request that carried it raise `UnicodeEncodeError` out of
+  `AgentLoop.run()`, with no `ErrorEvent` or `FinalEvent`, with the shipped client on
+  `openai` 2.43.0 and 2.54.0 (CPython 3.14.3) and 2.54.0 (CPython 3.11.15 and 3.13.2), which
+  encode the request body as strict UTF-8. For a tool name, under structlog's default
+  configuration it raised earlier, before that request, from the loop's `tool_invoked` debug
+  line, which printed the name to stdout as it was unless it held a space, tab, `=`, a quote
+  or a line break (those the default renderer writes with `repr`, so the run raised at the
+  request instead; measured with structlog 26.1.0 for each of them). The earlier raise was
+  measured for U+D800 with stdout a file under a UTF-8 locale and under the C locale, and a
+  TTY for a native call, a native batch and the `JsonModeParser` case below; under the C
+  locale `surrogateescape` wrote a name holding U+DC80 as a raw byte, so that run raised at
+  the request instead. Measured before BR-024:
+  - a JSON-mode completion holding one, echoed back on a tool step (streamed or not, and
+    without `tool_mode`), a parser retry or a require-tool re-ask (each streamed or not), and
+    a PROSE completion echoed back on a tool step, a parser retry or a require-tool re-ask;
+  - a native tool call whose name holds one (one call, the second of two, or with
+    `SafetyConfig(native_tools_enabled=True)` and no `tool_mode`), or a native tool turn
+    whose content holds one;
+  - without `tool_mode` and with the default `tool_message_role`, a JSON-mode tool name
+    written as the six-character escape, which `JsonModeParser` decodes into a surrogate code
+    point that goes out as the tool reply's name;
+  - an assistant message passed to `run()` holding one, such as a NATIVE final answer that
+    `AgentRunner` stored in `MemoryStateStore` and replays on the next turn (raised at that
+    turn's first request, with nothing sent).
+- Each now sends the request with the escape, and the run continues (see Changed), on the
+  same releases and interpreters: measured with structlog silenced, under its default
+  configuration with stdout a file (every case above), and with stdout a TTY (a native call,
+  a native batch and the `JsonModeParser` case).
+- Not covered:
+  - User and system messages are sent as they are: a surrogate code point in one passed to
+    `run()` still raises `UnicodeEncodeError` with nothing sent. So does one in a `"tool"`
+    message's content passed to `run()`, in the `name` of a user, assistant or system
+    message, in the system prompt (`PromptSections.persona`) or in a tool's description
+    (measured; the description in `ToolMode.JSON` and `ToolMode.NATIVE`). `SafetyConfig`
+    refuses one in `parser_retry_reminder` or `tool_required_reminder` with a pydantic
+    `ValidationError` when it is built (measured).
+  - A character outside the Basic Multilingual Plane whose two surrogate halves arrive in
+    two stream chunks, each as a JSON escape, now completes where it raised, but stays two
+    surrogate code points: the events carry both, as before, and the request carries two
+    six-character escapes, not the character (measured for an emoji in a streamed JSON-mode
+    tool turn).
+  - Events, `ChatResponse` and the messages the Runner passes to its state store keep the
+    provider's text. `model_dump_json()` of an event holding one (`ThoughtEvent`,
+    `ActionEvent`, `ToolStartedEvent`, `ToolFailedEvent`, `FinalEvent`) raises
+    `PydanticSerializationError`; `model_dump(mode="json")` returns. Persisting a final
+    answer holding one through `SqlStateStore` or `RedisStateStore` raised outside
+    `StateStoreError`; since BR-025 (below) both store it, with an escape that cannot be told
+    apart from the same six characters typed.
+  - A custom `LLMClient` encodes its own requests.
+  - Other `openai` releases, and CPython 3.12, were not measured. Log output was measured
+    with structlog 26.1.0, under its default configuration and with a JSON renderer only.
+
+  No public API changes. (BR-024)
+
+- Persisting a message whose `content`, `name` or `tool_call_id` holds a surrogate code
+  point (U+D800-U+DFFF) through `SqlStateStore` (measured on SQLite through aiosqlite) or
+  `RedisStateStore` raised an exception that is not a `StateStoreError`.
+  When `AgentRunner` persisted a final answer holding one, `SqlStateStore` (SQLite through
+  aiosqlite) raised `UnicodeEncodeError` and `RedisStateStore` (fakeredis)
+  `PydanticSerializationError`, out of `AgentRunner.run()` after the `FinalEvent`. The
+  answer was not stored. The session kept the user turn without it, so the next run sent
+  two user messages in a row. Measured before BR-025 and on 1.10.1, for a NATIVE final
+  answer (the provider body carrying the JSON escape, or the UTF-8 encoded surrogate bytes)
+  and a `ToolMode.JSON` final answer (streamed or not), on CPython 3.14.3 (pydantic 2.13.4,
+  SQLAlchemy 2.0.51, redis 8.0.0 and fakeredis 2.36.2; and pydantic 2.13.5, SQLAlchemy
+  2.1.2, redis 8.1.0 and fakeredis 2.39.0) and on CPython 3.13.2 and 3.11.15 (pydantic
+  2.13.5, SQLAlchemy 2.1.3, redis 8.1.0 and fakeredis 2.39.0), all with aiosqlite 0.22.1.
+  `MemoryStateStore` stored the answer.
+- `SqlStateStore` and `RedisStateStore` now store such a message. Each surrogate code point
+  in its `content`, `name` and `tool_call_id` is written as its six-character `\udXXX`
+  escape, the spelling BR-022 and BR-024 use. Measured on the same versions (SQLite
+  through aiosqlite, and fakeredis), through `append` for each of the three fields and
+  through `AgentRunner` for the final answers above:
+  - The answer is stored, and the next run sends the user turn, the stored answer and the
+    new user turn. The body of that request was byte for byte the one sent with
+    `MemoryStateStore`, because the shipped client writes the same escape into an
+    assistant message's content (BR-024), with `openai` 2.43.0 on the first version set
+    above and 2.54.0 on the others.
+  - Reading the message back returns the escaped text. Nothing decodes it, and it cannot
+    be told apart from those six characters typed literally. `MemoryStateStore` is
+    unchanged: it keeps the code point and returns it. A JSON-mode final answer is stored
+    as its raw envelope, so the escape sits inside a JSON string there: the stdlib
+    `json.loads` of the stored envelope gives the code point back (two that form a pair
+    come back as the one character), and pydantic's JSON parser (`pydantic_core.from_json`)
+    joins such a pair too and rejects one that is not half of a pair with a `ValueError`
+    (measured on the same versions).
+  - A message with no surrogate code point in those three fields is stored as before: the
+    store writes the message object it was given (by reading), and for 15 messages (Arabic
+    text, an astral emoji, U+007F, the six characters of an escape typed literally, quotes,
+    backslashes, a newline and a tab, an empty content, a 10 KB system message, a JSON
+    envelope, every role, with and without `name`, `tool_call_id` and `tool_calls`, and one
+    holding a surrogate code point only in `tool_calls`) the stored SQLite column bytes and
+    Redis list entries were identical before and after BR-025, on the same versions
+    (`RedisStateStore` raised for the last one both times and stored nothing). A message
+    built with `model_construct`, or changed by assignment after validation, can hold
+    something other than a `str` in those fields; such a value is passed through as it is,
+    and for an int, a float, `None`, bytes and a list in `content`, an int or bytes in
+    `name` and an int in `tool_call_id`, both stores stored the same bytes or raised the
+    same exception before and after BR-025, on the same versions. Rows already stored are
+    not changed.
+  - The rule follows the field, not the role. A user message holding one, or a
+    `system_prompt` holding one on the first turn, is now stored escaped, where both stores
+    raised before and did not store it. The shipped client still sends user and system
+    text as it is, so that run now ends with the client's `UnicodeEncodeError`, with
+    nothing sent (see BR-024's *Not covered*). The user turn stays stored without an
+    answer, so the next run sends it (escaped, when it held one) and then the new user
+    turn, and completes: that request carries two user messages in a row. With a
+    `system_prompt` on the session, those two user turns follow the loop's own system
+    message and the stored `system_prompt` message (escaped, when it held one). With
+    `MemoryStateStore` the next run raises again, because the code point is replayed.
+    Measured through `AgentRunner` on the same versions, for a user message holding one
+    (with no `system_prompt`, and with one that holds none) and for a `system_prompt`
+    holding one.
+  - Both stores' `append` now checks each of `content`, `name` and `tool_call_id` that is
+    a `str` with one UTF-8 encode; a field holding a surrogate code point is encoded twice
+    and decoded once (by reading).
+- Not covered:
+  - `tool_calls` are stored as before. `RedisStateStore` still raises
+    `PydanticSerializationError`, not `StateStoreError`, for a surrogate code point in a
+    tool call's name, id or argument value, and stores nothing. `SqlStateStore` on SQLite
+    stores one there as a JSON escape and returns the code point; two in a row that form a
+    pair come back as the one character they pair to. One in an argument's key does not
+    raise in either store: pydantic writes it as three U+FFFD, and the message is stored
+    with those. Measured on the same versions, the same before and after BR-025.
+    `AgentRunner` persists no `tool_calls`.
+  - A `session_id` holding a surrogate code point still raises `UnicodeEncodeError`, not
+    `StateStoreError`, from `append` and `get_messages` in both stores (measured on SQLite
+    through aiosqlite and with fakeredis). An id is a key, and escaping it could make two
+    ids one.
+  - Postgres and a real Redis server were not measured. By reading only: on Postgres
+    `name` and `tool_call_id` are `VARCHAR(255)`, which rejects a longer string (PostgreSQL
+    16 documentation), and each escaped code point takes six characters, so a value that
+    holds one and is near that length could exceed it there; SQLAlchemy raises a driver
+    error as a `SQLAlchemyError` (2.0.51, `engine/base.py`), which `append` wraps as
+    `StateStoreError`. `tool_calls` are `jsonb` there, and the same documentation says
+    `jsonb` accepts a surrogate escape only as half of a correct pair, so a tool call
+    holding one, which BR-025 leaves as it was, could be rejected there.
+  - The SDK serialises no event with `model_dump_json()` (by reading), so BR-024's *Not
+    covered* item on events stands.
+
+  No public API changes. (BR-025)
+
+- When a host routes structlog through stdlib `logging` with
+  `structlog.stdlib.render_to_log_kwargs` or `render_to_log_args_and_kwargs`, which pass the
+  event dict's keys apart from `event`, `exc_info`, `stack_info` and `stacklevel` (and
+  `positional_args` for the second) to stdlib as the record's `extra` (by reading structlog
+  26.1.0), stdlib's `Logger.makeRecord` refuses a key that is a `LogRecord` attribute,
+  `message` or `asctime`. Four SDK log lines passed one (`name`, or `message` in
+  `mcp.refresh_failed`; see Changed), so the log call raised `KeyError: "Attempt to
+  overwrite 'name' in LogRecord"` (`'message'` for `mcp.refresh_failed`), which escaped the
+  SDK call that logged it. In the periodic refresh, the task's `except` arm caught a
+  refresh's exception, that `KeyError` included, and its own log call then raised for
+  `'message'`. Measured before BR-026 with structlog 26.1.0 and both recipes, on CPython
+  3.14.3 with `openai` 2.43.0 and 2.54.0 and on CPython 3.13.2 and 3.11.15 with 2.54.0:
+  - With DEBUG enabled for the SDK's loggers, `AgentLoop.run()` raised it at the first tool
+    call it dispatched, with no `ErrorEvent` or `FinalEvent`: for a single native call (to a
+    registered tool, to an unregistered one, with an Arabic name and with a name holding
+    U+D800) and a native batch, with a scripted client and with the shipped client; and,
+    with a scripted client, a `ToolMode.JSON` call, a `ToolMode.PROSE` call and a call
+    parsed by `JsonModeParser` without a tool mode (that one also with the shipped client).
+    Those runs have no `before_tool` hook, and each raised after one request. A call a
+    `before_tool` hook denies logs `tool_denied` instead, which passes no such key: with the
+    shipped client and a hook that denied one tool, a native batch of the denied call and an
+    allowed one raised at the allowed call, after one request, and a run whose first turn
+    held only the denied call raised in its second turn, after two requests. With the SDK's
+    loggers at INFO, or with no level set anywhere (stdlib's default passes WARNING and
+    above), the runs without a hook completed.
+  - With the SDK's loggers at DEBUG, at INFO, or with no level set anywhere:
+    `Registry.register` of a name already registered raised it, and the registry kept the
+    earlier tool. `MCPProvider.attach` raised it at a server tool whose name was already
+    registered: with a local `search` registered and the catalog `[alpha, search, zeta]`,
+    `alpha` was registered, `search` stayed the local tool and `zeta` was not registered.
+    `refresh()` of a catalog that still held an attached tool raised it (measured for an
+    unchanged one-tool catalog; by reading, it raises at the first catalog tool already in
+    the registry). The periodic refresh task (`start_periodic_refresh`) ended at its first
+    tick with `KeyError` for `'message'`, whether that tick's refresh failed (measured with
+    an `MCPError`, with an attached tool and with an empty catalog) or refreshed an attached
+    tool (by reading, that refresh raised at `mcp.tool_overwrite`, and the task's `except`
+    arm then raised at `mcp.refresh_failed`), and no later refresh ran. With an empty
+    catalog and no failed refresh, the task kept running.
+  - Each of these raises happened the same way on 1.10.1 on the same library sets. At DEBUG
+    and with no level set, they also happened on 1.8.0 and 1.9.0, and on 1.7.0 through
+    `SafetyConfig(native_tools_enabled=True)` and `JsonModeParser` (it has no `tool_mode`),
+    with CPython 3.14.3 and `openai` 2.43.0; the `ToolMode.JSON`, `ToolMode.PROSE` and
+    `before_tool` cases were not run on those three.
+  - With a hand-written processor instead of either recipe, one that returns the event's
+    keys as `extra`, and the root logger at DEBUG, a single native call (scripted client)
+    and a registry overwrite raised the same way, on the same library sets, and on 1.7.0
+    (through `SafetyConfig(native_tools_enabled=True)`) and 1.10.1 with CPython 3.14.3 and
+    `openai` 2.43.0.
+- Each now logs and continues, measured the same way: the runs end on the model's answer
+  (the runs with a `before_tool` hook included), `register`, `attach` and `refresh()`
+  return, and the periodic task keeps refreshing after a failed tick and after a tick that
+  refreshed an attached tool. Under these two recipes the records carry the value as a
+  `tool_name` or `error_message` attribute, and their `name` is the SDK logger's name
+  (`fifty_agent_sdk.loop`, `fifty_agent_sdk.tools.registry` or
+  `fifty_agent_sdk.tools.mcp_provider`). Under structlog's default configuration and with
+  `structlog.stdlib.ProcessorFormatter.wrap_for_formatter`, which passes the event dict as
+  the record's `msg`, none of these cases raised just before BR-026, and they still do not.
+  On 1.10.1, before BR-024, the runs with a tool name holding U+D800 raised
+  `UnicodeEncodeError` under those configurations instead (with either client under the
+  default configuration, with the shipped client under `wrap_for_formatter`). structlog
+  24.1.0, the lowest release the SDK accepts, gave the same results as 26.1.0 on the tree
+  just before BR-026 and after it, with `render_to_log_kwargs`, `wrap_for_formatter` and
+  its default configuration, on the same four library sets; it was not run on 1.10.1 or
+  earlier, and it has no `render_to_log_args_and_kwargs`.
+- Not covered:
+  - stdlib refuses these keys whatever adds them. Six of the keys structlog's
+    `CallsiteParameterAdder` can add are `LogRecord` attributes (`pathname`, `filename`,
+    `module`, `lineno`, `thread` and `process`, in structlog 26.1.0). With its default
+    parameters before `render_to_log_kwargs`, `Registry.register`'s overwrite warning still
+    raises `KeyError` for one of those keys; which one depends on the interpreter's string
+    hash seed (with `PYTHONHASHSEED` 0 to 19 every seed raised, and each of the six keys
+    appeared, on the four library sets). An attribute that a host's `LogRecord` factory
+    adds can do the same (by reading). The SDK never configures structlog.
+  - The periodic refresh logs a failed tick with an unguarded log call, so a logging
+    configuration that makes that call raise still ends the task: with a processor that
+    raises on `mcp.refresh_failed`, the task ended with that processor's exception at its
+    first failed tick (measured on the four library sets).
+  - CPython 3.12 runs in CI but was not measured for this item, and structlog releases
+    other than 24.1.0 and 26.1.0 were not measured.
+
+  No public API changes; the renamed log keys are listed under Changed. (BR-026)
+
+- `ConsoleAuditSink` lost the audit event's time under structlog's default configuration
+  and with `structlog.processors.TimeStamper` at its default key in the processor chain.
+  The sink logged the time as `timestamp`; the `TimeStamper`, which runs after the log call
+  has built the event and writes its key whatever the key holds (by reading structlog
+  26.1.0), wrote the log time there, so the line carried the log time instead, with no
+  error. structlog's default configuration, which the SDK does not change, includes a
+  `TimeStamper` with `fmt="%Y-%m-%d %H:%M:%S"` and `utc=False` (measured on structlog 24.1.0
+  and 26.1.0), so a host that never configures structlog got the log time in local time,
+  to the second and with no zone, as the line's first column. Measured before BR-027 with
+  structlog 26.1.0 and 24.1.0 on CPython 3.11.15, 3.13.2 and 3.14.3, for an `AuditEvent`
+  stamped 2000-01-02 03:04:05 UTC:
+  - under the default configuration, and under `structlog.stdlib.recreate_defaults()`,
+    which reuses the same `TimeStamper`, the event's time appeared nowhere on the line;
+  - with the default processors and `JSONRenderer`, with `TimeStamper(fmt="iso")`, with
+    `TimeStamper()` (a UNIX time), and with `render_to_log_kwargs`,
+    `render_to_log_args_and_kwargs` (26.1.0 only) or `ProcessorFormatter.wrap_for_formatter`
+    after a `TimeStamper(fmt="iso")`, `timestamp` held the log time and the event's time
+    appeared nowhere;
+  - in an `AgentRunner` run with one tool call and an audit sink that passes each event to
+    `ConsoleAuditSink`, none of the three audit lines showed its event's time, under the
+    default configuration, under its processors with `JSONRenderer` and under
+    `TimeStamper(fmt="iso")`;
+  - with `structlog.processors.MaybeTimeStamper`, with `TimeStamper(fmt="iso", key="ts")`,
+    and under `structlog.testing.capture_logs()`, the line kept the event's time under
+    `timestamp`.
+
+  1.10.1 gave the same results, the stdlib recipes included, with structlog 26.1.0 and
+  24.1.0 on CPython 3.14.3 and 3.11.15 (`render_to_log_args_and_kwargs` on 26.1.0 only).
+  The line has logged the time as `timestamp` since `ConsoleAuditSink` was added: the
+  keyword is in the commit that added the sink and at every release tag from v1.1.0 to
+  v1.10.1 (the repository has no v1.0.0 tag). It now
+  carries the event's time under `event_timestamp` in each of these configurations,
+  measured the same way.
+- Not covered:
+  - The key check (see Changed) reads structlog's keys under their default names, so a name
+    a host chooses is not checked (`TimeStamper(key=...)`, `MaybeTimeStamper(key=...)`,
+    `EventRenamer(to=..., replace_by=...)`,
+    `ConsoleRenderer(timestamp_key=..., event_key=...)`). With
+    `TimeStamper(key="event_timestamp")` the line now loses the event's time, where before
+    it kept it under `timestamp` (measured with structlog 26.1.0 on the three interpreters).
+  - `structlog.stdlib.ExtraAdder`, without an `allow` list, copies into the event every
+    attribute of a stdlib record that a fresh record lacks (by reading): the host's own
+    `extra` keys, `_logger` and `_name` (in the check's set), and `message` and `asctime`
+    once an earlier formatter has set them (measured; both are keys BR-026's check already
+    refuses).
+  - Processors a host writes, processors from other packages, and `structlog.twisted` are
+    not checked.
+  - structlog releases other than 24.1.0 and 26.1.0 were not measured, and CPython 3.12
+    runs in CI but was not measured for this item.
+
+  No public API changes; the renamed log key is listed under Changed. (BR-027)
+
+- Under structlog's default configuration, which the SDK does not change, a control
+  character in one of the values BR-028 now escapes (see Changed) reached the log output as
+  it was: a tool name the model chose, or an MCP server's tool name or error message, could
+  write a terminal control sequence (ESC followed by `[2J`, for example) into a console log.
+  structlog 26.1.0's `ConsoleRenderer` writes a string value as it is unless it holds a
+  space, tab, `=`, a quote, CR or LF, and writes those with `repr`, which escapes control
+  characters, so the character reached the output when the value held none of those seven.
+  structlog 24.1.0, the lowest release the SDK accepts, writes every string value as it is,
+  so there a line feed in such a value also started a new output line. Measured before
+  BR-028 with structlog 26.1.0 and 24.1.0 on four library sets (CPython 3.14.3 with `openai`
+  2.43.0 and `mcp` 1.28.0, and CPython 3.14.3, 3.13.2 and 3.11.15 with `openai` 2.54.0 and
+  `mcp` 1.30.0):
+  - a direct logging call shaped like `tool_invoked`: each of the 65 control characters
+    reached the output as it was, apart from tab, line feed and carriage return on 26.1.0,
+    which it wrote with `repr`; on 24.1.0 those three as well, and a line feed split the line
+    in two;
+  - the loop's `tool_invoked` line, through `AgentLoop` and `OpenAICompatibleClient`, for a
+    native call, a native batch and a `JsonModeParser` tool name decoded from a JSON escape,
+    with ESC `[2J`, an OSC sequence ending in BEL, U+009B, DEL, NUL, VT and LF in the name,
+    with stdout a file and a terminal (`JsonModeParser` strips the name, so a trailing VT
+    did not reach the line there);
+  - `mcp.refresh_failed` for an MCP server's JSON-RPC error message, and
+    `mcp.tool_overwrite`, `tool overwritten` and the two hook lines for an MCP server's tool
+    name holding ESC, through a test transport that runs the SDK's `MCPClient` mapping, and
+    through real in-memory `mcp` sessions (a FastMCP server, which accepted a tool name
+    holding ESC with a warning, for the name lines and `mcp.tool_error_hook_failed`; a
+    low-level server whose `tools/list` returned the error, for `mcp.refresh_failed`).
+
+  On a stream whose encoding cannot encode a C1 control character, an ASCII or cp1252 stream,
+  the log call raised `UnicodeEncodeError` for a value holding one that the renderer wrote as
+  it was (on 26.1.0, a value holding none of those seven characters; on 24.1.0, any value; a
+  value 26.1.0 writes with `repr` did not raise, because `repr` escapes the character,
+  measured for a tool name and an error message holding a space): `AgentLoop.run()` ended at
+  the `tool_invoked` line after one request, with no `FinalEvent` (a native call, a native
+  batch, `SafetyConfig(native_tools_enabled=True)` with `JsonModeParser`, and a
+  `JsonModeParser` name); `Registry.register` raised and kept the earlier tool;
+  `MCPProvider.attach()` (for a name already registered, which then kept the earlier tool)
+  and `refresh()` raised at `mcp.tool_overwrite`; the periodic refresh task ended at the
+  failed tick, and no later refresh ran; and the hook lines' raise reached the tool call's
+  result, so `Registry.invoke` returned an error result holding the
+  `UnicodeEncodeError`'s text instead of the `isError` message. Measured with an explicit
+  stream in each of those two encodings, and for the loop, `register` and the periodic
+  refresh also with stdout under `PYTHONIOENCODING=ascii`, on the same library sets and
+  structlog releases. 1.7.0, 1.8.0, 1.9.0 and 1.10.1 gave the same results with the
+  explicit streams (1.7.0 has no `tool_mode`, so its loop rows were the two through
+  `JsonModeParser`). A latin-1 stream wrote a C1 control character as its single byte.
+  Each value is now written escaped, and those calls no longer raise for it, measured the
+  same way. A value holding a character that is not a control character and that such a
+  stream cannot encode, such as an Arabic tool name or U+202E, still raises there at each of
+  these calls, with the outcomes above (measured on all eight calls, before and after; U+202E
+  on a latin-1 stream too). On structlog 26.1.0, U+202E in a value the renderer writes with
+  `repr` (since BR-028, one holding a space, `=` or a quote) is escaped by `repr` and does
+  not raise, while an Arabic letter, which `repr` keeps, still does (measured with a space in
+  the value, on an ASCII stream with CPython 3.14.3 and 3.11.15, at `tool_invoked`, `register` and the periodic refresh, before and after).
+
+  The same calls on the MCP and registry lines raised the same ways for a surrogate code point
+  in a value the renderer wrote as it was (an MCP server's tool name or error message, or a
+  name `Registry.register` logged) on any strict stream, a UTF-8 one included: with
+  structlog's default configuration and stdout a file or a terminal under a UTF-8 locale, the
+  case BR-024 fixed for `tool_invoked`. Measured through the test transport with an explicit
+  strict UTF-8 stream on the same library sets and structlog releases and on 1.7.0, 1.8.0,
+  1.9.0 and 1.10.1, and, for `register`, the periodic refresh and a hook line, with stdout a
+  file under a UTF-8 locale. These lines now write BR-024's escape and continue. Whether a
+  real MCP server's JSON can carry a surrogate code point into these values was not measured.
+- Not covered:
+  - Other characters are written as they are, among them the bidirectional formatting
+    characters (U+061C, U+200E, U+200F, U+202A-U+202E, U+2066-U+2069), which can change the
+    order in which a viewer that implements them shows the rest of the line; zero-width
+    characters; and U+2028 and U+2029, which some tools treat as line breaks (each written as
+    it was by the default `ConsoleRenderer`, before and after, in a value holding none of the
+    characters that switch 26.1.0's renderer to `repr`; measured). With structlog 26.1.0 a
+    value whose only characters from the renderer's `repr` list (space, tab, `=`, a quote,
+    CR, LF) were a tab, CR or LF used to be written with `repr`, which escaped these
+    characters, NBSP and a backslash in it; it is now written as it is after the escape, so
+    they reach the output as they are, and on a stream that cannot encode one of them the log
+    call now raises where it did not (measured on ASCII and cp1252 streams for U+202E after a
+    tab at `tool_invoked`, `register`, `attach()`, `refresh()`, the periodic refresh and a
+    hook line, and for U+200B after a tab and NBSP after a line feed, NBSP on ASCII only, at
+    `tool_invoked`, `register`, `refresh()` and the periodic refresh; the other characters and
+    the backslash by reading `structlog/dev.py:923-926`).
+  - A value holding a character that is not a control character and that the stream cannot
+    encode (an ASCII or cp1252 stdout, for example), such as an Arabic tool name or U+202E,
+    still makes these log calls raise, with the outcomes Fixed lists (measured on all eight
+    calls, before and after; U+202E on a latin-1 stream too). On structlog 26.1.0 U+202E
+    does not when the renderer writes the value with `repr` (since BR-028, one holding a
+    space, `=` or a quote); an Arabic letter still does (measured on an ASCII stream with
+    CPython 3.14.3 and 3.11.15).
+  - Values you supply are logged as they are: session and branch ids, `user_id`,
+    `server_url`, a custom `LLMClient`'s `LLMError.context["type"]` (`llm_error_type`), a
+    custom parser's `context["error_phase"]`, and the text of an exception your state store
+    or audit sink raises, which `runner.persist_failed` and `audit.emit_failed` log. (A tool
+    name you register is escaped on the registry line; see Changed.)
+  - `ConsoleAuditSink`'s `payload` is a dict, which the default renderer writes with
+    `repr`; that escaped ESC, DEL, U+009B and line feed in a payload value (measured). With
+    `JSONRenderer(ensure_ascii=False)` DEL and U+009B in it are written as they are
+    (measured).
+  - Text your own code logs, such as `str()` of an SDK exception that quotes a tool name.
+  - structlog releases other than 24.1.0 and 26.1.0, CPython 3.12, Windows, and what a
+    terminal emulator does with each character were not measured.
+
+  No public API changes; the escaped values are listed under Changed. (BR-028)
+
 ## [1.10.1] - 2026-09-28
 
 ### Fixed

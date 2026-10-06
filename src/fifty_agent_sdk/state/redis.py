@@ -58,6 +58,43 @@ Atomicity
     contention fails after three attempts through the normal
     :class:`StateStoreError` wrapping contract.
 
+Text UTF-8 cannot encode (BR-025)
+    ``ChatMessage.model_dump_json()`` raises pydantic's
+    ``PydanticSerializationError`` for a surrogate code point
+    (U+D800-U+DFFF) in a message's ``content``, ``name`` or
+    ``tool_call_id``. That call runs before :meth:`RedisStateStore.append`'s
+    error wrapping, so such a message raised out of ``append`` as it was,
+    with nothing stored (measured with fakeredis on CPython 3.14.3 with
+    pydantic 2.13.4, redis 8.0.0 and fakeredis 2.36.2, and with pydantic
+    2.13.5, redis 8.1.0 and fakeredis 2.39.0, and on 3.13.2 and 3.11.15
+    with the latter three; BR-025 evidence, P2).
+    :meth:`~RedisStateStore.append` now serialises a copy whose
+    ``content``, ``name`` and ``tool_call_id`` carry each surrogate code
+    point as its six-character ``\\udXXX`` escape, and
+    :meth:`~RedisStateStore.get_messages` returns that escaped text.
+    Nothing decodes it, and it cannot be told apart from the same six
+    characters typed. A message without one in those fields is serialised as
+    before, by the same call on the same object; its list entry was unchanged
+    for each message BR-025 compared (probe P4; one of them, with a surrogate
+    code point in ``tool_calls``, raised before and after). A field holding
+    something other than a ``str`` (or ``None`` in ``name`` and
+    ``tool_call_id``), which a message holds only when validation was bypassed
+    (``model_construct``, ``model_copy(update=...)`` or assignment after
+    validation), is passed through as it is: for the values BR-025 round 2
+    tried (an int, a float, ``None``, bytes, a list), ``append`` stored the
+    same entry as before. Entries already stored are not changed.
+
+    ``tool_calls`` are serialised as before. A surrogate code point in a
+    tool call's name, id or argument value still raises
+    ``PydanticSerializationError``, not :class:`StateStoreError`, and
+    nothing is stored. One in an argument's key does not raise: pydantic
+    writes it as three U+FFFD, and the message is stored with those. A
+    ``session_id`` holding one still raises ``UnicodeEncodeError`` from
+    :meth:`~RedisStateStore.append` and
+    :meth:`~RedisStateStore.get_messages`. These were measured with the
+    versions above, the same before and after BR-025. A real Redis server
+    was not measured.
+
 Error wrapping contract
     Every public method wraps :class:`redis.exceptions.RedisError` (the
     redis-py base exception class) into
@@ -107,6 +144,7 @@ except ImportError as exc:  # pragma: no cover - exercised via importlib in test
 
 from fifty_agent_sdk.errors import StateStoreError
 from fifty_agent_sdk.llm.types import ChatMessage
+from fifty_agent_sdk.state._surrogates import escape_message_surrogates
 from fifty_agent_sdk.state.protocol import TRUNK_BRANCH_ID, BranchInfo
 
 _log: Final = structlog.get_logger(__name__)
@@ -607,6 +645,8 @@ class RedisStateStore:
             fifty_agent_sdk.errors.StateStoreError: If the backend operation
                 fails. ``context["wrapped"]`` carries the underlying
                 redis-py exception class name.
+            UnicodeEncodeError: If ``session_id`` holds a surrogate code
+                point (not wrapped).
         """
         try:
             registry = await self._load_registry(session_id)
@@ -654,6 +694,13 @@ class RedisStateStore:
         window slides forward together — a fork's parent line never expires out
         from under it.
 
+        Each surrogate code point in ``content``, ``name`` and
+        ``tool_call_id`` is written as its ``\\udXXX`` escape, which
+        :meth:`get_messages` returns and which cannot be told apart from the
+        same six characters typed; ``message`` itself is not changed. One in
+        ``tool_calls`` is not escaped (BR-025; see "Text UTF-8 cannot
+        encode" in the module docstring).
+
         Args:
             session_id: Opaque session identifier.
             message: The :class:`ChatMessage` to append.
@@ -662,8 +709,19 @@ class RedisStateStore:
             fifty_agent_sdk.errors.StateStoreError: If the backend operation
                 fails. ``context["wrapped"]`` carries the underlying
                 redis-py exception class name.
+            pydantic_core.PydanticSerializationError: If a tool call cannot
+                be serialised, for example when its name, id or argument
+                value holds a surrogate code point, or an argument value is
+                of an arbitrary class (not wrapped; nothing is stored).
+            UnicodeEncodeError: If ``session_id`` holds a surrogate code
+                point (not wrapped; nothing is stored).
         """
-        payload = message.model_dump_json()
+        # BR-025: model_dump_json() raises for a surrogate code point, so it is
+        # written as its \udXXX escape, which cannot be told apart from those
+        # six characters typed (module docstring). Without one, this dumps
+        # ``message`` itself. Still before the try: a raise here is not a
+        # RedisError.
+        payload = escape_message_surrogates(message).model_dump_json()
         try:
             active = TRUNK_BRANCH_ID
 

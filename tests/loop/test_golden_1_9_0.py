@@ -46,6 +46,30 @@ What this does NOT pin:
 * Any intervention path. No scenario passes ``interventions``; the
   configured-but-passive cases are pinned by
   ``test_passive_interventions_leave_requests_and_events_unchanged``.
+* Non-ASCII text or U+007F in the JSON the SDK writes for the model, which
+  1.11.0 changed (BR-020). No scenario's tool results, tool schemas or
+  replayed arguments hold any.
+* Any error path. No scenario ends on an ``ErrorEvent``, so the error-path
+  final text, message and context that 1.11.0 changed (BR-021) are outside it.
+* Any text the 64-level nesting check refuses (BR-019). It refuses no text
+  in any scenario, whose tool arguments nest at most 1 level.
+* Tool-result text holding a surrogate code point before the escape, or a
+  non-string tool result that cannot be rendered (BR-022). No scenario's
+  tool-result text holds one, and every successful tool result in the
+  scenarios is a non-string value that renders as JSON.
+* Model-written text the client sends (an assistant message's content, a
+  tool call's name, a tool reply's name) holding a surrogate code point
+  (BR-024). No scenario's text in those fields holds one (BR-024 evidence,
+  P5).
+* A run that dispatches a tool call while structlog passes the SDK's log keys
+  to stdlib ``logging`` as ``extra`` with DEBUG enabled (BR-026). No scenario
+  routes structlog through stdlib, and the fixtures hold no log lines (by
+  reading).
+* A run in which a value the SDK escapes for a log line held, before the
+  escape, a character that the stream structlog writes that line to cannot
+  encode (BR-028). No scenario uses MCP, the fixtures hold no log lines, and
+  they hold no control character other than line feed, none in a tool name,
+  and no surrogate code point (BR-028 evidence, P5).
 """
 
 from __future__ import annotations

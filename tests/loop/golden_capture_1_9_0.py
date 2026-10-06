@@ -2,7 +2,12 @@
 
 FR-003 adds ``AgentLoop(interventions=...)``. Its compatibility promise is that
 a loop built WITHOUT ``interventions`` sends the same request bodies (same
-keys, values and JSON types) and emits the same event stream as 1.9.0. The two
+keys, values and JSON types) and emits the same event stream as 1.9.0 (since
+1.11.0 claimed only for the runs :mod:`fifty_agent_sdk.loop` scopes it to:
+"Non-ASCII text (BR-020)", "Error-path final text (BR-021)",
+"Tool-argument nesting (BR-019)", "Tool-result text (BR-022)",
+"Model-written text in requests (BR-024)", "Log keys under stdlib
+logging (BR-026)" and "Control characters in log values (BR-028)"). The two
 earlier fixtures (``legacy_1_7_0.json``, ``requests_1_8_0.json``) pin request
 bodies only, and none of their scenarios drives the branches FR-003 edits:
 
@@ -29,6 +34,29 @@ the bodies: ``{"bodies": [...], "events": [...]}``.
   structure survives (assistant ``tool_calls[].id``, ``role="tool"``
   ``tool_call_id`` and event ``call_id`` share a placeholder when they share
   an id), and the result does not depend on how many times ``uuid4`` runs.
+
+It does NOT pin non-ASCII text or U+007F in the JSON the SDK writes for the
+model, which 1.11.0 changed (BR-020): no scenario's tool results, tool schemas
+or replayed arguments hold any. Nor does it pin any error path: no scenario
+ends on an ``ErrorEvent``, so the error-path final text, message and context
+that 1.11.0 changed (BR-021) are outside it. Nor any text the 64-level
+nesting check refuses (BR-019): it refuses no text in any scenario, whose
+tool arguments nest at most 1 level. Nor tool-result text holding a
+surrogate code point before the escape, or a non-string tool result that
+cannot be rendered (BR-022): no scenario's tool-result text holds one, and
+every successful tool result in the scenarios is a non-string value that
+renders as JSON. Nor model-written text the client sends (an assistant
+message's content, a tool call's name, a tool reply's name) holding a
+surrogate code point (BR-024): no scenario's text in those fields holds one
+(BR-024 evidence, P5). Nor a run that dispatches a tool call while structlog
+passes the SDK's log keys to stdlib ``logging`` as ``extra`` with DEBUG
+enabled (BR-026): no scenario routes structlog through stdlib, and the
+fixtures hold no log lines (by reading). Nor a run in which a value the SDK
+escapes for a log line held, before the escape, a character that the stream
+structlog writes that line to cannot encode (BR-028): no scenario uses MCP,
+the fixtures hold no log lines, and they hold no control character other than
+line feed, none in a tool name, and no surrogate code point (BR-028 evidence,
+P5).
 
 Running ``python -m tests.loop.golden_capture_1_9_0`` from the repo root writes
 ``tests/loop/golden/requests_1_9_0.json``. The fixture in the tree was written

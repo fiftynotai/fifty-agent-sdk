@@ -113,10 +113,11 @@ def test_register_emits_warning_on_duplicate_name() -> None:
     overwrites = [
         entry
         for entry in logs
-        if entry.get("event") == "tool overwritten" and entry.get("name") == "same"
+        if entry.get("event") == "tool overwritten" and entry.get("tool_name") == "same"
     ]
     assert len(overwrites) == 1, f"expected exactly one overwrite warning, got {logs}"
     assert overwrites[0]["log_level"] == "warning"
+    assert "name" not in overwrites[0]  # renamed to tool_name by BR-026
 
 
 def test_register_does_not_warn_on_first_registration() -> None:

@@ -666,7 +666,9 @@ async def test_parser_error_retry_exhausted_terminates() -> None:
 
     Locks the terminal ``ErrorEvent`` + fallback ``FinalEvent`` shape on
     the retry-exhausted path and asserts the LLM was called exactly twice
-    — once for the drift, once for the retry that also drifted.
+    — once for the drift, once for the retry that also drifted. Since
+    BR-021 that ``FinalEvent`` carries ``error_fallback_message``: the run
+    stopped on unparseable output, not on the iteration cap.
     """
     llm = FakeLLMClient(replies=[make_response("drift one"), make_response("drift two")])
     loop = _make_loop(llm=llm)
@@ -678,7 +680,7 @@ async def test_parser_error_retry_exhausted_terminates() -> None:
     assert isinstance(error_event, ErrorEvent)
     assert error_event.error_type == "ParserError"
     assert isinstance(final_event, FinalEvent)
-    assert final_event.text == SafetyConfig().fallback_message
+    assert final_event.text == SafetyConfig().error_fallback_message
     # The retry attempt fires a second LLM call before exhausting the budget.
     assert len(llm.calls) == 2
 
@@ -1391,8 +1393,9 @@ def test_serialize_tool_output_falls_back_to_repr_when_dumps_raises() -> None:
 
     json.dumps calls ``default=str`` on non-serializable objects; if ``str(obj)``
     itself raises, the exception propagates out of ``json.dumps``. We construct
-    objects whose ``__str__`` raises (one TypeError, one ValueError) to cover
-    both arms of the ``except`` clause.
+    objects whose ``__str__`` raises (one TypeError, one ValueError). Both
+    reach the ``repr`` fallback through its ``except Exception`` arm (an
+    ``except (TypeError, ValueError)`` clause before BR-022).
     """
     from fifty_agent_sdk.loop import _serialize_tool_output
 

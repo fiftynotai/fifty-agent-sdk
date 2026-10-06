@@ -16,14 +16,22 @@ Three stand-ins:
 
 Helpers :func:`make_response` and :func:`make_stream_chunks` reduce
 boilerplate in the individual test files.
+
+BR-022 adds :func:`dict_chain` and :func:`list_chain` (deep values built
+without recursion) and :func:`measured_unrenderable_depth`, which derives
+from the running interpreter a depth at which a tool result cannot be
+rendered. The Runner tests import them from here too.
 """
 
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from typing import Any
 
+import pytest
+
+from fifty_agent_sdk._model_json import dumps_for_model
 from fifty_agent_sdk.llm.types import (
     ChatMessage,
     ChatRequest,
@@ -220,11 +228,124 @@ class FakeTool:
         return self._result
 
 
+def dict_chain(depth: int) -> Any:
+    """``{"a": {"a": ... 0}}``, ``depth`` dicts deep, built without recursion (BR-022)."""
+    value: Any = 0
+    for _ in range(depth):
+        value = {"a": value}
+    return value
+
+
+def list_chain(depth: int) -> Any:
+    """``[[... 0]]``, ``depth`` lists deep, built without recursion (BR-022)."""
+    value: Any = 0
+    for _ in range(depth):
+        value = [value]
+    return value
+
+
+_MAX_REPR_DOUBLINGS = 4
+"""How many times :func:`measured_unrenderable_depth` may double its depth looking for ``repr``'s limit."""
+
+
+def measured_unrenderable_depth(*, include_repr: bool, shape: Callable[[int], Any]) -> int:
+    """A depth at which ``shape(depth)`` cannot be rendered, measured in this frame (BR-022).
+
+    Every attempt is made directly from this function's own frame, with
+    inline loops and no helper call, because one frame more or less moves
+    the limit on CPython 3.11 (BR-019's lesson; BR-022 plan P4):
+
+    1. ``E``, the deepest ``shape(d)`` that
+       ``dumps_for_model(value, default=str)`` renders here, is found by
+       doubling from 128 and then a binary search.
+    2. The candidate is ``E + 1``. Precondition, asserted here: it raises
+       ``RecursionError`` from ``dumps_for_model``.
+    3. With ``include_repr``, the candidate must also make ``repr`` raise
+       ``RecursionError`` here. While it does not, the candidate is doubled
+       (at most :data:`_MAX_REPR_DOUBLINGS` times) and both preconditions
+       are checked again. So the depth returned is past both limits, but
+       not necessarily one level past ``repr``'s. ``repr``'s limit is not
+       bisected: on CPython 3.14.3 a ``repr`` near its limit took about a
+       second, so a bisection took about 17 s (BR-022 evidence, P4).
+
+    Why a depth that fails here also fails where the SDK renders the value:
+    the test calls this function, and later drives the code under test from
+    the same test frame. ``loop._serialize_tool_output`` runs inside the
+    loop's generator (test -> ``run`` -> ``_serialize_tool_output`` ->
+    ``dumps_for_model``), and the Runner's ``_bounded_repr`` inside
+    ``AgentRunner.run`` (test -> ``run`` -> ``_tool_invocation_payload`` ->
+    ``_bounded_repr``), each at least as deep on the stack as this frame.
+    The recursion budget only shrinks as the stack grows; with the
+    containment removed (M3), I1 and I2 raised at the real sites on
+    3.11.15, 3.13.2 and 3.14.3; 3.12 was not measured.
+
+    What this returns depends on the interpreter, the platform and the stack
+    the calling test runs on, so no assertion relies on a figure. For scale
+    (macOS; BR-022's and its sentinel's runs, in different harnesses, where
+    each figure moved by up to 10 levels): I1 (dict chain, without
+    ``include_repr``) got about 950 levels on CPython 3.11.15, about 9,980 on
+    3.13.2 and about 61,470 on 3.14.3; I2 (list chain, with ``include_repr``)
+    got about 1,900 (one doubling), about 9,980 (none) and about 104,500
+    (none). 3.12 and Linux were not measured; the CI run is their first.
+
+    Deep values built here are freed before this returns and never reach an
+    ``assert`` or ``repr`` outside the calls being measured.
+
+    Args:
+        include_repr: Also require ``repr`` to fail at the returned depth.
+        shape: Builds the value for a depth, without recursion
+            (:func:`dict_chain` or :func:`list_chain`).
+
+    Returns:
+        The depth to build the unrenderable tool result with.
+    """
+    lo, hi = 1, 128
+    while True:
+        try:
+            dumps_for_model(shape(hi), default=str)
+        except RecursionError:
+            break
+        lo, hi = hi, hi * 2
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        try:
+            dumps_for_model(shape(mid), default=str)
+        except RecursionError:
+            hi = mid
+        else:
+            lo = mid
+    depth = lo + 1
+    for _ in range(_MAX_REPR_DOUBLINGS + 1):
+        try:
+            dumps_for_model(shape(depth), default=str)
+        except RecursionError:
+            pass
+        else:
+            pytest.fail(
+                f"precondition failed: dumps_for_model rendered a value nested {depth} levels "
+                "in this frame although the search found it could not; see BR-022 plan P4"
+            )
+        if not include_repr:
+            return depth
+        try:
+            repr(shape(depth))
+        except RecursionError:
+            return depth
+        depth *= 2
+    pytest.fail(
+        f"precondition failed: repr still rendered a value nested {depth // 2} levels in this "
+        f"frame after {_MAX_REPR_DOUBLINGS} doublings; see BR-022 plan P4"
+    )
+
+
 __all__ = [
     "DriftsOnceFakeLLM",
     "FakeLLMClient",
     "FakeTool",
+    "dict_chain",
+    "list_chain",
     "make_multi_tool_response",
     "make_response",
     "make_stream_chunks",
+    "measured_unrenderable_depth",
 ]

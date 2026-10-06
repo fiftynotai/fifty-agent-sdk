@@ -19,6 +19,7 @@ from typing import Any
 
 import structlog
 
+from fifty_agent_sdk._model_json import escape_for_log
 from fifty_agent_sdk.errors import AgentSdkError, ToolNotFound, ToolTimeout
 from fifty_agent_sdk.tools.protocol import Tool, ToolResult
 
@@ -44,8 +45,16 @@ class Registry:
         Subsequent registrations with the same ``tool.name`` overwrite the
         previous entry (last write wins). This is deliberate: tests, fixtures,
         and providers commonly re-register tools when reconfiguring. A
-        ``structlog`` warning is emitted on overwrite so unintended
-        collisions in production are still visible.
+        ``structlog`` WARNING ``tool overwritten``, with the name under
+        ``tool_name`` and its control characters and surrogate code points
+        escaped, is emitted on overwrite so unintended collisions in
+        production are still visible. (The key is not ``name``, which
+        stdlib's ``LogRecord`` reserves; BR-026. The escape is BR-028's: an
+        MCP server's tool name reaches this line when
+        :class:`~fifty_agent_sdk.tools.mcp_provider.MCPProvider` registers
+        it again; a name that is not a ``str`` is logged as it is.) The
+        escape cannot be told apart from the same six characters typed
+        (:func:`fifty_agent_sdk._model_json.escape_for_log`).
 
         Args:
             tool: An object satisfying the :class:`Tool` protocol.
@@ -59,7 +68,11 @@ class Registry:
         if not isinstance(tool, Tool):
             raise TypeError(f"register() requires a Tool; got {type(tool).__name__}")
         if tool.name in self._tools:
-            _log.warning("tool overwritten", name=tool.name)
+            # BR-028: the `Tool` isinstance check tests that `name` is present, not its
+            # type, so guard the escape (it would raise AttributeError on a non-str
+            # name, which this line used to log as it was).
+            logged = escape_for_log(tool.name) if isinstance(tool.name, str) else tool.name
+            _log.warning("tool overwritten", tool_name=logged)
         self._tools[tool.name] = tool
 
     def list(self) -> list[Tool]:
