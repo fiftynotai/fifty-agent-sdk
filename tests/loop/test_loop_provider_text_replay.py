@@ -30,6 +30,32 @@ raise. Since BR-026 the line carries the name under ``tool_name``
 escaped value on the stdlib record under structlog's
 ``render_to_log_kwargs`` recipe.
 
+Since BR-028 the line also writes each control character (U+0000-U+001F,
+U+007F-U+009F) in the name as a backslash, ``u`` and four lowercase hex
+digits. Before, structlog's default configuration wrote such a name as it
+was: measured with structlog 26.1.0 and 24.1.0 on CPython 3.11.15, 3.13.2
+and 3.14.3, with stdout a file and a terminal (BR-028 evidence, P1b), apart
+from tab, LF and CR on 26.1.0 (P1; B16 has the LF row), which its renderer
+writes with ``repr``; 24.1.0 wrote LF as a line break. On an ASCII stream a
+name holding a C1 control character, and none of the seven characters below
+on 26.1.0, made the line raise ``UnicodeEncodeError`` (P3). B16 pins the
+escape for ESC sequences, U+009B, DEL, NUL, VT and LF on both lines, for the same
+payloads but VT on the legacy parser path (``JsonModeParser`` strips the
+name), and with a colour renderer; B17 is its control (names without
+a control character, U+202E, NBSP, U+200B and U+2028 among them, logged
+exactly as written); B18 pins the ASCII stream (two C1 names complete, ESC
+is the control, an Arabic name still raises, and row ``e``, a tab and
+U+202E, pins the raise BR-028 adds on structlog 26.1.0); B19 pins the escaped value on
+the stdlib record under ``render_to_log_kwargs`` and
+``wrap_for_formatter``. Their payloads hold none of the seven characters
+for which 26.1.0's renderer switches to ``repr`` (space, tab, ``=``, the
+two quotes, CR, LF), apart from the LF row and B18's row ``e``, whose tab is
+the point of that row, because a value written with
+``repr`` hides a missing escape. Their parser, ``_tool_invoked_lines``,
+splits on ``"\\n"`` only and removes only SGR colour codes:
+``splitlines()`` would split on VT, FF, NEL and U+2028, and a wider ANSI
+strip would remove a raw ``ESC [2J``; B13 and B14 keep their own parser.
+
 Every test drives a real ``AgentLoop`` (or ``AgentRunner``) over the real
 ``OpenAICompatibleClient`` (``max_retries=0``) on pytest-httpx, because
 ``FakeLLMClient`` never encodes a request. Bodies holding a surrogate code
@@ -52,8 +78,10 @@ on any release.
 What these do NOT pin: HTTP bytes; a custom ``LLMClient`` (it receives the
 text as before); user and system messages, pinned here as a raw raise (a
 documented gap, B9); log output under structlog configurations other
-than the default one B13 and B14 use and the ``render_to_log_kwargs``
-stdlib recipe B15 uses.
+than the default one B13, B14, B16-B18 use (B16 also with
+``ConsoleRenderer(colors=True)``), and the ``render_to_log_kwargs`` and
+``wrap_for_formatter`` stdlib recipes B15 and B19 use; and streams other
+than strict UTF-8 and ASCII.
 """
 
 from __future__ import annotations
@@ -89,7 +117,7 @@ from fifty_agent_sdk import (
     ToolMode,
 )
 from tests.loop.conftest import FakeTool
-from tests.stdlib_routing import records_for, stdlib_routed_structlog
+from tests.stdlib_routing import record_field, records_for, stdlib_routed_structlog
 
 _ENDPOINT = "https://example.com/v1/chat/completions"
 _SURROGATE = chr(0xD800)
@@ -547,7 +575,7 @@ async def test_runner_replays_a_persisted_completion_escaped(httpx_mock: HTTPXMo
 
 
 @pytest.fixture
-def strict_log_stream() -> Iterator[io.TextIOWrapper]:
+def strict_log_stream(request: pytest.FixtureRequest) -> Iterator[io.TextIOWrapper]:
     """structlog's default configuration, printing to a strict UTF-8 stream instead of stdout.
 
     The SDK never configures structlog, and its default ``PrintLogger``
@@ -560,11 +588,16 @@ def strict_log_stream() -> Iterator[io.TextIOWrapper]:
     ``sys.stdout`` is under a UTF-8 locale (measured: a file and a TTY). It
     restores the previous configuration values afterwards (when structlog
     was unconfigured, the processor list comes back as an equal new list).
+
+    An indirect parameter names another encoding (BR-028's B18 uses
+    ``"ascii"``, as a stdout under ``PYTHONIOENCODING=ascii`` is); without
+    one the stream is UTF-8, as B13 and B14 use it.
     """
+    encoding = getattr(request, "param", "utf-8")
     was_configured = structlog.is_configured()
     previous = structlog.get_config()
     structlog.reset_defaults()
-    stream = io.TextIOWrapper(io.BytesIO(), encoding="utf-8", errors="strict", write_through=True)
+    stream = io.TextIOWrapper(io.BytesIO(), encoding=encoding, errors="strict", write_through=True)
     structlog.configure(logger_factory=structlog.PrintLoggerFactory(file=stream))
     try:
         yield stream
@@ -660,7 +693,8 @@ async def test_tool_invoked_log_line_keeps_other_names_as_they_are(
     ``tool_invoked`` line, and a native call to ``بحث`` alone, which reaches
     the single-call line. Under structlog's default configuration each line
     carries the name unchanged under ``tool_name``: the escape touches only
-    surrogate code points.
+    surrogate code points and, since BR-028, control characters, and these
+    names hold neither.
     """
     calls = (
         [_call("lookup", "call_1"), _call("بحث", "call_2")] if row == "batch" else [_call("بحث")]
@@ -696,4 +730,258 @@ async def test_tool_invoked_record_carries_the_escaped_tool_name_under_stdlib_ro
     assert len(httpx_mock.get_requests()) == 2
     action = [e.tool_name for e in events if isinstance(e, ActionEvent)]
     assert action[-1] == "find" + _SURROGATE
+    _ends_on(events, "done")
+
+
+# --- B16-B19: control characters in the tool_invoked line (BR-028) --------------------------
+
+# Each payload holds none of the seven characters for which structlog 26.1.0's ConsoleRenderer
+# switches to ``repr`` (space, tab, ``=``, ``"``, ``'``, CR, LF), apart from ``lf``: a value it
+# writes with ``repr`` would hide a missing escape. Each maps to the model's name and the value
+# the line must carry, a backslash, ``u`` and four lowercase hex digits per control character.
+_CONTROL_NAMES: dict[str, tuple[str, str]] = {
+    "csi": ("find\x1b[2J", "find\\u001b[2J"),
+    "osc": ("find\x1b]0;x\x07", "find\\u001b]0;x\\u0007"),
+    "c1_csi": ("find\x9b2J", "find\\u009b2J"),
+    "del": ("find\x7f", "find\\u007f"),
+    "nul": ("find\x00", "find\\u0000"),
+    "vt": ("find\x0b", "find\\u000b"),
+    "lf": ("find\nx", "find\\u000ax"),
+}
+
+_SGR = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _is_control(ch: str) -> bool:
+    return ord(ch) < 0x20 or 0x7F <= ord(ch) <= 0x9F
+
+
+def _tool_invoked_lines(stream: io.TextIOWrapper) -> list[str]:
+    """The ``tool_invoked`` lines, split on ``"\\n"`` only and with only SGR colour codes removed.
+
+    Not ``splitlines()``, which also splits on VT, FF, the C1 NEL, U+2028
+    and others, and not a wider ANSI strip, which would remove a raw
+    ``ESC [2J`` too: either could hide a control character the line wrote.
+    """
+    assert isinstance(stream.buffer, io.BytesIO)
+    text = _SGR.sub("", stream.buffer.getvalue().decode("utf-8"))
+    return [line for line in text.split("\n") if " tool_invoked " in line]
+
+
+def _tool_name_value(line: str) -> str:
+    """The rest of the line after `` tool_name=``: the renderer sorts keys, so ``tool_name`` is last."""
+    _, separator, value = line.partition(" tool_name=")
+    assert separator, line
+    return value
+
+
+def _queue_named_call(httpx_mock: HTTPXMock, row: str, name: str) -> AgentLoop:
+    """Queue ``row``'s two responses (a call to ``name``, then ``done``) and build its loop.
+
+    ``legacy_json_parser``: a JSON-mode completion whose ``tool_name`` is
+    ``json.dumps``' escape of ``name``, which ``JsonModeParser`` decodes.
+    """
+    if row == "legacy_json_parser":
+        envelope = {
+            "thought": "calling",
+            "action": "tool",
+            "tool_name": name,
+            "tool_args": {"q": "x"},
+            "answer": None,
+        }
+        completion = json.dumps(envelope)
+        # Precondition: the completion carries the control characters as JSON escapes.
+        assert completion.isascii() and not any(_is_control(ch) for ch in completion)
+        _respond(httpx_mock, json.dumps(_completion(completion)).encode())
+        _respond(httpx_mock, json.dumps(_completion(_JSON_FINAL)).encode())
+        return _loop(None)
+    calls = [_call("lookup", "call_1"), _call(name, "call_2")] if row == "batch" else [_call(name)]
+    _respond(httpx_mock, json.dumps(_completion(None, calls)).encode())
+    _respond(httpx_mock, json.dumps(_completion("done")).encode())
+    return _loop(ToolMode.NATIVE)
+
+
+def _wire_name(httpx_mock: HTTPXMock, row: str) -> str:
+    """The model's name as request 2 sends it: the last tool call's name, or the tool reply's name."""
+    messages = _sent_messages(httpx_mock, 1)
+    if row == "legacy_json_parser":
+        return str([m for m in messages if m["role"] == "tool"][-1]["name"])
+    calls = [tc for m in messages if m["role"] == "assistant" for tc in m.get("tool_calls") or []]
+    return str(calls[-1]["function"]["name"])
+
+
+_B16_ROWS = [
+    *[
+        pytest.param(row, payload, "default", id=f"{row}-{payload}")
+        for row in ("single", "batch", "legacy_json_parser")
+        for payload in _CONTROL_NAMES
+        # JsonModeParser strips the tool name (`str.strip`), which removes a trailing VT.
+        if not (row == "legacy_json_parser" and payload == "vt")
+    ],
+    pytest.param("single", "csi", "colors", id="single-csi-colors"),
+]
+
+
+@pytest.mark.parametrize(("row", "payload", "renderer"), _B16_ROWS)
+async def test_tool_invoked_writes_control_characters_escaped(
+    httpx_mock: HTTPXMock,
+    strict_log_stream: io.TextIOWrapper,
+    row: str,
+    payload: str,
+    renderer: str,
+) -> None:
+    """B16: a model tool name holding a control character is written to the ``tool_invoked`` line escaped, and the events and the request keep the model's name (BR-028).
+
+    Rows: a native call (the single-call line), a native batch whose second
+    call holds the payload (the batch line) and the legacy ``JsonModeParser``
+    path (the single-call line; no ``vt`` row, because the parser strips the
+    name). Payloads: ESC ``[2J``, an OSC title sequence ending in BEL, the C1
+    CSI U+009B, DEL, NUL, VT and LF. The ``colors`` row replaces the default
+    chain's renderer with ``ConsoleRenderer(colors=True)``, as a host whose
+    stdout was a terminal when structlog was imported has it.
+
+    Before BR-028, structlog's default configuration wrote the name as it
+    was: measured with stdout a file and a terminal, structlog 26.1.0 and
+    24.1.0, CPython 3.11.15, 3.13.2 and 3.14.3 (BR-028 evidence, P1b), apart
+    from LF, which 26.1.0 writes with ``repr`` and 24.1.0 as a line break.
+    """
+    name, expected = _CONTROL_NAMES[payload]
+    loop = _queue_named_call(httpx_mock, row, name)
+    if renderer == "colors":
+        processors = list(structlog.get_config()["processors"])
+        structlog.configure(
+            processors=[*processors[:-1], structlog.dev.ConsoleRenderer(colors=True)]
+        )
+
+    events = await _run(loop)
+
+    lines = _tool_invoked_lines(strict_log_stream)
+    assert len(lines) == (2 if row == "batch" else 1)
+    if row == "batch":
+        assert _tool_name_value(lines[0]) == "lookup"
+    assert _tool_name_value(lines[-1]) == expected
+    assert not any(_is_control(ch) for line in lines for ch in line)
+    if renderer == "colors":
+        # Precondition: the renderer wrote colour codes, which the parser removed.
+        assert b"\x1b[0m" in strict_log_stream.buffer.getvalue()  # type: ignore[attr-defined]
+    assert len(httpx_mock.get_requests()) == 2
+    action = [e.tool_name for e in events if isinstance(e, ActionEvent)]
+    assert action[-1] == name
+    assert _wire_name(httpx_mock, row) == name
+    _ends_on(events, "done")
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        pytest.param("lookup", id="ascii"),
+        pytest.param("بحث", id="arabic"),
+        pytest.param("find\\u001b", id="typed_escape"),
+        pytest.param("find‮x", id="rlo_u202e"),
+        pytest.param("find ", id="nbsp"),
+        pytest.param("find​", id="zwsp"),
+        pytest.param("find x", id="line_separator"),
+    ],
+)
+@pytest.mark.parametrize("row", ["single", "batch"])
+async def test_tool_invoked_keeps_names_without_control_characters(
+    httpx_mock: HTTPXMock, strict_log_stream: io.TextIOWrapper, row: str, name: str
+) -> None:
+    """B17, control: a tool name without a control character is logged exactly as the model wrote it (BR-028).
+
+    The rows hold none of the seven characters 26.1.0's renderer writes with
+    ``repr``. Among them: the six characters of the ESC escape typed (the
+    escape cannot be told apart from them), U+202E, which BR-028 leaves as
+    it is (decision D1), NBSP, a zero-width space and U+2028, which a
+    ``splitlines()`` parser would split on.
+    """
+    loop = _queue_named_call(httpx_mock, row, name)
+
+    events = await _run(loop)
+
+    lines = _tool_invoked_lines(strict_log_stream)
+    assert len(lines) == (2 if row == "batch" else 1)
+    assert _tool_name_value(lines[-1]) == name
+    assert len(httpx_mock.get_requests()) == 2
+    _ends_on(events, "done")
+
+
+@pytest.mark.parametrize("strict_log_stream", ["ascii"], indirect=True)
+@pytest.mark.parametrize(
+    ("row", "name", "expected"),
+    [
+        pytest.param("a", "find\x85", "find\\u0085", id="a-nel"),
+        pytest.param("b", "find\x9b2J", "find\\u009b2J", id="b-c1_csi"),
+        pytest.param("c", "find\x1b[2J", None, id="c-csi_control"),
+        pytest.param("d", "بحث", None, id="d-arabic_residual"),
+        pytest.param("e", "find\t\u202ex", None, id="e-tab_rlo_residual"),
+    ],
+)
+async def test_tool_invoked_with_a_c1_name_completes_on_a_non_utf8_stream(
+    httpx_mock: HTTPXMock,
+    strict_log_stream: io.TextIOWrapper,
+    row: str,
+    name: str,
+    expected: str | None,
+) -> None:
+    """B18: on an ASCII stream, a native call whose name holds a C1 control character completes, with the name escaped (BR-028).
+
+    Before BR-028, rows ``a`` and ``b`` raised ``UnicodeEncodeError`` from
+    the ``tool_invoked`` line out of ``AgentLoop.run()`` after one request,
+    with no ``FinalEvent`` (BR-028 evidence, P3: ASCII and cp1252 streams,
+    row ``a`` also with a real stdout under ``PYTHONIOENCODING=ascii``). Row
+    ``c`` (ESC, which ASCII can encode) is the control and completes before
+    and after. Row ``d`` is the residual: an Arabic name is not a control
+    character, so the line still raises on such a stream. Row ``e`` is the
+    raise BR-028 adds on structlog 26.1.0: ``find`` + TAB + U+202E + ``x``.
+    Before, 26.1.0's renderer wrote that name with ``repr`` because of the
+    tab, which escaped U+202E, and the run completed; the escape now rewrites
+    the tab, so the name is written as it is and U+202E, which ASCII cannot
+    encode, makes the line raise. With 24.1.0 the line raised before and
+    after (BR-028 evidence, round 2).
+    """
+    if row in ("d", "e"):
+        _respond(httpx_mock, json.dumps(_completion(None, [_call(name)])).encode())
+        with pytest.raises(UnicodeEncodeError):
+            await _run(_loop(ToolMode.NATIVE))
+        assert len(httpx_mock.get_requests()) == 1
+        return
+    loop = _queue_named_call(httpx_mock, "single", name)
+
+    events = await _run(loop)
+
+    assert len(httpx_mock.get_requests()) == 2
+    _ends_on(events, "done")
+    if expected is not None:
+        (line,) = _tool_invoked_lines(strict_log_stream)
+        assert _tool_name_value(line) == expected
+
+
+@pytest.mark.parametrize("recipe", ["render_to_log_kwargs", "wrap_for_formatter"])
+async def test_tool_invoked_record_carries_control_escapes_under_stdlib_routing(
+    httpx_mock: HTTPXMock, recipe: str
+) -> None:
+    """B19: under ``render_to_log_kwargs`` and ``wrap_for_formatter`` at DEBUG, the ``tool_invoked`` record carries the escaped name (BR-028).
+
+    Under ``wrap_for_formatter`` the event dict is the record's ``msg``, and
+    the formatter's ``ConsoleRenderer`` output carries the escape too.
+    """
+    name, expected = _CONTROL_NAMES["csi"]
+    loop = _queue_named_call(httpx_mock, "single", name)
+
+    with stdlib_routed_structlog(recipe, logging.DEBUG) as records:
+        events = await _run(loop)
+
+    (record,) = records_for(records, "tool_invoked")
+    assert record_field(record, "tool_name") == expected
+    if recipe == "wrap_for_formatter":
+        formatter = structlog.stdlib.ProcessorFormatter(
+            processors=[
+                structlog.stdlib.ProcessorFormatter.remove_processors_meta,
+                structlog.dev.ConsoleRenderer(colors=False),
+            ]
+        )
+        rendered = formatter.format(record)
+        assert rendered.endswith(" tool_name=" + expected)
+    assert len(httpx_mock.get_requests()) == 2
     _ends_on(events, "done")

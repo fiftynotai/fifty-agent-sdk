@@ -50,7 +50,11 @@ tool call's name, a tool reply's name) holding a surrogate code point
 Nor a run that dispatches a tool call while structlog passes the SDK's log
 keys to stdlib ``logging`` as ``extra`` with DEBUG enabled (BR-026): no
 scenario routes structlog through stdlib, and the fixtures hold no log lines
-(by reading).
+(by reading). Nor a run in which a value the SDK escapes for a log line held,
+before the escape, a character that the stream structlog writes that line to
+cannot encode (BR-028): no scenario uses MCP, the fixtures hold no log lines,
+and they hold no control character other than line feed, none in a tool name,
+and no surrogate code point (BR-028 evidence, P5).
 
 This file is deliberately NOT named ``test_*.py`` so pytest does not collect
 it; :mod:`tests.loop.test_golden_1_8_0` imports it.

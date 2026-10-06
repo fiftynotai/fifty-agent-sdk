@@ -165,7 +165,37 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   scenario routes structlog through stdlib (by reading). (BR-026) BR-027 adds no scope (by
   reading): it changes SDK code only in `audit/console.py`, no golden scenario uses
   `AgentRunner` or an audit sink, and these statements compare request bodies and, in some,
-  the system prompt or the event stream, not log lines. (BR-027)
+  the system prompt or the event stream, not log lines. (BR-027) Since BR-028 they also hold
+  only for runs in which no value that BR-028 escapes in a log line (see its Changed item)
+  held, before the escape, a character that the stream structlog writes that line to cannot
+  encode: on an ASCII or cp1252 stdout, for example, a C1 control character (U+0080-U+009F)
+  or any other character that encoding lacks, and on any strict stdout, UTF-8 included, a
+  surrogate code point. On an ASCII or cp1252 stream a run in which the loop dispatched a
+  model tool call whose name held a C1 control character, in a name the renderer wrote as it
+  was (with structlog 26.1.0's default `ConsoleRenderer`, one holding no space, tab, `=`,
+  quote, CR or LF; with 24.1.0, any), used to end with a raw `UnicodeEncodeError` at that
+  call's `tool_invoked` debug line (after one request when the first response named it), and
+  now continues (that line has escaped a surrogate code point since BR-024). An MCP tool call
+  whose error hook line logged such a name holding either used to get the
+  `UnicodeEncodeError`'s text as its error instead of the `isError` message (measured through
+  `Registry.invoke`, not through `AgentLoop`). With structlog 26.1.0's default
+  `ConsoleRenderer` a run can also differ the other way: a value whose only characters from
+  the renderer's `repr` list were a tab, CR or LF used to be written with `repr`, which
+  escaped a bidirectional formatting character, a zero-width character, U+2028, U+2029 or NBSP
+  in it, and it is now written as it is after the escape, so on a stream that cannot encode
+  such a character the line now raises where it did not (measured on the library
+  sets its Fixed item names, on ASCII and cp1252 streams: U+202E after a tab at
+  `tool_invoked` (single and batch), `register`, `attach()`, `refresh()`, the periodic refresh
+  and a hook line, and U+200B after a tab and NBSP after a line feed, NBSP on ASCII only, at
+  the single-call `tool_invoked` line, `register`, `refresh()` and the periodic refresh; with
+  U+202E after a tab such runs completed on 1.7.0, 1.8.0, 1.9.0 and 1.10.1, measured at
+  `tool_invoked`, `register` and the periodic refresh with CPython 3.14.3 and 3.11.15; with
+  structlog 24.1.0 they raised before and after). The C1 and
+  surrogate outcomes were measured on 1.7.0, 1.8.0, 1.9.0 and 1.10.1 as well, on the library
+  sets and streams its Fixed item names. The escaped values are not part of what these
+  statements compare: the golden tests capture no log lines, no golden scenario uses MCP, and
+  the three golden fixtures hold no control character other than line feed, none in a tool
+  name, and no surrogate code point (a scan of every string in them). (BR-028)
 - Tool-result message text no longer holds a surrogate code point (U+D800-U+DFFF), which
   UTF-8 cannot encode:
   - Each one is written as its six-character `\udXXX` escape, the spelling `json.dumps`
@@ -311,7 +341,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   | `mcp.tool_overwrite` (`MCPProvider.attach` and `refresh()`) | WARNING | `name` | `tool_name` |
   | `mcp.refresh_failed` (`MCPProvider`'s periodic refresh) | WARNING | `message` | `error_message` |
 
-  The values are unchanged: `tool_invoked` still writes the tool name with BR-024's escape.
+  BR-026 does not change the values: `tool_invoked` still writes the tool name with BR-024's
+  escape (BR-028 escapes control characters in the values of all four lines, and surrogate
+  code points in the other three; see its item).
   A query, alert or parser that reads one of the old keys on these lines needs the new one.
   Other SDK log lines already use `tool_name` for a tool's name (`mcp.tool_error_hook_failed`
   and `mcp.tool_error_hook_invalid`) and `error_message` for an exception's text
@@ -372,6 +404,45 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the other keyword arguments as values on every line that logger writes (by reading); the
   package's 11 such calls pass only a name. Before this change the processor-key check
   reported this one call. (BR-027)
+- Eight logging calls (six log lines) now write each control character in one of their
+  values, U+0000-U+001F (C0, tab, line feed and carriage return included) and U+007F-U+009F
+  (DEL and C1), as six characters: a backslash, `u` and the code point as four lowercase hex
+  digits (`\u001b` for ESC). Log readers see the change: the control character itself no
+  longer reaches the log output (see Fixed). The five MCP calls and the registry line also
+  write a surrogate code point (U+D800-U+DFFF) in their value as BR-024's six-character
+  escape, as `tool_invoked` has since BR-024; they wrote it as it was.
+
+  | Line | Level | Key | What the value is |
+  |---|---|---|---|
+  | `tool_invoked` (the loop's batch and single-call lines) | DEBUG | `tool_name` | the model's tool name |
+  | `mcp.tool_overwrite` (`MCPProvider.attach` and `refresh()`) | WARNING | `tool_name` | an MCP server's tool name |
+  | `tool overwritten` (`Registry.register`) | WARNING | `tool_name` | the tool's name: an MCP server's when `MCPProvider` registers it again, else yours |
+  | `mcp.refresh_failed` (`MCPProvider`'s periodic refresh) | WARNING | `error_message` | the exception's text, which for a JSON-RPC error is the MCP server's own message |
+  | `mcp.tool_error_hook_failed` (one call), `mcp.tool_error_hook_invalid` (two calls; `MCPClient`) | WARNING | `tool_name` | the MCP tool name of the call |
+
+  A value with neither a control character nor a surrogate code point is passed to the logger
+  as an equal string. For nine such values (among them Arabic, an emoji, NBSP, U+202E,
+  U+2028, the six characters of an escape typed, and a message with spaces), and for one
+  holding a surrogate code point on `tool_invoked`'s value, a direct logging call shaped like
+  `tool_invoked` wrote the same bytes before and after BR-028 under the default
+  configuration (its time column left out), with `ConsoleRenderer(colors=True)`,
+  `JSONRenderer` (with and without `ensure_ascii`), `LogfmtRenderer`, `KeyValueRenderer`,
+  `ProcessorFormatter.wrap_for_formatter` and `render_to_log_kwargs` (two formats), with
+  structlog 26.1.0 and 24.1.0 on CPython 3.11.15, 3.13.2 and 3.14.3. A name that is not a
+  string, on the registry line, is logged as it is. `tool_invoked` still writes BR-024's
+  escape for a surrogate code point. The keys are unchanged. Events, requests, registry keys
+  and the text of an MCP tool's error result keep the characters (measured), and so does
+  what the state stores write (by reading: their escape leaves control characters alone).
+  The escape cannot be told apart from the same six characters typed.
+  A renderer that escapes a backslash shows the escape's backslash doubled:
+  `structlog.processors.JSONRenderer` (so a reader that decodes the line gets the six
+  characters, where it got the control character before), `KeyValueRenderer`, structlog
+  26.1.0's default `ConsoleRenderer` for a value it writes with `repr` (one that also holds a
+  space, `=` or a quote; a tab, CR or LF is escaped first, so a value holding only those,
+  which 26.1.0 used to quote with `repr`, is now written unquoted) and 26.1.0's
+  `LogfmtRenderer` for a value it quotes (one holding a space, `=` or `"`); measured. Other
+  characters are written as before, among them the bidirectional formatting characters,
+  apart from one case on structlog 26.1.0 (see Not covered). (BR-028)
 
 ### Fixed
 - JSON that the SDK writes for the model now carries non-ASCII text as literal UTF-8
@@ -865,6 +936,108 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     runs in CI but was not measured for this item.
 
   No public API changes; the renamed log key is listed under Changed. (BR-027)
+
+- Under structlog's default configuration, which the SDK does not change, a control
+  character in one of the values BR-028 now escapes (see Changed) reached the log output as
+  it was: a tool name the model chose, or an MCP server's tool name or error message, could
+  write a terminal control sequence (ESC followed by `[2J`, for example) into a console log.
+  structlog 26.1.0's `ConsoleRenderer` writes a string value as it is unless it holds a
+  space, tab, `=`, a quote, CR or LF, and writes those with `repr`, which escapes control
+  characters, so the character reached the output when the value held none of those seven.
+  structlog 24.1.0, the lowest release the SDK accepts, writes every string value as it is,
+  so there a line feed in such a value also started a new output line. Measured before
+  BR-028 with structlog 26.1.0 and 24.1.0 on four library sets (CPython 3.14.3 with `openai`
+  2.43.0 and `mcp` 1.28.0, and CPython 3.14.3, 3.13.2 and 3.11.15 with `openai` 2.54.0 and
+  `mcp` 1.30.0):
+  - a direct logging call shaped like `tool_invoked`: each of the 65 control characters
+    reached the output as it was, apart from tab, line feed and carriage return on 26.1.0,
+    which it wrote with `repr`; on 24.1.0 those three as well, and a line feed split the line
+    in two;
+  - the loop's `tool_invoked` line, through `AgentLoop` and `OpenAICompatibleClient`, for a
+    native call, a native batch and a `JsonModeParser` tool name decoded from a JSON escape,
+    with ESC `[2J`, an OSC sequence ending in BEL, U+009B, DEL, NUL, VT and LF in the name,
+    with stdout a file and a terminal (`JsonModeParser` strips the name, so a trailing VT
+    did not reach the line there);
+  - `mcp.refresh_failed` for an MCP server's JSON-RPC error message, and
+    `mcp.tool_overwrite`, `tool overwritten` and the two hook lines for an MCP server's tool
+    name holding ESC, through a test transport that runs the SDK's `MCPClient` mapping, and
+    through real in-memory `mcp` sessions (a FastMCP server, which accepted a tool name
+    holding ESC with a warning, for the name lines and `mcp.tool_error_hook_failed`; a
+    low-level server whose `tools/list` returned the error, for `mcp.refresh_failed`).
+
+  On a stream whose encoding cannot encode a C1 control character, an ASCII or cp1252 stream,
+  the log call raised `UnicodeEncodeError` for a value holding one that the renderer wrote as
+  it was (on 26.1.0, a value holding none of those seven characters; on 24.1.0, any value; a
+  value 26.1.0 writes with `repr` did not raise, because `repr` escapes the character,
+  measured for a tool name and an error message holding a space): `AgentLoop.run()` ended at
+  the `tool_invoked` line after one request, with no `FinalEvent` (a native call, a native
+  batch, `SafetyConfig(native_tools_enabled=True)` with `JsonModeParser`, and a
+  `JsonModeParser` name); `Registry.register` raised and kept the earlier tool;
+  `MCPProvider.attach()` (for a name already registered, which then kept the earlier tool)
+  and `refresh()` raised at `mcp.tool_overwrite`; the periodic refresh task ended at the
+  failed tick, and no later refresh ran; and the hook lines' raise reached the tool call's
+  result, so `Registry.invoke` returned an error result holding the
+  `UnicodeEncodeError`'s text instead of the `isError` message. Measured with an explicit
+  stream in each of those two encodings, and for the loop, `register` and the periodic
+  refresh also with stdout under `PYTHONIOENCODING=ascii`, on the same library sets and
+  structlog releases. 1.7.0, 1.8.0, 1.9.0 and 1.10.1 gave the same results with the
+  explicit streams (1.7.0 has no `tool_mode`, so its loop rows were the two through
+  `JsonModeParser`). A latin-1 stream wrote a C1 control character as its single byte.
+  Each value is now written escaped, and those calls no longer raise for it, measured the
+  same way. A value holding a character that is not a control character and that such a
+  stream cannot encode, such as an Arabic tool name or U+202E, still raises there at each of
+  these calls, with the outcomes above (measured on all eight calls, before and after; U+202E
+  on a latin-1 stream too). On structlog 26.1.0, U+202E in a value the renderer writes with
+  `repr` (since BR-028, one holding a space, `=` or a quote) is escaped by `repr` and does
+  not raise, while an Arabic letter, which `repr` keeps, still does (measured with a space in
+  the value, on an ASCII stream with CPython 3.14.3 and 3.11.15, at `tool_invoked`, `register` and the periodic refresh, before and after).
+
+  The same calls on the MCP and registry lines raised the same ways for a surrogate code point
+  in a value the renderer wrote as it was (an MCP server's tool name or error message, or a
+  name `Registry.register` logged) on any strict stream, a UTF-8 one included: with
+  structlog's default configuration and stdout a file or a terminal under a UTF-8 locale, the
+  case BR-024 fixed for `tool_invoked`. Measured through the test transport with an explicit
+  strict UTF-8 stream on the same library sets and structlog releases and on 1.7.0, 1.8.0,
+  1.9.0 and 1.10.1, and, for `register`, the periodic refresh and a hook line, with stdout a
+  file under a UTF-8 locale. These lines now write BR-024's escape and continue. Whether a
+  real MCP server's JSON can carry a surrogate code point into these values was not measured.
+- Not covered:
+  - Other characters are written as they are, among them the bidirectional formatting
+    characters (U+061C, U+200E, U+200F, U+202A-U+202E, U+2066-U+2069), which can change the
+    order in which a viewer that implements them shows the rest of the line; zero-width
+    characters; and U+2028 and U+2029, which some tools treat as line breaks (each written as
+    it was by the default `ConsoleRenderer`, before and after, in a value holding none of the
+    characters that switch 26.1.0's renderer to `repr`; measured). With structlog 26.1.0 a
+    value whose only characters from the renderer's `repr` list (space, tab, `=`, a quote,
+    CR, LF) were a tab, CR or LF used to be written with `repr`, which escaped these
+    characters, NBSP and a backslash in it; it is now written as it is after the escape, so
+    they reach the output as they are, and on a stream that cannot encode one of them the log
+    call now raises where it did not (measured on ASCII and cp1252 streams for U+202E after a
+    tab at `tool_invoked`, `register`, `attach()`, `refresh()`, the periodic refresh and a
+    hook line, and for U+200B after a tab and NBSP after a line feed, NBSP on ASCII only, at
+    `tool_invoked`, `register`, `refresh()` and the periodic refresh; the other characters and
+    the backslash by reading `structlog/dev.py:923-926`).
+  - A value holding a character that is not a control character and that the stream cannot
+    encode (an ASCII or cp1252 stdout, for example), such as an Arabic tool name or U+202E,
+    still makes these log calls raise, with the outcomes Fixed lists (measured on all eight
+    calls, before and after; U+202E on a latin-1 stream too). On structlog 26.1.0 U+202E
+    does not when the renderer writes the value with `repr` (since BR-028, one holding a
+    space, `=` or a quote); an Arabic letter still does (measured on an ASCII stream with
+    CPython 3.14.3 and 3.11.15).
+  - Values you supply are logged as they are: session and branch ids, `user_id`,
+    `server_url`, a custom `LLMClient`'s `LLMError.context["type"]` (`llm_error_type`), a
+    custom parser's `context["error_phase"]`, and the text of an exception your state store
+    or audit sink raises, which `runner.persist_failed` and `audit.emit_failed` log. (A tool
+    name you register is escaped on the registry line; see Changed.)
+  - `ConsoleAuditSink`'s `payload` is a dict, which the default renderer writes with
+    `repr`; that escaped ESC, DEL, U+009B and line feed in a payload value (measured). With
+    `JSONRenderer(ensure_ascii=False)` DEL and U+009B in it are written as they are
+    (measured).
+  - Text your own code logs, such as `str()` of an SDK exception that quotes a tool name.
+  - structlog releases other than 24.1.0 and 26.1.0, CPython 3.12, Windows, and what a
+    terminal emulator does with each character were not measured.
+
+  No public API changes; the escaped values are listed under Changed. (BR-028)
 
 ## [1.10.1] - 2026-09-28
 

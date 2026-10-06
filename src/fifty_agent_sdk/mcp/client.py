@@ -100,6 +100,7 @@ from mcp.shared.exceptions import McpError
 from mcp.types import CallToolResult, Tool
 from pydantic import BaseModel, ConfigDict, Field
 
+from fifty_agent_sdk._model_json import escape_for_log
 from fifty_agent_sdk.errors import MCPError
 from fifty_agent_sdk.mcp.transport import StreamableHttpTransport, Transport
 
@@ -899,7 +900,10 @@ class MCPClient:
         Args:
             err: The per-call error carrier produced by
                 :meth:`_unwrap_invoke_result`.
-            tool_name: Remote tool name, used only for the WARNING log lines.
+            tool_name: Remote tool name, used only for the WARNING log lines,
+                which write its control characters and surrogate code points
+                escaped (BR-028; the escape cannot be told apart from the same
+                six characters typed).
 
         Returns:
             ``err`` itself when no hook is configured or the hook failed;
@@ -929,19 +933,21 @@ class MCPClient:
             # exception TYPE only): a hook screening untrusted server content
             # may embed that content in its own exception message
             # (`ValueError(f"bad: {content}")`), and this module's standing
-            # rule is that untrusted material never reaches a log line. Log
-            # the exception TYPE only — never its text, never `content`,
-            # never the message.
+            # rule is that untrusted content never reaches a log line: log the
+            # exception TYPE only — never its text, never `content`, never the
+            # message. The one server-controlled value these lines carry is
+            # `tool_name`, logged through `escape_for_log` (BR-028), here and on
+            # the two lines below.
             _log.warning(
                 "mcp.tool_error_hook_failed",
-                tool_name=tool_name,
+                tool_name=escape_for_log(tool_name),
                 error_type=type(exc).__name__,
             )
             return err
         if not isinstance(result, str):
             _log.warning(
                 "mcp.tool_error_hook_invalid",
-                tool_name=tool_name,
+                tool_name=escape_for_log(tool_name),
                 returned_type=type(result).__name__,
                 reason="not_a_string",
             )
@@ -949,7 +955,7 @@ class MCPClient:
         if not result.strip():
             _log.warning(
                 "mcp.tool_error_hook_invalid",
-                tool_name=tool_name,
+                tool_name=escape_for_log(tool_name),
                 returned_type=type(result).__name__,
                 reason="blank_string",
             )

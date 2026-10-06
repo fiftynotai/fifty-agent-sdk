@@ -40,7 +40,8 @@ Legacy path
     for the runs :mod:`fifty_agent_sdk.loop` scopes that claim to ("Non-ASCII
     text (BR-020)", "Error-path final text (BR-021)", "Tool-argument
     nesting (BR-019)", "Tool-result text (BR-022)", "Model-written text
-    in requests (BR-024)" and "Log keys under stdlib logging (BR-026)").
+    in requests (BR-024)", "Log keys under stdlib logging (BR-026)" and
+    "Control characters in log values (BR-028)").
     That includes the half-native combination ``native_tools_enabled=True``
     + a text parser, kept for compatibility.
     ``tool_mode=ToolMode.NATIVE`` is the documented way to close that hole.

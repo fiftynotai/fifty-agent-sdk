@@ -19,16 +19,35 @@ each of the 2048 surrogate code points gets exactly ``json.dumps``' escape;
 only the surrogates change, two in a row are escaped one by one; and typed
 escape text is left as it is, so the escape cannot be undone. Its call site
 is pinned in ``tests/loop/test_loop_tool_result_containment.py``.
+
+BR-028 adds ``escape_for_log``, for a log value a model or a remote MCP
+server controls: ``escape_surrogates`` first, then each of the 65 control
+code points U+0000-U+001F and U+007F-U+009F (Unicode category Cc) as six
+characters, a backslash, ``u`` and four lowercase hex digits. Pinned here:
+each of the 65 gets exactly that escape, and the two ranges equal the
+category Cc on the running interpreter (U1); every other code point that is
+not a surrogate comes back unchanged, the bidirectional formatting
+characters, zero-width characters, U+2028, U+2029 and NBSP included (U2);
+each surrogate code point gets ``escape_surrogates``' escape (U3); typed
+escape text is left as it is, so this escape cannot be undone either (U4);
+and ``escape_surrogates`` itself still leaves control characters alone, so
+the text the SDK sends or stores keeps them (U5). The tests reach the
+helper as ``_model_json.escape_for_log`` so that each fails on its own on a
+tree without it. Its call sites are pinned in
+``tests/loop/test_loop_provider_text_replay.py`` (B16-B19) and
+``tests/tools/test_tools_console_log.py`` (T1-T6).
 """
 
 from __future__ import annotations
 
 import json
+import unicodedata
 from datetime import UTC, datetime
 from typing import Any
 
 import pytest
 
+from fifty_agent_sdk import _model_json
 from fifty_agent_sdk._model_json import dumps_for_model, escape_surrogates
 
 _MIXED_NON_ASCII: dict[str, Any] = {
@@ -228,3 +247,99 @@ def test_escape_surrogates_leaves_escape_text_alone() -> None:
 
     assert escape_surrogates(typed) is typed
     assert escape_surrogates(typed + chr(0xD800)) == typed + typed
+
+
+# --- escape_for_log (BR-028) --------------------------------------------------------------
+
+_CONTROL_CODE_POINTS = [*range(0x00, 0x20), *range(0x7F, 0xA0)]
+"""C0 (U+0000-U+001F, TAB, LF and CR included), DEL and C1 (U+0080-U+009F): the 65 BR-028 escapes."""
+
+_BIDI_CONTROLS = [0x061C, 0x200E, 0x200F, *range(0x202A, 0x202F), *range(0x2066, 0x206A)]
+
+
+def test_escape_for_log_escapes_every_control_code_point() -> None:
+    """U1: each of the 65 control code points becomes a backslash, ``u`` and four lowercase hex digits, and the two ranges are exactly the category Cc (BR-028).
+
+    The set is checked against ``unicodedata.category`` over every code point
+    on the running interpreter, an independent derivation. The expected text
+    is built from its parts, never from the helper.
+    """
+    category_cc = {cp for cp in range(0x110000) if unicodedata.category(chr(cp)) == "Cc"}
+    assert set(_CONTROL_CODE_POINTS) == category_cc
+    assert len(_CONTROL_CODE_POINTS) == 65
+
+    for cp in _CONTROL_CODE_POINTS:
+        expected = "a" + "\\u" + format(cp, "04x") + "b"
+        assert len(expected) == 8
+
+        assert _model_json.escape_for_log("a" + chr(cp) + "b") == expected, f"{cp:#06x}"
+
+    every = "".join(map(chr, _CONTROL_CODE_POINTS))
+    escaped = _model_json.escape_for_log(every)
+    assert escaped == "".join("\\u" + format(cp, "04x") for cp in _CONTROL_CODE_POINTS)
+    assert escaped.isascii()
+    assert escaped.isprintable()
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        pytest.param(" ", id="space"),
+        pytest.param("~", id="tilde_u007e"),
+        pytest.param("\u00a0", id="nbsp"),
+        pytest.param("\u00a1", id="u00a1"),
+        *[pytest.param("find" + chr(cp) + "x", id=f"bidi_{cp:04x}") for cp in _BIDI_CONTROLS],
+        pytest.param("\u200b\u200c\u200d", id="zero_width"),
+        pytest.param("a\u2028b\u2029c", id="line_and_paragraph_separators"),
+        pytest.param("\ufeff", id="bom"),
+        pytest.param("بحث", id="arabic"),
+        pytest.param("ok \U0001f600", id="astral_emoji"),
+    ],
+)
+def test_escape_for_log_leaves_named_code_points_alone(text: str) -> None:
+    """U2, named rows: NBSP, the bidirectional formatting characters, zero-width characters, U+2028/U+2029, Arabic and an astral emoji come back unchanged (BR-028, decision D1)."""
+    assert _model_json.escape_for_log(text) == text
+
+
+def test_escape_for_log_leaves_every_other_code_point_alone() -> None:
+    """U2: a text holding every code point that is neither Cc nor a surrogate comes back unchanged (BR-028).
+
+    That is printable ASCII, U+00A0 onwards, and characters outside the
+    Basic Multilingual Plane: a value without a control character or a
+    surrogate code point is logged as before.
+    """
+    controls = set(_CONTROL_CODE_POINTS)
+    text = "".join(
+        chr(cp) for cp in range(0x110000) if cp not in controls and not 0xD800 <= cp <= 0xDFFF
+    )
+    # Precondition: the text is complete.
+    assert len(text) == 0x110000 - 0x800 - 65
+
+    assert _model_json.escape_for_log(text) == text
+
+
+def test_escape_for_log_escapes_surrogates_as_escape_surrogates_does() -> None:
+    """U3: each surrogate code point gets ``escape_surrogates``' six characters, and a mixed text gets both escapes and nothing else changes (BR-028)."""
+    for cp in range(0xD800, 0xE000):
+        assert _model_json.escape_for_log(chr(cp)) == escape_surrogates(chr(cp)), f"{cp:#06x}"
+
+    mixed = "x" + chr(0xD800) + "\x1b" + "\x85" + "بحث"
+    assert _model_json.escape_for_log(mixed) == "x\\ud800\\u001b\\u0085بحث"
+
+
+def test_escape_for_log_leaves_escape_text_alone() -> None:
+    """U4: the six characters of the ESC escape, typed, and those of BR-024's U+D800 escape come back as they are, so a typed escape and an escaped control character look the same (BR-028)."""
+    typed = "\\u001b"
+    typed_surrogate = "\\ud800"
+    assert len(typed) == len(typed_surrogate) == 6
+
+    assert _model_json.escape_for_log(typed) == typed
+    assert _model_json.escape_for_log(typed_surrogate) == typed_surrogate
+    assert _model_json.escape_for_log(typed + "\x1b") == typed + typed
+
+
+def test_escape_surrogates_still_leaves_control_characters_alone() -> None:
+    """U5: ``escape_surrogates``, which runs on the wire and on stored text, returns a text with ESC, LF and TAB as the same object (BR-028, decision D3)."""
+    text = "a\x1b\n\tb"
+
+    assert escape_surrogates(text) is text

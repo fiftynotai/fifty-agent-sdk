@@ -6,8 +6,8 @@ keys, values and JSON types) and emits the same event stream as 1.9.0 (since
 1.10.2 claimed only for the runs :mod:`fifty_agent_sdk.loop` scopes it to:
 "Non-ASCII text (BR-020)", "Error-path final text (BR-021)",
 "Tool-argument nesting (BR-019)", "Tool-result text (BR-022)",
-"Model-written text in requests (BR-024)" and "Log keys under stdlib
-logging (BR-026)"). The two
+"Model-written text in requests (BR-024)", "Log keys under stdlib
+logging (BR-026)" and "Control characters in log values (BR-028)"). The two
 earlier fixtures (``legacy_1_7_0.json``, ``requests_1_8_0.json``) pin request
 bodies only, and none of their scenarios drives the branches FR-003 edits:
 
@@ -51,7 +51,12 @@ surrogate code point (BR-024): no scenario's text in those fields holds one
 (BR-024 evidence, P5). Nor a run that dispatches a tool call while structlog
 passes the SDK's log keys to stdlib ``logging`` as ``extra`` with DEBUG
 enabled (BR-026): no scenario routes structlog through stdlib, and the
-fixtures hold no log lines (by reading).
+fixtures hold no log lines (by reading). Nor a run in which a value the SDK
+escapes for a log line held, before the escape, a character that the stream
+structlog writes that line to cannot encode (BR-028): no scenario uses MCP,
+the fixtures hold no log lines, and they hold no control character other than
+line feed, none in a tool name, and no surrogate code point (BR-028 evidence,
+P5).
 
 Running ``python -m tests.loop.golden_capture_1_9_0`` from the repo root writes
 ``tests/loop/golden/requests_1_9_0.json``. The fixture in the tree was written

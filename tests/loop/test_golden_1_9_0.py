@@ -65,6 +65,11 @@ What this does NOT pin:
   to stdlib ``logging`` as ``extra`` with DEBUG enabled (BR-026). No scenario
   routes structlog through stdlib, and the fixtures hold no log lines (by
   reading).
+* A run in which a value the SDK escapes for a log line held, before the
+  escape, a character that the stream structlog writes that line to cannot
+  encode (BR-028). No scenario uses MCP, the fixtures hold no log lines, and
+  they hold no control character other than line feed, none in a tool name,
+  and no surrogate code point (BR-028 evidence, P5).
 """
 
 from __future__ import annotations

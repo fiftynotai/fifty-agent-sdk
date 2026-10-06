@@ -31,7 +31,11 @@ tool call's name, a tool reply's name) holding a surrogate code point
 Nor a run that dispatches a tool call while structlog passes the SDK's log
 keys to stdlib ``logging`` as ``extra`` with DEBUG enabled (BR-026): no
 scenario routes structlog through stdlib, and the fixtures hold no log lines
-(by reading).
+(by reading). Nor a run in which a value the SDK escapes for a log line held,
+before the escape, a character that the stream structlog writes that line to
+cannot encode (BR-028): no scenario uses MCP, the fixtures hold no log lines,
+and they hold no control character other than line feed, none in a tool name,
+and no surrogate code point (BR-028 evidence, P5).
 
 Running ``python -m tests.loop.golden_capture`` from the repo root writes
 ``tests/loop/golden/legacy_1_7_0.json``. The fixture in the tree was written

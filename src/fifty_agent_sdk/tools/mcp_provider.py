@@ -46,6 +46,7 @@ from typing import Any, Final
 import structlog
 from pydantic import BaseModel, ConfigDict
 
+from fifty_agent_sdk._model_json import escape_for_log
 from fifty_agent_sdk.mcp import MCPClient, MCPToolDef
 from fifty_agent_sdk.mcp.client import _MCPCallError
 from fifty_agent_sdk.tools._schema_refs import inline_local_refs
@@ -377,9 +378,10 @@ class MCPProvider:
         for defn in defs:
             adapter = _MCPToolAdapter(defn, self._client)
             if defn.name in existing:
+                # BR-028: a server-defined name; control characters escaped for the log only.
                 _log.warning(
                     "mcp.tool_overwrite",
-                    tool_name=defn.name,
+                    tool_name=escape_for_log(defn.name),
                     reason="name already present in registry",
                 )
                 refreshed += 1
@@ -396,7 +398,10 @@ class MCPProvider:
 
         An ``Exception`` from a refresh (a discovery failure, for example)
         is logged at WARNING as ``mcp.refresh_failed``, with the exception's
-        class name under ``wrapped`` and its ``str()`` under
+        class name under ``wrapped`` and its ``str()``, with control
+        characters and surrogate code points escaped (BR-028: for a
+        JSON-RPC error it is the MCP server's own message; the escape cannot
+        be told apart from the same six characters typed), under
         ``error_message``, and does NOT terminate the task — a transient
         server outage shouldn't permanently stop refresh.
         ``asyncio.CancelledError`` ends the task. The line does not carry an
@@ -422,7 +427,7 @@ class MCPProvider:
                 _log.warning(
                     "mcp.refresh_failed",
                     wrapped=type(exc).__name__,
-                    error_message=str(exc),
+                    error_message=escape_for_log(str(exc)),
                 )
 
 

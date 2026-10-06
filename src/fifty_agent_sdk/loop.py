@@ -198,6 +198,43 @@ Log keys under stdlib logging (BR-026)
     configuration. No golden scenario routes structlog through stdlib (by
     reading).
 
+Control characters in log values (BR-028)
+    Since 1.10.2 the ``tool_invoked`` debug line also writes each control
+    character (U+0000-U+001F, U+007F-U+009F) in the model's tool name as six
+    characters, a backslash, ``u`` and four lowercase hex digits
+    (:func:`fifty_agent_sdk._model_json.escape_for_log`), which cannot be
+    told apart from the same six characters typed. Under structlog's default
+    configuration, which prints to stdout, such a character reached the
+    output as it was unless the name held a space, tab, ``=``, a quote, CR
+    or LF (structlog 26.1.0; with 24.1.0, whatever the name held). Events
+    and requests keep the model's name. On a stream whose encoding cannot
+    encode a C1 control character (U+0080-U+009F), such as an ASCII or
+    cp1252 stdout, a dispatched call whose name held one, and on structlog
+    26.1.0 none of those characters, made that line raise
+    ``UnicodeEncodeError`` out of :meth:`AgentLoop.run` (after one request
+    when the first response named it), with no ``FinalEvent``, before BR-028
+    and on 1.7.0, 1.8.0, 1.9.0 and 1.10.1; such a run now continues
+    (measured; the CHANGELOG names the library sets). An MCP tool call whose
+    error hook line logged such a name holding a C1 control character, or a
+    surrogate code point (on any strict stream, UTF-8 included), got that
+    exception's text as its error result instead of the ``isError`` message
+    (measured through ``Registry.invoke``). The release-equivalence
+    statements in this module (above, in :class:`AgentLoop`'s Args and in
+    its ``__init__`` comments), and the matching ones in
+    :mod:`fifty_agent_sdk.tool_mode` and :mod:`fifty_agent_sdk.interventions`,
+    are claimed only for runs in which no value the SDK escapes for a log
+    line held, before the escape, a character that the stream structlog
+    writes that line to cannot encode. With structlog 26.1.0 that includes a
+    run that now raises: a name whose only characters from the renderer's
+    ``repr`` list were a tab, CR or LF was written with ``repr``, which
+    escaped a character such as U+202E or NBSP in it, and it is now written
+    as it is after the escape (measured with structlog 26.1.0 for U+202E,
+    U+200B and NBSP after a tab or LF, on ASCII and cp1252 streams, NBSP on
+    ASCII only; such a run completed before BR-028, and with U+202E after a
+    tab also on 1.7.0, 1.8.0, 1.9.0 and 1.10.1). The golden tests capture no log lines, no golden
+    scenario uses MCP, and the golden fixtures hold no control character
+    other than line feed, none in a tool name, and no surrogate code point.
+
 Statelessness
     Every :meth:`AgentLoop.run` call is its own scoped iteration. The
     loop holds no state across calls — conversation persistence and
@@ -253,7 +290,7 @@ from uuid import uuid4
 import structlog
 from pydantic import ValidationError
 
-from fifty_agent_sdk._model_json import dumps_for_model, escape_surrogates
+from fifty_agent_sdk._model_json import dumps_for_model, escape_for_log, escape_surrogates
 from fifty_agent_sdk.errors import (
     AgentSdkError,
     LLMError,
@@ -1431,9 +1468,13 @@ class AgentLoop:
                         # LogRecord reserves: with structlog routed through stdlib
                         # (`render_to_log_kwargs`) and DEBUG enabled, `name=` raised
                         # KeyError here.
+                        # BR-028: control characters too (see
+                        # `_model_json.escape_for_log`): structlog's default
+                        # ConsoleRenderer wrote such a name as it was, so a model
+                        # could send a terminal control sequence to a console log.
                         _log.debug(
                             "tool_invoked",
-                            tool_name=escape_surrogates(tc.name),
+                            tool_name=escape_for_log(tc.name),
                             call_id=cid,
                             run_id=run_id,
                         )
@@ -1784,9 +1825,10 @@ class AgentLoop:
                 continue
             # BR-024: escaped as on the wire (see the batch path above).
             # BR-026: under `tool_name`, not `name` (see the batch path above).
+            # BR-028: control characters escaped too (see the batch path above).
             _log.debug(
                 "tool_invoked",
-                tool_name=escape_surrogates(tool_name),
+                tool_name=escape_for_log(tool_name),
                 call_id=call_id,
                 run_id=run_id,
             )

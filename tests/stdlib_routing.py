@@ -24,9 +24,13 @@ one of three stdlib recipes as the processor chain, stdlib's
 The yielded list holds every record a ``fifty_agent_sdk`` logger produced.
 The handler formats each record before keeping it, as a host's handler
 would (``%(levelname)s %(name)s %(message)s``; a ``ProcessorFormatter``
-with ``ConsoleRenderer(colors=False)`` for the control recipe). So
-``record.message`` is always set: never assert that it is absent. Read a
-field with :func:`record_field`.
+with ``ConsoleRenderer(colors=False)`` for the control recipe). Under
+``render_to_log_kwargs`` and ``render_to_log_args_and_kwargs`` the kept
+record carries ``record.message``; under ``wrap_for_formatter`` it does not
+(measured with structlog 26.1.0 on CPython 3.11.15 and 3.14.3, BR-028
+evidence; B19 re-renders the record instead), so assert neither its
+presence nor its absence across recipes. Read a field with
+:func:`record_field`.
 
 Restoring: the handler is removed and the ``fifty_agent_sdk`` logger's
 level and ``propagate`` come back, as does ``logging.raiseExceptions``

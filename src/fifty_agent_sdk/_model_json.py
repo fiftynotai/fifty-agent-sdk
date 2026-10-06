@@ -1,4 +1,4 @@
-"""Text the SDK writes for a model to read, to a log line and to two state stores: JSON (BR-020) and surrogate escapes (BR-022, BR-024, BR-025).
+"""Text the SDK writes for a model to read, to a log line and to two state stores: JSON (BR-020), surrogate escapes (BR-022, BR-024, BR-025) and control-character escapes for log values (BR-028).
 
 Routing rule: every ``json.dumps`` whose output reaches a model prompt goes
 through :func:`dumps_for_model`. Since 1.10.2 those are the three call sites
@@ -10,8 +10,9 @@ through it and keeps the stdlib defaults, so stored bytes do not change.
 :func:`escape_surrogates` writes each surrogate code point as its
 ``\\udXXX`` escape. The loop runs it once on the text of every tool-result
 message it builds (``AgentLoop._build_tool_message``, BR-022), and on the
-model's tool name in its ``tool_invoked`` debug log line (BR-024). The
-shipped client runs it when it serialises a request, on the three fields
+model's tool name in its ``tool_invoked`` debug log line (BR-024; since
+BR-028 through :func:`escape_for_log`). The shipped client runs it when it
+serialises a request, on the three fields
 that carry text the model wrote: an assistant message's content, each tool
 call's name and a ``"tool"`` message's name
 (``OpenAICompatibleClient._serialize_message``, BR-024). The BR-024 escapes
@@ -30,6 +31,19 @@ There too the escape cannot be reversed: reading the message back returns
 the six characters, which cannot be told apart from the same six characters
 typed.
 
+:func:`escape_for_log` is for a log value that a model or a remote MCP
+server can control (BR-028). It runs :func:`escape_surrogates`, then writes
+each control character, U+0000-U+001F and U+007F-U+009F, as six characters:
+a backslash, ``u`` and four lowercase hex digits. Eight logging calls use
+it: the loop's two ``tool_invoked`` lines, ``Registry.register``'s
+``tool overwritten`` line (which escapes a host's own ``str`` tool name the
+same way), ``MCPProvider``'s ``mcp.tool_overwrite`` and
+``mcp.refresh_failed`` (its ``error_message``), and ``MCPClient``'s three
+``mcp.tool_error_hook_*`` calls. That escape cannot be told apart from the
+same six characters typed either. It never runs on text sent to a model, on
+events or on stored text: a control character there (a newline in an
+assistant message, say) is content.
+
 This module is private and carries no semver protection.
 """
 
@@ -37,7 +51,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
-from typing import Any
+from typing import Any, Final
 
 
 def dumps_for_model(
@@ -113,11 +127,13 @@ def escape_surrogates(text: str) -> str:
     one surrogate code point in a tool-result message made the next request
     raise ``UnicodeEncodeError`` before it was sent. BR-024 measured the same
     for text the model wrote and the SDK sent back (an echoed completion, a
-    tool name), and the shipped client's request serialiser and the loop's
-    ``tool_invoked`` log line call this function too (see the module
-    docstring). Two state stores raised for such text too, and since
-    BR-025 they call it as well; whoever reads that text back cannot tell
-    the escape from the same six characters typed either (below).
+    tool name), and the shipped client's request serialiser calls this
+    function too, as does the loop's ``tool_invoked`` log line, through
+    :func:`escape_for_log` (see the module docstring). Two state stores
+    raised for such text too, and since BR-025 they call it as well; whoever
+    reads that text back cannot tell the escape from the same six characters
+    typed either (below). It leaves control characters as they are;
+    :func:`escape_for_log` escapes those, for log values only.
 
     The function tries ``text.encode("utf-8")``, which fails exactly when the
     text holds a surrogate code point. If it succeeds, ``text`` itself is
@@ -163,4 +179,52 @@ def escape_surrogates(text: str) -> str:
     return text
 
 
-__all__ = ["dumps_for_model", "escape_surrogates"]
+_CONTROL_ESCAPES: Final[dict[int, str]] = {
+    code_point: f"\\u{code_point:04x}" for code_point in (*range(0x00, 0x20), *range(0x7F, 0xA0))
+}
+"""The 65 control code points (Unicode general category Cc) and the six characters each becomes in a log value (BR-028)."""
+
+
+def escape_for_log(text: str) -> str:
+    """Write a log value that a model or a remote MCP server can control without any control character (BR-028).
+
+    The value first goes through :func:`escape_surrogates`. Then each of the
+    65 control characters U+0000-U+001F and U+007F-U+009F (the Unicode
+    general category Cc) becomes six characters: a backslash, ``u`` and the
+    code point as four lowercase hex digits, for example ``\\u001b`` for
+    ESC. ``json.dumps`` writes the same text for 60 of them by default; it
+    writes backspace, tab, line feed, form feed and carriage return as
+    two-character escapes. Every other code point is left as it is, so a
+    value with no control character and no surrogate code point comes back
+    equal (as a plain ``str``). The bidirectional formatting characters,
+    zero-width characters and U+2028/U+2029 are left as they are too (BR-028
+    plan, decision D1).
+
+    Why: under structlog's default configuration, which the SDK does not
+    change, structlog 26.1.0's ``ConsoleRenderer`` writes a string value as
+    it is unless it holds a space, tab, ``=``, a quote, CR or LF, and
+    24.1.0 writes every string value as it is. A control character in a
+    value written as it is reached the log output as it was, and on 24.1.0 a
+    line feed split the line (measured on CPython 3.11.15, 3.13.2 and
+    3.14.3; BR-028 evidence, P1). The MCP and registry log lines passed a
+    surrogate code point as it was too, so with a strict UTF-8 stdout they
+    raised as ``tool_invoked`` did before BR-024; the first step now escapes
+    it there as well (BR-028 evidence, P3).
+
+    For log values only. Never use it on text sent to a model, on events or
+    on stored text. Like the surrogate escape it cannot be reversed: the
+    escape cannot be told apart from the same six characters typed, which
+    are left as they are. It catches nothing.
+
+    Args:
+        text: A tool name or an error message that a model or an MCP server
+            can control, about to be logged.
+
+    Returns:
+        ``text`` with each surrogate code point and each control character
+        escaped.
+    """
+    return escape_surrogates(text).translate(_CONTROL_ESCAPES)
+
+
+__all__ = ["dumps_for_model", "escape_for_log", "escape_surrogates"]
