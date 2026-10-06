@@ -45,7 +45,7 @@ Interventions (FR-003)
     :mod:`fifty_agent_sdk.interventions` for the contract.
 
 Non-ASCII text (BR-020)
-    Since 1.10.2, JSON the SDK writes for the model carries non-ASCII text
+    Since 1.11.0, JSON the SDK writes for the model carries non-ASCII text
     literally instead of as ``\\uXXXX`` escapes: non-string tool results,
     the text-mode tool list, and the ``arguments`` string of a replayed
     native tool call (a value holding a surrogate code point keeps the
@@ -58,7 +58,7 @@ Non-ASCII text (BR-020)
     for runs where it does.
 
 Error-path final text (BR-021)
-    Since 1.10.2 a run that ends on an ``LLMError`` or a ``ParserError`` ends
+    Since 1.11.0 a run that ends on an ``LLMError`` or a ``ParserError`` ends
     with :attr:`SafetyConfig.error_fallback_message`, where earlier releases
     used ``fallback_message``. An ``LLMError`` from
     :class:`~fifty_agent_sdk.llm.openai_compat.OpenAICompatibleClient` can
@@ -76,7 +76,7 @@ Error-path final text (BR-021)
     not end on an ``LLMError`` or a ``ParserError``.
 
 Tool-argument nesting (BR-019)
-    Since 1.10.2 the shipped
+    Since 1.11.0 the shipped
     :class:`~fifty_agent_sdk.llm.openai_compat.OpenAICompatibleClient`,
     :class:`~fifty_agent_sdk.parser.json_mode.JsonModeParser` and
     :class:`~fifty_agent_sdk.parser.prose_mode.ProseModeParser` check the
@@ -103,7 +103,7 @@ Tool-argument nesting (BR-019)
     arguments nest at most 64 levels.
 
 Tool-result text (BR-022)
-    Since 1.10.2 the text of each tool-result message the loop builds has
+    Since 1.11.0 the text of each tool-result message the loop builds has
     every surrogate code point (U+D800-U+DFFF), which UTF-8 cannot encode,
     written as its six-character ``\\udXXX`` escape
     (:func:`fifty_agent_sdk._model_json.escape_surrogates`), whatever
@@ -145,7 +145,7 @@ Tool-result text (BR-022)
     when it sends them (see "Model-written text in requests (BR-024)").
 
 Model-written text in requests (BR-024)
-    Since 1.10.2 the shipped
+    Since 1.11.0 the shipped
     :class:`~fifty_agent_sdk.llm.openai_compat.OpenAICompatibleClient`
     writes each surrogate code point in an assistant message's content, a
     tool call's name and a ``"tool"`` message's name as its ``\\udXXX``
@@ -181,7 +181,7 @@ Model-written text in requests (BR-024)
     (BR-024 probe P5).
 
 Log keys under stdlib logging (BR-026)
-    Since 1.10.2 the loop's ``tool_invoked`` debug line logs the tool name
+    Since 1.11.0 the loop's ``tool_invoked`` debug line logs the tool name
     under ``tool_name``, not ``name``, which stdlib's ``LogRecord`` reserves.
     When structlog passed the loop's log keys to stdlib ``logging`` as a
     record's ``extra``, as ``structlog.stdlib.render_to_log_kwargs`` and
@@ -199,7 +199,7 @@ Log keys under stdlib logging (BR-026)
     reading).
 
 Control characters in log values (BR-028)
-    Since 1.10.2 the ``tool_invoked`` debug line also writes each control
+    Since 1.11.0 the ``tool_invoked`` debug line also writes each control
     character (U+0000-U+001F, U+007F-U+009F) in the model's tool name as six
     characters, a backslash, ``u`` and four lowercase hex digits
     (:func:`fifty_agent_sdk._model_json.escape_for_log`), which cannot be
@@ -518,7 +518,7 @@ def _serialize_tool_output(
        returns ``repr(self)``.
     4. If it raises any other ``Exception``, ``repr(output)`` is returned.
        1.10.1 did this for ``TypeError`` (for example a tuple key) and
-       ``ValueError`` (for example a circular reference). Since 1.10.2 it
+       ``ValueError`` (for example a circular reference). Since 1.11.0 it
        also covers an exception raised by a value's ``__str__`` under
        ``default=str`` (BR-022 measured ``RuntimeError`` and ``KeyError``),
        which used to propagate.
@@ -1036,7 +1036,7 @@ class AgentLoop:
         Non-recoverable failures (``LLMError``, ``ParserError``, iteration
         cap exhaustion) emit an :class:`fifty_agent_sdk.streaming.ErrorEvent`
         followed by a fallback :class:`fifty_agent_sdk.streaming.FinalEvent`,
-        then return. Since 1.10.2 (BR-021) that ``FinalEvent`` carries
+        then return. Since 1.11.0 (BR-021) that ``FinalEvent`` carries
         :attr:`SafetyConfig.fallback_message` only after iteration cap
         exhaustion (``error_type="MaxIterationsExceeded"``), and
         :attr:`SafetyConfig.error_fallback_message` after an ``LLMError`` or

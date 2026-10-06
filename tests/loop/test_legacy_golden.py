@@ -27,7 +27,7 @@ pinned here): ``OpenAICompatibleClient._build_body`` adds its keys in the
 ``_serialize_message`` without moving a key (the ``model_dump`` branch
 re-assigns the existing key; the envelope builds its keys in the same
 order). Nor non-ASCII text or U+007F in the JSON the SDK writes for the
-model, which 1.10.2 changed (BR-020): no scenario's tool results, tool
+model, which 1.11.0 changed (BR-020): no scenario's tool results, tool
 schemas or replayed arguments hold any. Nor any text the 64-level nesting
 check refuses (BR-019): it refuses no text in any scenario, whose tool
 arguments nest at most 1 level. Nor tool-result text holding a surrogate

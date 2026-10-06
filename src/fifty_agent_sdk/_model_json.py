@@ -1,7 +1,7 @@
 """Text the SDK writes for a model to read, to a log line and to two state stores: JSON (BR-020), surrogate escapes (BR-022, BR-024, BR-025) and control-character escapes for log values (BR-028).
 
 Routing rule: every ``json.dumps`` whose output reaches a model prompt goes
-through :func:`dumps_for_model`. Since 1.10.2 those are the three call sites
+through :func:`dumps_for_model`. Since 1.11.0 those are the three call sites
 that render tool results, the text-mode tool list and the ``arguments`` string
 of a replayed native tool call. JSON that is stored, hashed or used as a key
 (for example the Redis branch metadata in ``state/redis.py``) never goes
@@ -112,7 +112,7 @@ def dumps_for_model(
         text.encode("utf-8")
     except UnicodeEncodeError:
         # BR-020: a surrogate code point cannot be sent as UTF-8; return the
-        # pre-1.10.2 escaped form, which is ASCII, so this text encodes.
+        # pre-1.11.0 escaped form, which is ASCII, so this text encodes.
         return json.dumps(obj, default=default, sort_keys=sort_keys)
     return text
 

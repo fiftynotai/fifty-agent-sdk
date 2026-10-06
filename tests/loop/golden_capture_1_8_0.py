@@ -37,7 +37,7 @@ No scenario here passes ``reasoning_effort`` or ``temperature`` to
 ``AgentLoop``: neither kwarg existed when the fixture was captured.
 
 It does NOT pin non-ASCII text or U+007F in the JSON the SDK writes for the
-model, which 1.10.2 changed (BR-020): no scenario's tool results, tool schemas
+model, which 1.11.0 changed (BR-020): no scenario's tool results, tool schemas
 or replayed arguments hold any. Nor any text the 64-level nesting check
 refuses (BR-019): it refuses no text in any scenario, whose tool arguments
 nest at most 1 level. Nor tool-result text holding a surrogate code point

@@ -23,7 +23,7 @@ Two final texts (BR-021)
     :attr:`SafetyConfig.error_fallback_message`, so the end user is not told
     the steps ran out when the provider failed. The two are independent:
     setting only ``fallback_message`` leaves ``error_fallback_message`` at
-    its default. Before 1.10.2 every one of those paths used
+    its default. Before 1.11.0 every one of those paths used
     ``fallback_message``.
 
 Parser-error retry (BR-018)
@@ -82,7 +82,7 @@ class SafetyConfig(BaseModel):
         fallback_message: Text of the :class:`fifty_agent_sdk.streaming.
             FinalEvent` when the iteration cap is hit, the one path whose
             ``ErrorEvent`` has ``error_type="MaxIterationsExceeded"``. Must be
-            non-empty. Before 1.10.2 it also ended runs stopped by an LLM or
+            non-empty. Before 1.11.0 it also ended runs stopped by an LLM or
             parser error; those now use :attr:`error_fallback_message`
             (BR-021).
         error_fallback_message: Text of the :class:`fifty_agent_sdk.streaming.

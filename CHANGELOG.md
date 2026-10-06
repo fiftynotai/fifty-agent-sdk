@@ -6,7 +6,7 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-## [1.10.2] - 2026-10-02
+## [1.11.0] - 2026-10-06
 
 ### Added
 - `SafetyConfig.error_fallback_message`: the text of the `FinalEvent` that ends a run after
@@ -278,7 +278,7 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     `ContextLengthExceeded` even when its message names no overflow.
   - Old to new:
 
-    | Method | HTTP 200 body | 1.10.1 | 1.10.2 |
+    | Method | HTTP 200 body | 1.10.1 | 1.11.0 |
     |---|---|---|---|
     | `complete()` | labelled JSON, not valid UTF-8 | raw `UnicodeDecodeError` | `UndecodableProviderBody` |
     | `complete()` | labelled JSON, an integer literal over the digit limit | raw `ValueError` | `UndecodableProviderBody` |
@@ -294,7 +294,7 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     `classified_from`, when the body's text names an overflow. In the `stream()` rows the
     old type is now in `decode_error`, and the message, which was the exception's text,
     now has the prefix. Measured for 1.10.1 on CPython 3.14.3 with `openai` 2.43.0, and for
-    1.10.2 on 3.14.3 with 2.43.0 and on 3.11.15 and 3.13.2 with 2.54.0. (BR-023)
+    1.11.0 on 3.14.3 with 2.43.0 and on 3.11.15 and 3.13.2 with 2.54.0. (BR-023)
 - `OpenAICompatibleClient` writes each surrogate code point (U+D800-U+DFFF) as its
   six-character `\udXXX` escape, the spelling `json.dumps` uses, in three fields of the
   request it sends: an assistant message's content, the name of each tool call an assistant

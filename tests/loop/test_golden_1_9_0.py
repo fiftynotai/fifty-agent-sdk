@@ -47,10 +47,10 @@ What this does NOT pin:
   configured-but-passive cases are pinned by
   ``test_passive_interventions_leave_requests_and_events_unchanged``.
 * Non-ASCII text or U+007F in the JSON the SDK writes for the model, which
-  1.10.2 changed (BR-020). No scenario's tool results, tool schemas or
+  1.11.0 changed (BR-020). No scenario's tool results, tool schemas or
   replayed arguments hold any.
 * Any error path. No scenario ends on an ``ErrorEvent``, so the error-path
-  final text, message and context that 1.10.2 changed (BR-021) are outside it.
+  final text, message and context that 1.11.0 changed (BR-021) are outside it.
 * Any text the 64-level nesting check refuses (BR-019). It refuses no text
   in any scenario, whose tool arguments nest at most 1 level.
 * Tool-result text holding a surrogate code point before the escape, or a

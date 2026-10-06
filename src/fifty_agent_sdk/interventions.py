@@ -70,7 +70,7 @@ Wiring
 
     A non-blank ``str`` return is appended verbatim (not stripped, not
     truncated) to that call's model-facing observation, after a blank line.
-    The one exception, since 1.10.2: a surrogate code point (U+D800-U+DFFF)
+    The one exception, since 1.11.0: a surrogate code point (U+D800-U+DFFF)
     in the note reaches the model as its six-character ``\\udXXX`` escape,
     as it does anywhere else in the observation (BR-022).
     There is one append point, after the tool-result role is chosen, so the

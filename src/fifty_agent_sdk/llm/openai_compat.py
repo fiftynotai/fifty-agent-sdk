@@ -916,7 +916,7 @@ class OpenAICompatibleClient:
         sets ``ToolCall(id=None)`` and ``msg.tool_call_id=call_id``, so
         ``tc.id is None`` falls back to ``msg.tool_call_id`` and emits the
         same id BR-008 did. ``arguments`` is emitted as a JSON STRING (not an
-        object), per the OpenAI function-calling spec. Since 1.10.2 that
+        object), per the OpenAI function-calling spec. Since 1.11.0 that
         string keeps non-ASCII text literal rather than as ``\\uXXXX``
         escapes (a value holding a surrogate code point keeps the escaped
         form; :func:`fifty_agent_sdk._model_json.dumps_for_model`, BR-020);

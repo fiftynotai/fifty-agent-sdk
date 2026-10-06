@@ -207,7 +207,7 @@ class FinalEvent(_EventBase):
             :attr:`fifty_agent_sdk.safety.SafetyConfig.fallback_message`; on
             parser error or LLM error termination it is
             :attr:`fifty_agent_sdk.safety.SafetyConfig.error_fallback_message`
-            (BR-021; before 1.10.2 those also used ``fallback_message``). On
+            (BR-021; before 1.11.0 those also used ``fallback_message``). On
             those paths it is never the error's message.
         raw_completion: The raw LLM completion that produced this answer
             (the JSON envelope under JSON-mode). Set ONLY on the happy-path
@@ -248,7 +248,7 @@ class ErrorEvent(_EventBase):
             end-user text: for an ``"LLMError"`` it is the error's message,
             which from :class:`fifty_agent_sdk.llm.openai_compat.
             OpenAICompatibleClient` is often the provider's own error text
-            and may quote its response body (since 1.10.2 the provider-body
+            and may quote its response body (since 1.11.0 the provider-body
             errors listed in that client's module docstring quote up to 500
             characters of the body, except an ``"UndecodableProviderBody"``
             from ``stream()``, which quotes the decoder's error instead;
