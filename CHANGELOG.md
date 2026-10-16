@@ -4,7 +4,81 @@ All notable changes to `fifty-agent-sdk` are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.12.0] - 2026-10-16
+
+### Added
+- Agent Skills: `Skill`, `SkillSet`, `discover_skills` and `SkillError`, also importable
+  from `fifty_agent_sdk.skills`. A skill is a directory holding a `SKILL.md` file (YAML
+  frontmatter with `name` and `description`, then Markdown instructions) and, optionally,
+  reference files. `discover_skills(*roots)` loads every immediate subdirectory holding a
+  `SKILL.md`, in name order, skipping hidden (dot) directories; `Skill.from_directory(path)`
+  loads one; a `Skill` can also be
+  built in code. `SKILL.md` is read eagerly, as strict UTF-8 of at most 256 KiB, and any
+  problem raises `SkillError` naming the file (and the line, when there is one), with a
+  fixed reason code in `context["reason"]`. A skill's name is 1 to 64 lowercase letters
+  and digits in hyphen-separated runs and must equal its directory's name. (FR-004)
+- `AgentLoop(skills=SkillSet(...))`: the loop renders each skill's name and description
+  into a new `# Skills` system-prompt section, between `# Tools` and `# Output Format`,
+  and offers a `load_skill(name, file=None)` tool after the registry's tools in every tool
+  mode (the `tools` parameter under `NATIVE` and the legacy flag, the prompt-side tool
+  block otherwise). The caller's `Registry` is not modified: the load tool lives in a
+  private one-tool registry. A value other than a `SkillSet` or `None` raises
+  `TypeError`; a skill named like a registered tool, a registered tool named like the
+  load tool, or a non-empty `prompts.skills` raises `ValueError`. An empty `SkillSet` is
+  the same as `None`. `AgentRunner` takes no `skills`. (FR-004)
+- `load_skill` returns a skill's instructions, or the text of a file inside the skill
+  (`file`, a path relative to it). Every failure (an unknown name, bad arguments, a
+  refused or unreadable file) is a tool error the model reads, never a raised exception,
+  and no error text holds a host path. The `file` argument is confined to the skill's
+  directory: absolute paths, `..`, `:`, hidden names and symlinks leading out of the
+  directory are refused, and only regular files of at most 256 KiB of UTF-8 text are
+  read. On POSIX the file is opened by walking from the skill directory with `O_NOFOLLOW`
+  at every step, so a symlink swapped in after the check is refused too; on Windows the
+  open goes by path, and containment there has not been measured.
+  `SkillSet(..., tool_name=...)` renames the tool. (FR-004)
+- `PromptSections.skills`, the slot the catalog renders into, and
+  `SkillSet.render_catalog()` / `SkillSet.load_tool()`, for hosts that wire the catalog
+  and the tool by hand instead of passing `skills=`. A `SkillSet` also has `names`,
+  `tool_name`, `get(name)`, `len()`, iteration in name order and `name in skill_set`. Two
+  skills with one name raise `ValueError` when the `SkillSet` is built. (FR-004)
+
+### Notes
+- The frontmatter is read by a strict YAML subset, with no YAML dependency: plain values,
+  single- or double-quoted values on one line, and `|` / `>` block values. A plain value
+  YAML would read as something other than text (`no`, `on`, `~`, `123`, `1e5`,
+  `2024-01-01`) must be quoted, and so must one holding `: `. A value must start on its
+  key's line. Other keys (`license`, `metadata`, `allowed-tools`, ...) are kept in
+  `Skill.frontmatter` but not interpreted; under them, a quoted value or a `[` / `{`
+  collection must close on the line where it opens, so a multi-line flow list such as
+  `allowed-tools: [Bash,` is refused (YAML would let it swallow a following `name:` line;
+  write it as a block list). The subset is stricter than YAML in a few more places: a TAB
+  anywhere in the frontmatter, the characters YAML's reader refuses, U+0085, U+2028,
+  U+2029 and U+FEFF are refused, and so is every column-1 line that is not a `key:` line
+  (a `<<:` merge key included). A test checks the accepted values against PyYAML, which is
+  now a dev-only dependency. **`allowed-tools` is not enforced**: the SDK
+  has no permission model, and a skill's body is instructions to your model, so install
+  only skills you trust. (FR-004)
+- Freshness: skill bodies are read when the skills are loaded, and the catalog is
+  rendered when the loop is built; reference files are read when the model asks for one.
+  Rebuild the `SkillSet` and the loop to pick up edited skills. A loaded body is a tool
+  result: it lasts for the run and, like every tool roundtrip, is never persisted. The
+  catalog is part of the loop's own system prompt, which a Runner never persists either,
+  so every turn's request carries it. (FR-004)
+- `PromptSections` gains the field `skills` (default `""`). It is appended last, so
+  positional construction with the first four fields is unchanged, but
+  `dataclasses.fields`, `repr`, `==` and `dataclasses.asdict` include it. (FR-004)
+- A `load_skill` call counts as a tool call for `SafetyConfig(require_tool_before_final=True)`,
+  and interventions and hooks see it like any other call. (FR-004)
+- With `skills` omitted, or an empty `SkillSet`, the loop sends the same request bodies
+  (same keys, values and JSON types), the same system prompt and the same event stream as
+  1.11.0 (timestamps and minted ids aside). For `skills` omitted this is pinned by the
+  1.7.0, 1.8.0 and 1.9.0 goldens and by a new golden captured from 1.11.0, before any
+  change, that also covers the `additional_context` slot and intervention runs; the same
+  capture run against the published 1.11.0 wheel produced an identical file. An empty
+  `SkillSet` is not in any golden: the loop resolves it to `None` at construction, and a
+  test runs the same scripts with `skills=None` and `skills=SkillSet([])` in every tool
+  mode and finds the same bodies, events and system prompt. Key order holds by
+  construction; the HTTP bytes the `openai` SDK sends were not measured. (FR-004)
 
 ## [1.11.0] - 2026-10-06
 

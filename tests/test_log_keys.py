@@ -600,6 +600,8 @@ _LOGGER_MODULES: Final = frozenset(
         "fifty_agent_sdk/mcp/client.py",
         "fifty_agent_sdk/observability/hooks.py",
         "fifty_agent_sdk/runner.py",
+        "fifty_agent_sdk/skills/_load_tool.py",
+        "fifty_agent_sdk/skills/discovery.py",
         "fifty_agent_sdk/state/redis.py",
         "fifty_agent_sdk/state/sql.py",
         "fifty_agent_sdk/tools/mcp_provider.py",
@@ -609,7 +611,7 @@ _LOGGER_MODULES: Final = frozenset(
 
 
 def test_every_module_with_a_logger_has_swept_calls(package_sweep: list[ModuleSweep]) -> None:
-    """K4: the 11 modules that assign a structlog logger are found, and each yields a swept call."""
+    """K4: the 13 modules that assign a structlog logger are found, and each yields a swept call (FR-004 adds two)."""
     with_receivers = {sweep.path: sweep for sweep in package_sweep if sweep.receivers}
     assert set(with_receivers) >= _LOGGER_MODULES
     empty = sorted(path for path, sweep in with_receivers.items() if not sweep.calls)

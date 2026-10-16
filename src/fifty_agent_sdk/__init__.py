@@ -40,6 +40,7 @@ from fifty_agent_sdk.errors import (
     MaxIterationsExceeded,
     MCPError,
     ParserError,
+    SkillError,
     StateStoreError,
     ToolNotFound,
     ToolTimeout,
@@ -87,6 +88,7 @@ from fifty_agent_sdk.prompts import (
 )
 from fifty_agent_sdk.runner import AgentRunner
 from fifty_agent_sdk.safety import SafetyConfig
+from fifty_agent_sdk.skills import Skill, SkillSet, discover_skills
 from fifty_agent_sdk.state import (
     TRUNK_BRANCH_ID,
     BranchInfo,
@@ -183,6 +185,9 @@ __all__ = [
     "ReplaceToolArgs",
     "Role",
     "SafetyConfig",
+    "Skill",
+    "SkillError",
+    "SkillSet",
     "SqlAuditSink",
     "SqlStateStore",
     "StateStore",
@@ -202,6 +207,7 @@ __all__ = [
     "ToolTimeout",
     "Usage",
     "audit_metadata",
+    "discover_skills",
     "json_mode_template",
     "prose_mode_template",
     "render_system_prompt",

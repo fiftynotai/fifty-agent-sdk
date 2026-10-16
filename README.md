@@ -16,6 +16,7 @@ fifty-agent-sdk is a reusable agent loop for python. it implements a custom reAC
 - talks to any openai-compatible chat-completions endpoint by swapping one `base_url`: openai, google distributed cloud, a local oss server.
 - llm clients, state stores, and tools are pluggable behind protocols: bring your own, the loop stays the same.
 - the run emits a typed event stream the caller consumes, so you watch the react loop step by step.
+- agent skills: `SKILL.md` directories listed in the system prompt by name and description, loaded by the model on demand through a built-in `load_skill` tool.
 - an iteration cap and per-tool timeouts bound every run, with a fallback answer when a run hits the cap and a separate one when it errors: a loop that can't end is a loop that doesn't ship.
 - zero-infra by default: no db, no redis, until you opt into an extra.
 
@@ -131,6 +132,63 @@ AgentLoop(..., tool_mode=ToolMode.NATIVE, parser=JsonModeParser())
 ```
 
 omit `tool_mode` and the loop sends the same request bodies and system prompt as 1.7.0 (same keys, values and JSON types); since 1.11.0 the JSON the SDK writes for the model keeps non-ASCII text literal (see CHANGELOG), so this holds for runs where that JSON holds only code points U+0000-U+007E, in which the 64-level nesting check (see safety) refuses no text, in which no text that goes into a tool-result message holds a surrogate code point and every non-string tool result renders to the same json or `repr` text as in 1.10.1 (see tools), in which no text that goes into an assistant message's content, a tool call's name or a tool reply's name holds a surrogate code point (see llm), that do not dispatch a tool call while structlog passes the sdk's log keys to stdlib `logging` as a record's `extra` with debug enabled for the `fifty_agent_sdk.loop` logger (see CHANGELOG), in which no value the sdk escapes for a log line held, before the escape, a character that the stream structlog writes that line to cannot encode (see CHANGELOG), and that do not end on an llm or parser error, which since 1.11.0 end with `error_fallback_message`. on those runs the one event-level change is `ThoughtEvent.text` on native tool turns, which can now be non-empty (see CHANGELOG). `parser=` is required, `tool_message_role` defaults to `"tool"`, and `SafetyConfig(native_tools_enabled=True)` declares tools natively without changing the parser. that flag still works and is not deprecated, but on its own it leaves a text tool call dispatchable. to migrate, drop `parser=`, `output_format=` and `native_tools_enabled`, and pass `tool_mode=ToolMode.NATIVE`. the final answer is then plain text in `FinalEvent.text`, not a json envelope.
+
+### skills
+
+instructions the model loads only when a task needs them. a skill is a directory with a `SKILL.md` file: a short frontmatter naming the skill and saying when to use it, then markdown instructions. the system prompt lists each skill's name and description in a `# Skills` section, and the model calls a `load_skill` tool to read a skill's instructions, or a file inside the skill, when it picks one. this follows the open agent skills layout, so skills written for other runtimes load here.
+
+```python
+from fifty_agent_sdk import AgentLoop, SkillSet, ToolMode, discover_skills
+
+skills = SkillSet(
+    discover_skills("skills")
+)  # every skills/<name>/SKILL.md; hidden (dot) directories are skipped
+
+loop = AgentLoop(
+    ...,
+    tool_mode=ToolMode.NATIVE,
+    skills=skills,
+)
+```
+
+```
+skills/
+└─ pdf-forms/
+   ├─ SKILL.md
+   └─ reference/
+      └─ forms.md
+```
+
+```markdown
+---
+name: pdf-forms
+description: Fill in PDF forms. Use when the user asks to complete or check a form.
+---
+
+# Filling a PDF form
+
+Read reference/forms.md for the field ids, then ...
+```
+
+the frontmatter is read with a strict yaml subset and no yaml dependency: `name` and `description` may be plain text, single- or double-quoted on one line, or a `|` / `>` block. quote a value yaml could read as something other than text (`no`, `on`, `123`, `2024-01-01`), and a value holding `: `. a value must start on its key's line (or be a `|` / `>` block). other keys (`license`, `metadata`, `allowed-tools`, ...) are kept but not interpreted; `Skill.frontmatter` holds the raw text if you want to parse it yourself, for example with `yaml.safe_load(skill.frontmatter)`. under those keys, a quoted value or a `[` / `{` collection must close on the line where it opens, because yaml lets those span lines and a following `name:` line would end up inside them: a multi-line flow list such as `allowed-tools: [Bash,` is refused (write it as a block list, one `- Bash` per line). the subset is also stricter than yaml in a few places: a TAB anywhere in the frontmatter, the characters yaml's reader refuses (control characters, U+007F), U+0085, U+2028, U+2029 and U+FEFF are refused, and so is every line starting in column 1 that is not a `key:` line (a `<<:` merge key, `- item`, `? key`, `%YAML`). anything outside the subset raises `SkillError` naming the file (and the line, when the problem is on one), with a reason code in `context["reason"]`.
+
+a name is 1 to 64 lowercase letters and digits in hyphen-separated runs (`pdf-forms`), and must equal its directory's name. a description is at most 1024 characters. two skills with one name raise `ValueError` when the `SkillSet` is built; a skill named like a registered tool, or a registered tool named `load_skill`, raise `ValueError` when the loop is built. `SkillSet(..., tool_name="read_skill")` renames the load tool. `"pdf-forms" in skills` tells whether a set holds a skill.
+
+`load_skill` takes `name` and an optional `file`, a path relative to the skill. it returns the instructions, or the file's text. it is an ordinary tool: declared in the `tools` parameter under `NATIVE`, listed last in the prompt's tool block under `JSON` and `PROSE`, and seen by interventions and hooks like any other call. a call to it counts as a tool call for `require_tool_before_final`. an unknown name, bad arguments or a refused file come back as a tool error the model can read, never as an exception. the `file` argument is chosen by the model, so it is confined to the skill's directory: absolute paths, `..`, `:`, hidden names and symlinks leading out of the directory are refused, only regular files of at most 256 KiB of utf-8 text are read, and no error text holds a path on your machine. on posix the file is opened by walking from the skill directory with `O_NOFOLLOW` at every step, so a symlink swapped in after the check is refused too. on windows that walk is not available and the open goes by path, so a swap between the check and the open is not caught there; containment on windows has not been measured.
+
+a skill's body is instructions to your model, so only install skills you trust. `allowed-tools` is not enforced: the sdk has no permission model.
+
+the set is a snapshot. skill bodies are read when the skills are loaded and the catalog is rendered when the loop is built, while reference files are read when the model asks for one. rebuild the `SkillSet` and the loop to pick up edited skills. a loaded body is a tool result: it lasts for the run and is never persisted, so on a later turn the model loads the skill again when it needs it. the catalog is part of the loop's own system prompt, which a runner never persists either.
+
+to wire the pieces yourself, without `skills=`:
+
+```python
+skills = SkillSet(discover_skills("skills"))
+registry.register(skills.load_tool())
+prompts = PromptSections(persona="...", skills=skills.render_catalog())
+```
+
+without `skills` (or with an empty `SkillSet`), the loop sends the same request bodies (same keys, values and JSON types), the same system prompt and the same event stream as 1.11.0 (timestamps and minted ids aside).
 
 ### llm
 
@@ -293,6 +351,7 @@ src/fifty_agent_sdk/
 ├─ prompts
 ├─ ▶ runner
 ├─ safety
+├─ ▢ skills
 ├─ ▢ state
 ├─ streaming
 ├─ tool_mode
@@ -310,6 +369,7 @@ depends (→):
    loop → parser
    loop → prompts
    loop → safety
+   loop → skills
    loop → streaming
    loop → tool_mode
    loop → tools
@@ -324,6 +384,8 @@ depends (→):
    runner → observability
    runner → state
    runner → streaming
+   skills → errors
+   skills → tools
    state → errors
    state → llm
    streaming → tools
