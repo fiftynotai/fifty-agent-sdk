@@ -41,6 +41,8 @@ updates:
           - "pytest*"
           - "aiosqlite"
           - "fakeredis"
+          # FR-004: test-only, for the SKILL.md frontmatter differential.
+          - "pyyaml"
 
     # A capped requirement reads to Dependabot as staleness to be fixed: it sees
     # the ceiling, sees a version above it, and proposes relaxing the cap. It

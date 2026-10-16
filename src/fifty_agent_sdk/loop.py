@@ -44,6 +44,34 @@ Interventions (FR-003)
     1.9.0 (timestamps and minted ids aside); see
     :mod:`fifty_agent_sdk.interventions` for the contract.
 
+Skills (FR-004)
+    ``AgentLoop(skills=...)`` takes a :class:`fifty_agent_sdk.skills.SkillSet`.
+    The loop renders its catalog (each skill's name and description) into the
+    system prompt's ``# Skills`` section, between ``# Tools`` and
+    ``# Output Format``, once, at construction, and adds the set's load tool
+    (``load_skill`` by default) to the tools the model sees: last in the
+    prompt-side ``# Tools`` block under ``ToolMode.JSON`` / ``PROSE`` and the
+    legacy text path, last in the ``tools`` request parameter when tools are
+    declared natively. The caller's :class:`~fifty_agent_sdk.tools.registry.
+    Registry` is NOT modified: the load tool lives in a private one-tool
+    ``Registry``, and the loop sends calls to that name there and every other
+    call to the caller's registry, through the same ``Registry.invoke`` (same
+    timeout, same exception classification). A host tool registered under the
+    load tool's name after construction is shadowed by the loop's tool, in
+    the declaration and in dispatch. The load tool is an ordinary tool to the
+    rest of the loop: interventions and hooks see its calls, and a call to it
+    counts for ``require_tool_before_final``. A loaded skill body is a tool
+    result: it lasts for the run and, like every tool roundtrip, is never
+    persisted; the catalog is part of the loop's own system prompt, which a
+    Runner never persists either. With ``skills`` omitted, or an empty
+    ``SkillSet``, the loop sends the same request bodies (same keys, values
+    and JSON types), the same system prompt and the same event stream as
+    1.11.0 (timestamps and minted ids aside). That statement compares with
+    1.11.0, which already has every change the seven scope paragraphs below
+    describe (BR-020 to BR-028, changes since 1.10.1), so those scopes do not
+    apply to it; they scope the statements that compare with 1.7.0, 1.8.0
+    and 1.9.0.
+
 Non-ASCII text (BR-020)
     Since 1.11.0, JSON the SDK writes for the model carries non-ASCII text
     literally instead of as ``\\uXXXX`` escapes: non-string tool results,
@@ -67,8 +95,9 @@ Error-path final text (BR-021)
     ``text/event-stream`` and yields no chunk now ends the run after one
     request with an ``LLMError``, where earlier releases, with the shipped
     text parsers, ended it with a ``ParserError``, after a parser retry when
-    that is enabled. The 1.9.0 golden, the one fixture that records events,
-    holds no run that ends on an ``ErrorEvent``. The release-equivalence
+    that is enabled. The golden fixtures that record events (the 1.9.0 and,
+    since FR-004, 1.11.0 baselines and the skills forward pin) hold no run
+    that ends on an ``ErrorEvent``. The release-equivalence
     statements in this module (above, in :class:`AgentLoop`'s Args and in
     its ``__init__`` comments),
     and the matching ones in :mod:`fifty_agent_sdk.tool_mode` and
@@ -322,6 +351,7 @@ from fifty_agent_sdk.parser.base import FinalAnswer, MultiAction, Parser, ParseR
 from fifty_agent_sdk.parser.native_tools import NativeToolsParser
 from fifty_agent_sdk.prompts import PromptSections, render_system_prompt
 from fifty_agent_sdk.safety import SafetyConfig
+from fifty_agent_sdk.skills.skill_set import SkillSet
 from fifty_agent_sdk.streaming import (
     ActionEvent,
     AgentEvent,
@@ -693,6 +723,51 @@ def _validate_temperature(temperature: float | None | _Unset) -> float | None | 
     return validated
 
 
+def _resolve_skills(
+    skills: SkillSet | None, *, prompts: PromptSections, registry: Registry
+) -> SkillSet | None:
+    """Check ``AgentLoop(skills=...)`` and return the set to use, or ``None`` (FR-004).
+
+    An empty :class:`SkillSet` resolves to ``None`` (D9): no section and no
+    tool. The collision checks (D4) read the registry once, here; a tool
+    registered later under the load tool's name is shadowed instead (see
+    :meth:`AgentLoop._tool_snapshot`).
+
+    Raises:
+        TypeError: When ``skills`` is neither ``None`` nor a ``SkillSet``.
+        ValueError: For a non-empty set, when ``prompts.skills`` is set, when
+            the registry has a tool named ``skills.tool_name``, or when a skill
+            shares its name with a registered tool.
+    """
+    if skills is not None and not isinstance(skills, SkillSet):
+        # escape_for_log: a host class name is arbitrary text (aegis L2 sweep).
+        raise TypeError(
+            f"skills must be a SkillSet or None; got {escape_for_log(type(skills).__name__)}"
+        )
+    if skills is None or len(skills) == 0:
+        return None
+    if prompts.skills:
+        raise ValueError(
+            "skills=SkillSet(...) conflicts with prompts.skills: the loop renders the "
+            "skills catalog itself when skills= is set. Drop prompts.skills, or wire the "
+            "catalog and the load tool by hand and drop skills=."
+        )
+    host_names = {tool.name for tool in registry.list()}
+    if skills.tool_name in host_names:
+        raise ValueError(
+            f"skills=SkillSet(...) adds a tool named {skills.tool_name!r}, but the registry "
+            "already has a tool with that name. Pass SkillSet(..., tool_name=...) with "
+            "another name."
+        )
+    clash = sorted(set(skills.names) & host_names)
+    if clash:
+        raise ValueError(
+            f"skill names {clash!r} are also names of registered tools; rename the skills "
+            "or the tools, so the model cannot confuse a skill with a tool."
+        )
+    return skills
+
+
 class AgentLoop:
     """Production ReACT loop.
 
@@ -712,7 +787,9 @@ class AgentLoop:
             failure).
         registry: :class:`fifty_agent_sdk.tools.registry.Registry` of available
             tools. A snapshot of :meth:`Registry.list` is taken at
-            construction and embedded in the system prompt.
+            construction and embedded in the system prompt. With ``skills``
+            set, the tools offered are this registry's plus the skills load
+            tool, appended last; the registry itself is not modified.
         parser: :class:`fifty_agent_sdk.parser.base.Parser` matching the LLM's
             output format. REQUIRED when ``tool_mode`` is omitted (a
             :class:`TypeError` otherwise, as in 1.7.0). Optional under
@@ -722,7 +799,8 @@ class AgentLoop:
             ``ToolMode.NATIVE``.
         prompts: :class:`fifty_agent_sdk.prompts.PromptSections` slots. The
             loop OWNS the ``tool_descriptions`` slot (it is rebuilt from
-            the registry snapshot); the caller supplies the rest. If
+            the registry snapshot), and the ``skills`` slot when ``skills``
+            is set (FR-004); the caller supplies the rest. If
             ``prompts.output_format`` is empty and ``output_format`` is
             also empty, no output-format section appears in the system
             prompt.
@@ -829,12 +907,32 @@ class AgentLoop:
             this for gpt-5.1 with a level other than ``"none"``; not verified
             by this SDK), pass ``temperature=None`` yourself. Omit the kwarg
             rather than passing the private default marker.
+        skills: FR-004. An optional :class:`fifty_agent_sdk.skills.SkillSet`.
+            Its catalog (each skill's name and description) is rendered into
+            the system prompt's ``# Skills`` section, and its load tool
+            (``SkillSet.tool_name``, ``load_skill`` by default) is offered to
+            the model after the registry's tools, in every tool mode. The
+            caller's ``registry`` is not modified. The set is a snapshot:
+            the catalog is rendered once, here, and skill bodies were read
+            when the skills were built; reference files are read when the
+            model asks for one. Rebuild the ``SkillSet`` and the loop to pick
+            up edited skills. Interventions and hooks see ``load_skill``
+            calls like any tool call, and such a call counts for
+            ``require_tool_before_final``. An empty ``SkillSet`` is the same
+            as ``None``. With ``None`` (the default) the loop sends the same
+            request bodies (same keys, values and JSON types), the same
+            system prompt and the same event stream as 1.11.0 (timestamps
+            and minted ids aside). The module docstring's BR-020 to BR-028
+            scope paragraphs do not apply to this statement: they describe
+            changes since 1.10.1, which 1.11.0 already has (see "Skills
+            (FR-004)").
 
     Raises:
         TypeError: When both ``parser`` and ``tool_mode`` are omitted; when
             ``interventions`` is neither ``None`` nor an
             :class:`~fifty_agent_sdk.interventions.Interventions` (for example
-            a :class:`Hooks` passed by mistake).
+            a :class:`Hooks` passed by mistake); when ``skills`` is neither
+            ``None`` nor a :class:`~fifty_agent_sdk.skills.SkillSet`.
         ValueError: When ``reasoning_effort`` is neither ``None`` nor a
             lowercase token; when ``temperature`` is neither ``None`` nor a
             number in ``[0.0, 2.0]`` (``bool`` and numeric strings are
@@ -848,7 +946,12 @@ class AgentLoop:
             combination can never dispatch a native tool call — every
             streamed turn would parse empty content, burn the parser
             retry, and terminate on the fallback message. The
-            misconfiguration is rejected at construction instead.
+            misconfiguration is rejected at construction instead. Also
+            (FR-004, a non-empty ``skills`` only): when ``prompts.skills`` is
+            not empty (the loop renders that slot itself); when the registry
+            already has a tool named ``skills.tool_name`` (pass
+            ``SkillSet(..., tool_name=...)``); and when a skill has the name
+            of a registered tool.
     """
 
     def __init__(
@@ -870,6 +973,7 @@ class AgentLoop:
         tool_mode: ToolMode | None = None,
         reasoning_effort: str | None = None,
         temperature: float | None | _Unset = _UNSET,
+        skills: SkillSet | None = None,
     ) -> None:
         # FR-002: validate the request options first, before the tool-mode
         # resolver, so a bad value fails cheaply at construction and never as
@@ -883,6 +987,9 @@ class AgentLoop:
                 "interventions must be an Interventions instance or None; "
                 f"got {type(interventions).__name__}"
             )
+        # FR-004: the skills checks run here, before the tool-mode resolver,
+        # so a bad value fails cheaply at construction.
+        active_skills = _resolve_skills(skills, prompts=prompts, registry=registry)
         # FR-001: resolve every tool-calling knob together. `tool_mode=None`
         # is the frozen legacy path — each resolved value equals what 1.7.0
         # read directly (parser required, role "tool", native behaviour keyed
@@ -931,6 +1038,19 @@ class AgentLoop:
             if interventions is not None
             else BeforeToolFallback.DENY
         )
+        # FR-004 D2: the load tool lives in a private one-tool Registry, never in
+        # the caller's (`self._registry` stays the caller's object and contents),
+        # and `_tool_snapshot` / `_registry_for` route that one name to it. With
+        # no (or an empty) SkillSet all three are None and both helpers return
+        # exactly what the loop used before FR-004.
+        self._skill_set: SkillSet | None = active_skills
+        self._skill_tool_name: str | None = (
+            active_skills.tool_name if active_skills is not None else None
+        )
+        self._skill_registry: Registry | None = None
+        if active_skills is not None:
+            self._skill_registry = Registry()
+            self._skill_registry.register(active_skills.load_tool())
         self._tool_mode: ToolMode | None = resolved.mode
         self._declare_native_tools = resolved.declare_native_tools
         self._native_precedence = resolved.native_precedence
@@ -974,23 +1094,59 @@ class AgentLoop:
         if self._declare_native_tools:
             tool_block = ""
         else:
-            tool_block = _render_tool_descriptions(self._registry.list())
+            tool_block = _render_tool_descriptions(self._tool_snapshot())
         chosen_format = output_format or prompts.output_format
+        # FR-004: the loop renders the catalog when `skills=` is set (and then
+        # `prompts.skills` is empty, checked in __init__); otherwise the
+        # caller's slot passes through, "" by default, which renders nothing.
+        skills_block = (
+            self._skill_set.render_catalog() if self._skill_set is not None else prompts.skills
+        )
         composed = PromptSections(
             persona=prompts.persona,
             tool_descriptions=tool_block,
             output_format=chosen_format,
             additional_context=prompts.additional_context,
+            skills=skills_block,
         )
         return render_system_prompt(composed)
+
+    def _tool_snapshot(self) -> list[Tool]:
+        """The tools the model is offered: the registry's, plus the skills load tool last.
+
+        With no skills (FR-004) this is ``self._registry.list()``, the same
+        expression the loop used before. With skills, a host tool under the
+        load tool's name (registered after construction; the constructor
+        rejects one registered before) is left out, so the model never sees
+        two tools with one name, and the load tool is appended.
+        """
+        base = self._registry.list()
+        if self._skill_registry is None or self._skill_tool_name is None:
+            return base
+        return [tool for tool in base if tool.name != self._skill_tool_name] + [
+            self._skill_registry.get(self._skill_tool_name)
+        ]
+
+    def _registry_for(self, name: str) -> Registry:
+        """The registry a call to tool ``name`` is dispatched to (FR-004 D2).
+
+        The private one-tool registry for the skills load tool's name, the
+        caller's registry for every other name (and for every name with no
+        skills).
+        """
+        if self._skill_registry is not None and name == self._skill_tool_name:
+            return self._skill_registry
+        return self._registry
 
     def _build_request(self, messages: list[ChatMessage]) -> ChatRequest:
         """Wrap the working message list in a :class:`ChatRequest` for this loop's model.
 
         When native tools are declared (``ToolMode.NATIVE``, or
         :attr:`SafetyConfig.native_tools_enabled` on the legacy path), the
-        request carries the registry's tools as the OpenAI ``tools`` param
-        (built via :func:`_render_openai_tools`) plus ``tool_choice="auto"``.
+        request carries the registry's tools (plus the skills load tool,
+        last, when ``skills`` is set; :meth:`_tool_snapshot`) as the OpenAI
+        ``tools`` param (built via :func:`_render_openai_tools`) plus
+        ``tool_choice="auto"``.
         Otherwise the request is ``ChatRequest(messages=..., model=...)``
         plus the request options described below.
 
@@ -998,6 +1154,8 @@ class AgentLoop:
         ``tool_choice`` (OpenAI rejects an empty ``tools`` array); the registry
         is re-read every iteration, so a later registration is declared on the
         next turn. The legacy flag keeps sending ``tools=[]`` (FR-001 D10).
+        With ``skills`` set the load tool is always declared, so an empty
+        host registry still sends ``tools`` with that one entry.
 
         Every request, on all three branches, also carries the loop's request
         options (FR-002): ``reasoning_effort`` when set, and ``temperature``
@@ -1009,7 +1167,7 @@ class AgentLoop:
         (the new ``reasoning_effort`` field stays ``None``).
         """
         if self._declare_native_tools:
-            tools = _render_openai_tools(self._registry.list())
+            tools = _render_openai_tools(self._tool_snapshot())
             if not tools and self._omit_empty_tools:
                 return ChatRequest(
                     messages=list(messages), model=self._model, **self._request_options
@@ -1501,7 +1659,7 @@ class AgentLoop:
                     if call_denial is not None:
                         return _DeniedCall(call_denial)
                     async with _sem:
-                        return await self._registry.invoke(
+                        return await self._registry_for(tc.name).invoke(
                             tc.name,
                             dict(call_args),
                             timeout=self._safety.tool_timeout_seconds,
@@ -1834,7 +1992,7 @@ class AgentLoop:
             )
 
             try:
-                tool_result = await self._registry.invoke(
+                tool_result = await self._registry_for(tool_name).invoke(
                     tool_name,
                     dict(dispatch_args),
                     timeout=self._safety.tool_timeout_seconds,

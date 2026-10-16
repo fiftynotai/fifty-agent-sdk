@@ -118,12 +118,46 @@ class StateStoreError(AgentSdkError):
     """A state-store backend operation (load, save, delete) failed."""
 
 
+class SkillError(AgentSdkError):
+    """A skill directory or its ``SKILL.md`` file could not be loaded (FR-004).
+
+    Raised by :meth:`fifty_agent_sdk.skills.Skill.from_directory` and
+    :func:`fifty_agent_sdk.skills.discover_skills` for problems with skill
+    FILES. The message names the file, for example ``Invalid skill file
+    /srv/skills/pdf/SKILL.md: frontmatter line 3: ...``. Configuration
+    mistakes made in code are builtins instead: a duplicate skill name or a
+    tool-name collision is a :class:`ValueError`, a wrong argument type a
+    :class:`TypeError`, and a :class:`~fifty_agent_sdk.skills.Skill` built
+    directly with a bad field raises pydantic's ``ValidationError``.
+
+    ``context`` always holds ``path`` (the file or directory, as a ``str``)
+    and ``reason``, a fixed code a host can branch on without parsing the
+    message: ``not_found``, ``not_a_directory``, ``missing_skill_md``,
+    ``not_a_file``, ``too_large``, ``not_utf8``, ``unreadable`` (an
+    ``OSError`` while resolving, checking, listing or reading; also a
+    ``RuntimeError`` from resolving a symlink loop on CPython before 3.13,
+    and a ``ValueError`` for a path holding NUL), ``no_frontmatter``,
+    ``unclosed_frontmatter``, ``malformed_frontmatter``, ``duplicate_key``,
+    ``missing_field``, ``invalid_field``, ``name_mismatch`` or
+    ``empty_body``. It may also hold ``line`` (the 1-based line of
+    ``SKILL.md``), ``field`` (``"name"``, ``"description"`` or ``"body"``),
+    ``offset`` (the byte offset of the first byte that is not UTF-8, counted
+    after a stripped BOM, for ``not_utf8``), ``error_type`` (the exception
+    class name, for ``unreadable``) and, for ``name_mismatch``,
+    ``directory_name``. The path in the message has each surrogate code
+    point and C0/C1 control character written as a six-character escape
+    (``escape_for_log``), so printing it cannot raise or write a terminal
+    control sequence; ``context["path"]`` keeps the path as it is.
+    """
+
+
 __all__ = [
     "AgentSdkError",
     "LLMError",
     "MCPError",
     "MaxIterationsExceeded",
     "ParserError",
+    "SkillError",
     "StateStoreError",
     "ToolNotFound",
     "ToolTimeout",

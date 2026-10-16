@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import FrozenInstanceError
 
 import pytest
@@ -154,3 +155,46 @@ def test_json_mode_output_format_carries_br018_strengthening() -> None:
         assert key in body
     assert "Hard rules:" in body
     assert "Never wrap the JSON in ```json fences" in body
+
+
+# --- FR-004: the skills slot -----------------------------------------------------------
+
+
+def test_skills_section_renders_between_tools_and_output_format() -> None:
+    """P1 (FR-004 D11): five slots render persona, tools, skills, output format, context."""
+    out = render_system_prompt(
+        PromptSections(
+            persona="P",
+            tool_descriptions="T",
+            output_format="O",
+            additional_context="C",
+            skills="S",
+        )
+    )
+    assert (
+        out
+        == "# Persona\nP\n\n# Tools\nT\n\n# Skills\nS\n\n# Output Format\nO\n\n# Additional Context\nC"
+    )
+
+
+def test_empty_skills_slot_renders_the_1_11_0_prompt() -> None:
+    """P2 (FR-004): ``skills=""`` gives exactly the four-slot 1.11.0 output (a frozen literal)."""
+    sections = PromptSections(
+        persona="P", tool_descriptions="T", output_format="O", additional_context="C"
+    )
+    expected_1_11_0 = "# Persona\nP\n\n# Tools\nT\n\n# Output Format\nO\n\n# Additional Context\nC"
+    assert render_system_prompt(sections) == expected_1_11_0
+    assert render_system_prompt(dataclasses.replace(sections, skills="")) == expected_1_11_0
+
+
+def test_skills_field_is_appended_last_and_positional_construction_still_works() -> None:
+    """P3 (FR-004 D11): the field is last; four positional arguments mean what they meant."""
+    assert [field.name for field in dataclasses.fields(PromptSections)][-1] == "skills"
+    sections = PromptSections("P", "T", "O", "C")  # positional, as before 1.12.0
+    assert (sections.persona, sections.tool_descriptions, sections.output_format) == ("P", "T", "O")
+    assert (sections.additional_context, sections.skills) == ("C", "")
+
+
+def test_skills_slot_without_persona_renders_cleanly() -> None:
+    """P4 (FR-004): an empty persona and a skills slot give just the skills section."""
+    assert render_system_prompt(PromptSections(persona="", skills="S")) == "# Skills\nS"

@@ -29,6 +29,14 @@ System prompt vs. AgentLoop's structured prompt
     customer-support agent"). Both coexist in the loop's prompt; that
     is intentional and supported by every major LLM provider.
 
+    Skills (FR-004): the catalog an ``AgentLoop(skills=...)`` renders is
+    part of the loop's structured prompt, so it is never persisted either;
+    every turn's request carries the loop's current catalog. A skill body
+    the model loads is a tool result, a roundtrip like any other (see
+    below), so it is not persisted: on a later turn the model loads the
+    skill again when it needs it. ``AgentRunner`` takes no ``skills``
+    argument; wire them on the loop.
+
 Transactional persistence invariants
     * Every successful ``run()`` appends exactly one user message and
       exactly one assistant message to the state store. If

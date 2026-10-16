@@ -9,6 +9,7 @@ from fifty_agent_sdk.errors import (
     LLMError,
     MaxIterationsExceeded,
     ParserError,
+    SkillError,
     StateStoreError,
     ToolNotFound,
     ToolTimeout,
@@ -55,6 +56,7 @@ def test_agent_sdk_error_context_is_mutable_after_construction() -> None:
         MaxIterationsExceeded,
         ParserError,
         StateStoreError,
+        SkillError,
     ],
 )
 def test_subclasses_inherit_from_agent_sdk_error(cls: type[AgentSdkError]) -> None:

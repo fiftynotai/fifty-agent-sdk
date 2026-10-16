@@ -1,8 +1,10 @@
 """System prompt template builder.
 
 Provides a composable :class:`PromptSections` dataclass and a renderer that
-joins non-empty slots into a single system prompt string. Two pre-built
-templates ship with the SDK:
+joins non-empty slots into a single system prompt string. The slots render in
+the order ``persona``, ``tool_descriptions``, ``skills`` (FR-004),
+``output_format``, ``additional_context``; an empty slot renders nothing. Two
+pre-built templates ship with the SDK:
 
 * :func:`json_mode_template` — strict JSON output for the BR-005 parser.
 * :func:`prose_mode_template` — classic ``Thought / Action / Final Answer``
@@ -56,12 +58,16 @@ _SECTION_SEPARATOR = "\n\n"
 _HEADINGS: dict[str, str] = {
     "persona": "# Persona",
     "tool_descriptions": "# Tools",
+    "skills": "# Skills",
     "output_format": "# Output Format",
     "additional_context": "# Additional Context",
 }
 _SECTION_ORDER: tuple[str, ...] = (
     "persona",
     "tool_descriptions",
+    # FR-004: skills describe capabilities, like tools; the output format stays
+    # near the end. The order is set here, not by the dataclass field order.
+    "skills",
     "output_format",
     "additional_context",
 )
@@ -74,6 +80,11 @@ class PromptSections:
     Frozen so a built section bundle cannot be mutated in flight; this keeps
     accidental reuse safe across multiple loop iterations.
 
+    ``skills`` (FR-004) is the last field, so positional construction with
+    the first four fields is unchanged; ``dataclasses.fields``, ``repr``,
+    ``==`` and ``dataclasses.asdict`` include it. Its place in the rendered
+    prompt is between ``tool_descriptions`` and ``output_format``.
+
     Attributes:
         persona: Who the assistant is and how it should behave. The only
             section that is conventionally non-empty.
@@ -84,19 +95,26 @@ class PromptSections:
             :data:`PROSE_MODE_OUTPUT_FORMAT`.
         additional_context: Any extra context — domain facts, session
             metadata, retrieved-document summaries.
+        skills: FR-004. The skills catalog, rendered under ``# Skills``:
+            usually :meth:`fifty_agent_sdk.skills.SkillSet.render_catalog`.
+            Empty by default, which renders nothing. ``AgentLoop`` fills it
+            itself when given ``skills=``, and then rejects a non-empty value
+            here.
     """
 
     persona: str
     tool_descriptions: str = ""
     output_format: str = ""
     additional_context: str = ""
+    skills: str = ""
 
 
 def render_system_prompt(sections: PromptSections) -> str:
     """Compose a system prompt from :class:`PromptSections`.
 
     Sections are emitted in a fixed order:
-    ``persona → tool_descriptions → output_format → additional_context``.
+    ``persona → tool_descriptions → skills → output_format →
+    additional_context`` (``skills`` since FR-004).
     Empty sections are omitted entirely — no stray headings or blank
     paragraphs leak into the output.
 

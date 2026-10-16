@@ -211,8 +211,12 @@ def escape_for_log(text: str) -> str:
     raised as ``tool_invoked`` did before BR-024; the first step now escapes
     it there as well (BR-028 evidence, P3).
 
-    For log values only. Never use it on text sent to a model, on events or
-    on stored text. Like the surrogate escape it cannot be reversed: the
+    For log values, and (since FR-004) for host paths and host class names
+    written into exception messages in ``fifty_agent_sdk.skills`` and in
+    ``AgentLoop(skills=...)``'s ``TypeError``, so printing such a message
+    cannot raise or write a terminal control sequence; the exceptions'
+    ``context`` keeps the raw value. Never use it on text sent to a model, on
+    events or on stored text. Like the surrogate escape it cannot be reversed: the
     escape cannot be told apart from the same six characters typed, which
     are left as they are. It catches nothing.
 

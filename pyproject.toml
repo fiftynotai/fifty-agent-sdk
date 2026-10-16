@@ -100,6 +100,13 @@ dev = [
     # the SDK relies on 5.x async semantics — aclose(), pipeline(transaction=True).
     # The <3.0.0 ceiling enforces what this comment has always asserted.
     "fakeredis>=2.20.0,<3.0.0",
+    # FR-004 D1: test-only. The SDK reads SKILL.md frontmatter with its own
+    # strict YAML subset and never imports PyYAML; this powers the differential
+    # test (tests/skills/test_frontmatter_differential.py) that checks the
+    # subset reads every accepted value as PyYAML does. A runtime dependency
+    # would be a consumer contract (TD-004/TD-007), so PyYAML stays here. Major
+    # ceiling per the harness rule above.
+    "pyyaml>=6.0.1,<7.0.0",
 ]
 
 [tool.setuptools.packages.find]
